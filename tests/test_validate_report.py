@@ -182,6 +182,14 @@ class ShapeAndEnumTests(unittest.TestCase):
         errors = validate_report.validate_report(bad)
         self.assertTrue(any("duplicate entry" in e for e in errors))
 
+    def test_empty_locations_is_rejected(self):
+        # D-022 / Probe B: an empty locations array degenerates the primary-location
+        # component of stableKey, letting unrelated findings collapse into one.
+        bad = make_valid_report()
+        bad["findings"][0]["locations"] = []
+        errors = validate_report.validate_report(bad)
+        self.assertTrue(any("at least one entry" in e for e in errors))
+
     def test_evidence_over_five_lines_is_rejected(self):
         bad = make_valid_report()
         bad["findings"][0]["evidence"] = ["line"] * 6

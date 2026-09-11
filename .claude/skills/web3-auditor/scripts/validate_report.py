@@ -148,6 +148,11 @@ def _validate_finding(finding: Any, index: int, errors: ErrorCollector) -> Optio
 
     locations = finding.get("locations")
     if errors.require(isinstance(locations, list), "%s.locations must be an array" % path):
+        errors.require(
+            len(locations) >= 1,
+            "%s.locations must have at least one entry (an empty array makes stableKey's primary-location "
+            "component degenerate and lets unrelated findings collapse into one - see D-022)" % path,
+        )
         for loc_index, loc in enumerate(locations):
             _validate_location(loc, "%s.locations[%d]" % (path, loc_index), errors)
 
