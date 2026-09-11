@@ -1,0 +1,38 @@
+# Decisiones técnicas y de producto
+
+Registro vivo. Cada entrada recoge la decisión y su motivo. Las dudas abiertas van al final y se
+cierran cuando exista evidencia. Las cuestiones jurídicas no se deciden aquí: ver
+`docs/legal-risk-register.md`. Nada de este documento se publica.
+
+## Decisiones
+
+| ID | Fecha | Decisión | Motivo |
+|---|---|---|---|
+| D-001 | 2026-09-11 | Raíz del proyecto: la carpeta `web3-security-review-ai` (estaba vacía). No se toca el proyecto vecino `virtual assistent`. | Evitar mezclar repositorios y que el publisher descubra skills ajenas. |
+| D-002 | 2026-09-11 | Repositorio inicializado con `git init -b chore/setup`, sin commit vacío en `main`. `main` nacerá en el merge que apruebe Diego. | Indicación explícita de Diego. |
+| D-003 | 2026-09-11 | Idiomas: `CLAUDE.md` y `docs/` en español; `.claude/skills/web3-auditor/**` y `capafy/**` en inglés. La entrada del usuario puede estar en cualquier idioma; la prosa del informe sigue el idioma del usuario; claves JSON, enums, `SC01`–`SC10` e identificadores siempre en inglés. | Confirmado por Diego. Material publicado y ficha en inglés para el marketplace. |
+| D-004 | 2026-09-11 | Nombre técnico `web3-auditor` (directorio de la Skill = nombre que descubre Capafy) y nombre comercial "Web3 Security Review AI". No se renombra el identificador técnico por motivos de naming. | El publisher toma el nombre del directorio/frontmatter y cambiarlo tras publicar rompería la continuidad de versiones. "auditor" es identificador interno, no claim comercial. |
+| D-005 | 2026-09-11 | Estructura creada con `.gitkeep` en carpetas vacías. Los `.gitkeep` dentro de `.claude/skills/web3-auditor/` se eliminan en cuanto la carpeta tenga archivos reales. | Git no versiona carpetas vacías; un `.gitkeep` publicado es ruido en el paquete. |
+| D-006 | 2026-09-11 | `.gitattributes` con `* text=auto eol=lf`. | Scripts, JSON y casos de eval idénticos en cualquier SO; el `inputHash` de los evals debe ser estable entre Windows y Linux. |
+| D-007 | 2026-09-11 | Grep de secretos (`sk-ant`, `api_key`, `PRIVATE_KEY`, `mnemonic`, ficheros `.env*`) sobre todo el repo salvo `.git`. Una coincidencia solo es admisible si es texto que prohíbe o describe el término (la propia regla en `CLAUDE.md`, esta fila, o la futura instrucción runtime de no pedir claves); nunca un valor asignado. | La Skill debe decir explícitamente que no pide secretos; el grep literal pedido por Diego sirve para detectar valores filtrados, no menciones. |
+| D-008 | 2026-09-11 | Grep de términos prohibidos limitado a `.claude/skills/` y `capafy/`. `docs/commercial-claims.md` define la lista y `docs/` queda fuera. `references/guardrails.md` (2.1) será el único archivo publicado que contenga la lista literal y se revisa a mano; `SKILL.md` la referencia sin reproducirla. | La lista tiene que existir en algún archivo publicado para que el modelo la aplique en runtime, y el grep automático debe seguir siendo útil. |
+| D-009 | 2026-09-11 | Compatibilidad Python 3.8: sin `match`, sin `X \| Y` en anotaciones, sin `list[str]`/`dict[str, X]` evaluados en runtime (usar `typing`), sin `str.removeprefix`, sin `zoneinfo`; `from __future__ import annotations` permitido. Se desarrolla y prueba con Python 3.14 local. | No hay CI multi-versión; la compatibilidad se garantiza por disciplina y se revisa en cada commit. |
+| D-010 | 2026-09-11 | `tests/` queda creado sin `__init__.py`; discovery e imports se deciden en 1.1 con el primer test real. | Indicación de Diego: no añadir complejidad ahora. |
+| D-011 | 2026-09-11 | OWASP Smart Contract Top 10:2026 se usa solo como taxonomía de referencia (`SC01`–`SC10`). Toda descripción en `checklist.md`, `severity-and-score.md`, `guardrails.md` y en el material comercial se redacta con palabras propias; no se copian textos, ejemplos ni definiciones. | Requisito de Diego (§20) y RISK-008. |
+| D-012 | 2026-09-11 | La cláusula comercial (§6.3) se guarda en `docs/legal-risk-register.md` como "PROPOSED COMMERCIAL TERMS LANGUAGE — LEGAL REVIEW REQUIRED". No se incluye en la Skill ni en los informes como mecanismo automático de exclusión de responsabilidad. | Una limitación escrita no equivale por sí sola a una exclusión válida; el aviso técnico del informe y los términos comerciales se mantienen separados. |
+| D-013 | 2026-09-11 | Los "workspace documents" que Capafy ofrece en la confirmación web (`CLAUDE.md`, `README.md`, `.md/.txt` de la raíz) nunca se marcan para publicar. Irá al pre-publish checklist (3.2). | Verificado en el publisher: empiezan como `excluded` y solo se empaquetan si el creador los marca. |
+| D-014 | 2026-09-11 | Los archivos publicados no contienen rutas locales absolutas, emails, teléfonos ni IPs privadas. | Invariantes del empaquetado de Capafy (`package_invariants`, `PII_PATTERNS`). |
+| D-015 | 2026-09-11 | Identidad git configurada solo a nivel de este repositorio (`user.name` "Diego" y el email de la cuenta de Diego) porque no existía configuración global ni de sistema. | Sin identidad no se puede crear el commit; Diego puede cambiarla con `git config user.name/user.email`. |
+
+## Dudas abiertas
+
+| ID | Duda | Estado |
+|---|---|---|
+| Q-001 | ¿Existe `python3` en el runtime Run Online de Capafy? Condiciona el score determinista; sin él, `scoreStatus: "not_computed"`. `[CAPAFY-VERIFY]` | Abierta — comprobar con una instancia de prueba en 3.1/3.2. |
+| Q-002 | Suscripción diaria: el repo público solo muestra ciclos `week`/`month`. `[CAPAFY-VERIFY]` | Abierta — afecta a `capafy/pricing.md`. |
+| Q-003 | Retención de logs de ejecución durante 90 días: no aparece en el repo público. `[CAPAFY-VERIFY]` | Abierta — Diego la da por verificada; falta la fuente documental para `capafy/data-declaration.md`. |
+| Q-004 | Categoría "Developer Tools / Security" y límite de 5 tags. `[CAPAFY-VERIFY]` | Abierta — comprobar en la web de publicación. |
+| Q-005 | Proveedor/modelo LLM efectivo en runtime y su política de retención. `[CAPAFY-VERIFY]` | Abierta — mientras tanto solo se documenta "LLM processing via Capafy infrastructure". |
+| Q-006 | Modo de venta: Run Online mantiene el código cerrado; Download entrega todos los archivos de la Skill al comprador. | Decisión de Diego pendiente para 3.2 (`capafy/pricing.md`). |
+| Q-007 | ¿Puede el publisher fijar condiciones comerciales propias además de los ToS de Capafy? `[CAPAFY-VERIFY]` | Abierta — condiciona el uso de la cláusula §6.3 (RISK-010). |
+| Q-008 | Límites duros de tamaño/número de archivos del paquete y longitud de `description`. Solo se conocen los umbrales "suspicious" (>200 archivos, >5 MiB). `[CAPAFY-VERIFY]` | Abierta. |

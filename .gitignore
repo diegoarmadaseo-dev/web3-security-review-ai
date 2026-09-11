@@ -1,0 +1,31 @@
+# Secretos y entorno local: nunca se versionan ni se publican
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Estado local del publisher de Capafy (si se ejecutara desde este workspace)
+.temp/
+.temp-fallback/
+
+# Configuración local de Claude Code (permisos de esta máquina)
+.claude/settings.local.json
+
+# Temporales
+*.tmp
+*.log
+
+# SO / editores
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
