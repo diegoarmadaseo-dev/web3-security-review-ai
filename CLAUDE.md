@@ -50,8 +50,8 @@ Este archivo NO se publica y no describe comportamiento runtime: eso vive en
 - Secretos: `grep -rniE "sk-ant|api_key|PRIVATE_KEY|mnemonic" --exclude-dir=.git .` y
   `find . -name ".env*" -not -path "./.git/*"`. Solo se admite texto que prohíbe o describe el término;
   nunca un valor. Cada coincidencia se justifica en el informe del commit.
-- Términos prohibidos: grep de `docs/commercial-claims.md` sobre `.claude/skills/` y `capafy/`.
-  `docs/`, `guardrails.md` y `preprocess.py` (detector de prompt injection) se revisan a mano.
+- Términos prohibidos: grep de `docs/commercial-claims.md` sobre `.claude/skills/` y `capafy/`. `docs/`,
+  `guardrails.md`, `preprocess.py` (detector) y `render_report.py` (disclaimer §6.2) se revisan a mano.
 - La carpeta de la Skill no contiene `tests/`, `evals/`, `capafy/`, `docs/`, `.env` ni secretos,
   ni rutas locales absolutas ni emails (invariantes del empaquetado de Capafy).
 - Actualizar `docs/decisiones.md` cuando cambie o nazca una decisión.

@@ -89,11 +89,12 @@ limitativas y se revisan a mano en cada commit.
 Antes de cada commit, sobre `.claude/skills/` y `capafy/` (no sobre `docs/`, que define la lista):
 
 ```bash
-grep -rniE "certified|certificaci[oó]n|audited|audit completed|complete audit|professional audit|official|safe to deploy|guaranteed|100% secure|vulnerability-free|no vulnerabilities|production-ready|zero retention|no logs|never stored|private by default|deploy with confidence|secure your contract|eliminate vulnerabilities|audit your contract" --exclude=guardrails.md --exclude=preprocess.py .claude/skills capafy
+grep -rniE "certified|certificaci[oó]n|audited|audit completed|complete audit|professional audit|official|safe to deploy|guaranteed|100% secure|vulnerability-free|no vulnerabilities|production-ready|zero retention|no logs|never stored|private by default|deploy with confidence|secure your contract|eliminate vulnerabilities|audit your contract" --exclude=guardrails.md --exclude=preprocess.py --exclude=render_report.py .claude/skills capafy
 ```
 
 - Resultado esperado: sin coincidencias.
 - `references/guardrails.md` se revisa a mano: los términos solo pueden aparecer dentro de su lista de prohibidos.
 - `scripts/preprocess.py` también se excluye del grep automático y se revisa a mano: contiene, dentro de `INJECTION_PATTERNS` (detector de intentos de prompt injection multilingüe), los patrones que RECONOCEN frases como "this contract is safe/secure/audited/certified" en el CÓDIGO/COMENTARIOS APORTADOS POR EL USUARIO — es decir, usa esas palabras para detectarlas como manipulación en contenido ajeno, nunca para afirmarlas sobre la propia Skill. Ver D-020 en `docs/decisiones.md`. Cualquier otro uso de estos términos en `preprocess.py` (fuera de `INJECTION_PATTERNS` y sus tests) sigue siendo una violación.
-- Nivel B: `grep -rniwE "audit|certification|guarantee|secure|private|confidential" --exclude=preprocess.py .claude/skills capafy` y comprobar que cada coincidencia está en negación o limitación.
+- `scripts/render_report.py` también se excluye y se revisa a mano: contiene, dentro de `MANDATORY_NOTICE_LINES`, el disclaimer obligatorio §6.2 verbatim aportado por Diego, que usa "audit"/"certification"/"guarantee" en negación ("It is NOT... No statement... creates a warranty, certification, guarantee, or professional audit engagement"). Ver D-021. Ningún otro texto de `render_report.py` puede reproducir estos términos sin la misma justificación de negación explícita.
+- Nivel B: `grep -rniwE "audit|certification|guarantee|secure|private|confidential" --exclude=preprocess.py --exclude=render_report.py .claude/skills capafy` y comprobar que cada coincidencia está en negación o limitación.
 - Las plantillas de informe y los evals de 3.1 comprueban además que la salida generada no contiene términos de nivel A ("forbidden terms" en `evals/results/summary.md`).

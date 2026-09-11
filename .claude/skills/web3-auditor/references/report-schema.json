@@ -1,0 +1,185 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "web3-security-review-ai/report-schema.json",
+  "title": "Automated AI-Assisted Smart Contract Security Review Report",
+  "description": "Reference shape for a report produced by this Skill. This document is the authoritative reference for scripts/validate_report.py, scripts/score.py and scripts/render_report.py, but it is not executed by a JSON Schema library at runtime (scripts/validate_report.py is a hand-written, standard-library-only validator; see docs/decisiones.md D-021). Every field here describes machine-readable data. Visible report prose (executive summary, finding descriptions, recommendations) follows the user's language; this schema, its enum values and its field names are always in English.",
+  "type": "object",
+  "required": [
+    "generatedBy",
+    "skillVersion",
+    "analysisEngineVersion",
+    "checklistVersion",
+    "scoreVersion",
+    "mode",
+    "compilerVersion",
+    "scriptsAvailable",
+    "inputHash",
+    "scope",
+    "categoryCoverage",
+    "findings",
+    "limitations",
+    "riskIndicator",
+    "scoreStatus"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "generatedBy": { "const": "ai", "description": "This report's findings, descriptions and recommendations are AI-authored. Deterministic scripts (preprocess/score/validate/render) only transform, check and lay out that content; they never author a finding." },
+    "skillVersion": { "type": "string", "description": "Version of the Skill package (SKILL.md) that produced this report." },
+    "analysisEngineVersion": { "type": "string", "description": "Version of the analysis instructions/prompting used for the finding-authoring step (2.1)." },
+    "checklistVersion": { "type": "string", "description": "Version of references/checklist.md used." },
+    "scoreVersion": { "type": "string", "description": "Version of the scoring formula in references/severity-and-score.md." },
+    "mode": { "enum": ["quick", "standard", "pro"] },
+    "language": { "type": "string", "minLength": 2, "maxLength": 10, "description": "Language of the visible prose in this report (e.g. 'es', 'en', 'it'), for metadata/rendering purposes only. Does not change any enum value or field name." },
+    "compilerVersion": { "type": "string", "description": "Resolved or user-declared compiler version/range for the analyzed source. 'unknown' if it could not be determined." },
+    "scriptsAvailable": { "type": "boolean", "description": "Whether the deterministic scripts (preprocess.py/score.py/validate_report.py) were available and used in this runtime. When false, scoreStatus must be 'not_computed'." },
+    "inputHash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "Carried over from preprocess.py's inputHash for the analyzed source set." },
+    "scope": {
+      "type": "object",
+      "required": ["completeness"],
+      "additionalProperties": false,
+      "properties": {
+        "completeness": { "enum": ["complete", "partial", "failed"], "description": "Whole-analysis status. 'partial' or 'failed' here requires at least one 'NOT_ASSESSED' entry in categoryCoverage (see rule R-05 below) so a partial analysis can never render as if it were complete." },
+        "reasons": {
+          "type": "array",
+          "description": "Typed reasons, normally carried over from preprocess.py's completeness.reasons plus any reason the analysis step itself adds (e.g. protocol context the user did not supply in 'pro' mode).",
+          "items": {
+            "type": "object",
+            "required": ["code", "detail"],
+            "additionalProperties": false,
+            "properties": {
+              "code": { "type": "string" },
+              "detail": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "categoryCoverage": {
+      "type": "array",
+      "description": "Exactly one entry per SC01-SC10, in that order. This is the checklist coverage view; it is separate from 'findings' so that scoring and deduplication only ever operate on real detected items, never on placeholder rows.",
+      "minItems": 10,
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "required": ["category", "status"],
+        "additionalProperties": false,
+        "properties": {
+          "category": { "enum": ["SC01", "SC02", "SC03", "SC04", "SC05", "SC06", "SC07", "SC08", "SC09", "SC10"] },
+          "status": { "enum": ["DETECTED", "NOT_DETECTED", "NOT_ASSESSED"], "description": "DETECTED: at least one non-informational finding in this category. NOT_DETECTED: this category was assessed and no matching pattern was found within the analyzed scope - this is not a claim that no vulnerability exists. NOT_ASSESSED: this category could not be properly evaluated (missing dependency, unsupported language feature, insufficient protocol context, etc.)." },
+          "note": { "type": "string", "description": "Optional short, user-language explanation, mainly used for NOT_ASSESSED." }
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "description": "Only real detected items (security findings and informational notices such as a prompt-injection attempt). Never a placeholder for 'nothing found' - that belongs in categoryCoverage.",
+      "items": { "$ref": "#/definitions/finding" }
+    },
+    "limitations": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Free-text, user-language list of what this review does not cover (off-chain logic, deployment configuration, key management, tokenomics, governance outside the analyzed code, oracle/bridge infrastructure, deployed contract state, third-party systems, etc.)."
+    },
+    "riskIndicator": {
+      "type": "object",
+      "required": ["scoreStatus", "score", "band"],
+      "additionalProperties": false,
+      "properties": {
+        "scoreStatus": { "enum": ["computed", "not_computed"] },
+        "score": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 },
+        "band": { "enum": ["LOW", "MODERATE", "HIGH", "CRITICAL", null] },
+        "explanation": { "type": "string", "description": "Fixed English sentence rendered by render_report.py; not authored per-report." },
+        "scopeNote": { "type": "string", "description": "Fixed English sentence: 'according to the analyzed scope'." },
+        "message": { "type": "string", "description": "Present when scoreStatus is 'not_computed'; fixed English sentence explaining why no score is available." }
+      }
+    },
+    "scoreStatus": { "enum": ["computed", "not_computed"], "description": "Top-level mirror of riskIndicator.scoreStatus, kept for direct access per the original field list; both must always agree (rule R-08)." },
+    "gasSuggestions": {
+      "type": "array",
+      "description": "Optional, 'standard'/'pro' only (rule R-06). Qualitative gas-optimization notes; never an exact gas-unit estimate unless it was actually measured.",
+      "items": {
+        "type": "object",
+        "required": ["technique", "location", "explanation", "impact"],
+        "additionalProperties": false,
+        "properties": {
+          "technique": { "type": "string" },
+          "location": {
+            "type": "object",
+            "required": ["file"],
+            "additionalProperties": false,
+            "properties": {
+              "file": { "type": "string" },
+              "lineStart": { "type": ["integer", "null"] },
+              "lineEnd": { "type": ["integer", "null"] },
+              "contract": { "type": ["string", "null"] },
+              "function": { "type": ["string", "null"] }
+            }
+          },
+          "explanation": { "type": "string" },
+          "impact": { "enum": ["low", "medium", "high"] },
+          "compilerCompatible": { "type": ["boolean", "null"], "description": "Whether this technique is compatible with the report's compilerVersion; null if not checked." }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "finding": {
+      "type": "object",
+      "required": ["id", "stableKey", "category", "severity", "confidence", "status", "locations", "evidence", "description", "recommendation", "patch"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^F-[0-9a-f]{8}$", "description": "Derived deterministically from stableKey by score.py; not chosen by the AI." },
+        "stableKey": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "Recomputed by score.py from category + primary (first) location + signature. A finding's stableKey is never trusted from AI input; score.py always overwrites it (rule R-02)." },
+        "category": { "enum": ["SC01", "SC02", "SC03", "SC04", "SC05", "SC06", "SC07", "SC08", "SC09", "SC10", "EXTRA-tx-origin", "EXTRA-delegatecall", "EXTRA-selfdestruct", "EXTRA-weak-randomness", "EXTRA-dos-gas", "EXTRA-replay-permit", "EXTRA-front-running-mev", "EXTRA-floating-pragma", "EXTRA-obsolete-compiler", "EXTRA-assembly", "EXTRA-ownership", "EXTRA-config", "EXTRA-prompt-injection"] },
+        "signature": { "type": "string", "description": "Short, kebab-case, machine-meaningful slug identifying the root cause (e.g. 'unprotected-admin-function'), authored by the analysis step. Used together with category and locations to compute stableKey; an empty string is allowed but weakens deduplication precision." },
+        "severity": { "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFORMATIONAL"] },
+        "confidence": { "enum": ["high", "medium", "low"] },
+        "status": { "enum": ["suspected", "confirmed", "informational"], "description": "'informational' is for non-vulnerability notices (e.g. a detected prompt-injection attempt) and must always carry severity INFORMATIONAL (rule R-07); it never affects the score." },
+        "locations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["file"],
+            "additionalProperties": false,
+            "properties": {
+              "file": { "type": "string" },
+              "lineStart": { "type": ["integer", "null"] },
+              "lineEnd": { "type": ["integer", "null"] },
+              "contract": { "type": ["string", "null"] },
+              "function": { "type": ["string", "null"] }
+            }
+          }
+        },
+        "evidence": { "type": "array", "maxItems": 5, "items": { "type": "string" }, "description": "At most 5 short lines, sufficient to justify the finding. Never a full reproduction of unrelated code." },
+        "description": { "type": "string" },
+        "recommendation": { "type": "string" },
+        "patch": {
+          "description": "Structure only; scripts in this Skill never generate or validate the diff's correctness. Always null outside 'standard'/'pro' mode (rule R-06). render_report.py always appends a fixed disclaimer next to any non-null patch, regardless of this object's content.",
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "required": ["format", "diff"],
+              "additionalProperties": false,
+              "properties": {
+                "format": { "const": "unified-diff" },
+                "diff": { "type": "string" }
+              }
+            }
+          ]
+        },
+        "mergedCount": { "type": "integer", "minimum": 1, "description": "Set by score.py: how many pre-deduplication findings were merged into this one root-cause entry." }
+      }
+    }
+  },
+  "businessRules": [
+    "R-01: findings[] contains only real detected items; coverage/absence is expressed exclusively through categoryCoverage[].",
+    "R-02: score.py always recomputes id and stableKey from category + primary (first) location + signature; it never trusts these fields from AI input, so root-cause deduplication stays deterministic instead of depending on the analysis step behaving well.",
+    "R-03: categoryCoverage[] has exactly the 10 SC01-SC10 entries, no duplicates, no omissions.",
+    "R-04: if any non-informational finding references category X, categoryCoverage[X].status must be DETECTED.",
+    "R-05: if scope.completeness is 'partial' or 'failed', at least one categoryCoverage entry must be NOT_ASSESSED - a partial analysis must never render as if it were complete.",
+    "R-06: mode 'quick' forbids any non-null finding.patch and forbids any populated gasSuggestions; HTML rendering is only available for mode 'pro'.",
+    "R-07: status 'informational' implies severity INFORMATIONAL, and informational findings are excluded from scoring.",
+    "R-08: scoreStatus (top level) and riskIndicator.scoreStatus must be equal; scoreStatus 'computed' requires riskIndicator.score/band to be non-null and consistent with the band table in severity-and-score.md; 'not_computed' requires both to be null and riskIndicator.message to be present."
+  ]
+}
