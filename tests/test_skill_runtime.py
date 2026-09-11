@@ -148,7 +148,7 @@ class GuardrailsContentTests(unittest.TestCase):
             self.assertNotIn(claim, text)
 
     def test_mode_limit_numbers_are_not_hardcoded_here(self):
-        # Only scripts/preprocess.py's PROVISIONAL_LIMITS may state these numbers (D-006/section 6).
+        # Only config/modes.json may state these numbers (D-023/section 6).
         text = _read("references/guardrails.md")
         for number in ("500", "1500", "1,500", "4000", "4,000"):
             self.assertNotIn(number, text)
@@ -157,6 +157,11 @@ class GuardrailsContentTests(unittest.TestCase):
         text = _read("references/guardrails.md")
         self.assertIn("LOC_LIMIT_EXCEEDED", text)
         self.assertIn("stop before analyzing", text.lower())
+
+    def test_modes_config_is_named_as_the_single_source_of_truth(self):
+        text = _read("references/guardrails.md")
+        self.assertIn("config/modes.json", text)
+        self.assertIn("fails explicitly", text)
 
 
 class SkillFlowContentTests(unittest.TestCase):
@@ -173,15 +178,26 @@ class SkillFlowContentTests(unittest.TestCase):
         text = _read("SKILL.md")
         self.assertIn("2 retry attempts", text)
 
-    def test_skill_forbids_html_outside_pro(self):
+    def test_skill_gates_html_through_modes_config(self):
         text = _read("SKILL.md")
-        self.assertIn("In `pro` mode only", text)
-        self.assertIn("refuses `--format html` outside `pro`", text)
+        self.assertIn("`config/modes.json` sets `allowHtmlReport: true`", text)
+        self.assertIn("refuses `--format html` for a mode that doesn't", text)
 
     def test_skill_does_not_hardcode_mode_limit_numbers(self):
         text = _read("SKILL.md")
         for number in ("500", "1500", "1,500", "4000", "4,000"):
             self.assertNotIn(number, text)
+
+    def test_skill_documents_pro_only_report_fields(self):
+        text = _read("SKILL.md")
+        self.assertIn("executiveSummary", text)
+        self.assertIn("architectureNotes", text)
+        self.assertIn("allowExecutiveSummary", text)
+        self.assertIn("allowArchitectureChecks", text)
+
+    def test_skill_references_modes_config_as_source_of_truth(self):
+        text = _read("SKILL.md")
+        self.assertIn("config/modes.json", text)
 
 
 if __name__ == "__main__":

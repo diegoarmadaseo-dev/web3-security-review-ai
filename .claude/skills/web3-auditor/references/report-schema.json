@@ -94,9 +94,26 @@
       }
     },
     "scoreStatus": { "enum": ["computed", "not_computed"], "description": "Top-level mirror of riskIndicator.scoreStatus, kept for direct access per the original field list; both must always agree (rule R-08)." },
+    "executiveSummary": {
+      "type": "string",
+      "description": "Optional. Only permitted for modes where config/modes.json sets allowExecutiveSummary: true (rule R-09; currently 'pro' only). A short, non-technical, user-language synthesis of the review's overall findings and risk posture for a non-developer stakeholder. Must not restate the Automated Risk Indicator as a certification, guarantee, or safety claim - see references/guardrails.md, section 3."
+    },
+    "architectureNotes": {
+      "type": "array",
+      "description": "Optional. Only permitted for modes where config/modes.json sets allowArchitectureChecks: true (rule R-09; currently 'pro' only). Protocol/architecture-level observations that do not map to a single SC01-SC10 finding (e.g. trust assumptions between contracts, upgrade or governance surface, cross-contract invariants) - informational context, never a substitute for a categorized finding.",
+      "items": {
+        "type": "object",
+        "required": ["title", "description"],
+        "additionalProperties": false,
+        "properties": {
+          "title": { "type": "string" },
+          "description": { "type": "string" }
+        }
+      }
+    },
     "gasSuggestions": {
       "type": "array",
-      "description": "Optional, 'standard'/'pro' only (rule R-06). Qualitative gas-optimization notes; never an exact gas-unit estimate unless it was actually measured.",
+      "description": "Optional. Only permitted for modes where config/modes.json sets allowGasSuggestions: true (rule R-06). Qualitative gas-optimization notes; never an exact gas-unit estimate unless it was actually measured.",
       "items": {
         "type": "object",
         "required": ["technique", "location", "explanation", "impact"],
@@ -156,7 +173,7 @@
         "description": { "type": "string" },
         "recommendation": { "type": "string" },
         "patch": {
-          "description": "Structure only; scripts in this Skill never generate or validate the diff's correctness. Always null outside 'standard'/'pro' mode (rule R-06). render_report.py always appends a fixed disclaimer next to any non-null patch, regardless of this object's content.",
+          "description": "Structure only; scripts in this Skill never generate or validate the diff's correctness. Always null for modes where config/modes.json sets allowPatch: false (rule R-06). render_report.py always appends a fixed disclaimer next to any non-null patch, regardless of this object's content.",
           "oneOf": [
             { "type": "null" },
             {
@@ -180,8 +197,9 @@
     "R-03: categoryCoverage[] has exactly the 10 SC01-SC10 entries, no duplicates, no omissions.",
     "R-04: if any non-informational finding references category X, categoryCoverage[X].status must be DETECTED.",
     "R-05: if scope.completeness is 'partial' or 'failed', at least one categoryCoverage entry must be NOT_ASSESSED - a partial analysis must never render as if it were complete.",
-    "R-06: mode 'quick' forbids any non-null finding.patch and forbids any populated gasSuggestions; HTML rendering is only available for mode 'pro'.",
+    "R-06: finding.patch, gasSuggestions and HTML rendering are only permitted for modes where config/modes.json sets the corresponding allowPatch/allowGasSuggestions/allowHtmlReport to true; forbidden otherwise. Nothing in this Skill duplicates those booleans - scripts/preprocess.py, scripts/validate_report.py and scripts/render_report.py all read config/modes.json directly.",
     "R-07: status 'informational' implies severity INFORMATIONAL, and informational findings are excluded from scoring.",
-    "R-08: scoreStatus (top level) and riskIndicator.scoreStatus must be equal; scoreStatus 'computed' requires riskIndicator.score/band to be non-null and consistent with the band table in severity-and-score.md; 'not_computed' requires both to be null and riskIndicator.message to be present."
+    "R-08: scoreStatus (top level) and riskIndicator.scoreStatus must be equal; scoreStatus 'computed' requires riskIndicator.score/band to be non-null and consistent with the band table in severity-and-score.md; 'not_computed' requires both to be null and riskIndicator.message to be present.",
+    "R-09: executiveSummary and architectureNotes are only permitted for modes where config/modes.json sets allowExecutiveSummary/allowArchitectureChecks to true; omitted otherwise."
   ]
 }

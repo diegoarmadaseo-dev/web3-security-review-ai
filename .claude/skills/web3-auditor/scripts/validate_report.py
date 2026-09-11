@@ -2,7 +2,7 @@
 """Standard-library-only validator for a security review report JSON.
 
 Checks the shape and enums against references/report-schema.json and the
-business rules (R-01..R-08) documented there and in
+business rules (R-01..R-09) documented there and in
 references/severity-and-score.md. This script never fixes content itself -
 the Skill runtime is responsible for retrying with the analysis step (see
 the original brief, section 29: at most 2 retries before reportStatus
@@ -28,7 +28,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
-from preprocess import CATEGORIES  # noqa: E402
+from preprocess import CATEGORIES, ModesConfigError, load_modes_config  # noqa: E402
 from score import compute_id, compute_stable_key, score_band  # noqa: E402
 
 EXIT_OK = 0
@@ -36,7 +36,6 @@ EXIT_FAILED = 1
 
 SC_CATEGORIES = ["SC%02d" % n for n in range(1, 11)]
 VALID_CATEGORIES = set(CATEGORIES.keys())
-VALID_MODES = {"quick", "standard", "pro"}
 VALID_COMPLETENESS = {"complete", "partial", "failed"}
 VALID_COVERAGE_STATUS = {"DETECTED", "NOT_DETECTED", "NOT_ASSESSED"}
 VALID_SEVERITIES = {"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFORMATIONAL"}
@@ -62,7 +61,7 @@ TOP_LEVEL_REQUIRED = [
     "riskIndicator",
     "scoreStatus",
 ]
-TOP_LEVEL_OPTIONAL = {"language", "gasSuggestions"}
+TOP_LEVEL_OPTIONAL = {"language", "gasSuggestions", "executiveSummary", "architectureNotes"}
 TOP_LEVEL_ALLOWED = set(TOP_LEVEL_REQUIRED) | TOP_LEVEL_OPTIONAL
 
 FINDING_REQUIRED = [
@@ -277,9 +276,27 @@ def _validate_gas_suggestions(gas_suggestions: Any, errors: ErrorCollector) -> N
         errors.require(item.get("impact") in VALID_GAS_IMPACT, "%s.impact must be one of %s" % (path, sorted(VALID_GAS_IMPACT)))
 
 
+def _validate_architecture_notes(notes: Any, errors: ErrorCollector) -> None:
+    if not errors.require(isinstance(notes, list), "architectureNotes must be an array"):
+        return
+    for index, item in enumerate(notes):
+        path = "architectureNotes[%d]" % index
+        if not errors.require(isinstance(item, dict), "%s must be an object" % path):
+            continue
+        errors.require(_is_str(item.get("title")) and item.get("title"), "%s.title must be a non-empty string" % path)
+        errors.require(_is_str(item.get("description")) and item.get("description"), "%s.description must be a non-empty string" % path)
+        unknown = set(item.keys()) - {"title", "description"}
+        errors.require(not unknown, "%s has unknown fields: %s" % (path, sorted(unknown)))
+
+
 def validate_report(report: Any) -> List[str]:
     if not isinstance(report, dict):
         raise ReportValidationError("report must be a JSON object")
+
+    # No silent fallback: a missing or malformed config/modes.json must stop
+    # validation rather than let it proceed against invented mode rules.
+    modes_config = load_modes_config()
+    valid_modes = set(modes_config["modes"].keys())
 
     errors = ErrorCollector()
 
@@ -292,7 +309,7 @@ def validate_report(report: Any) -> List[str]:
     for key in ("skillVersion", "analysisEngineVersion", "checklistVersion", "scoreVersion", "compilerVersion"):
         if key in report:
             errors.require(_is_str(report[key]) and report[key], "%s must be a non-empty string" % key)
-    errors.require(report.get("mode") in VALID_MODES, "mode must be one of %s" % sorted(VALID_MODES))
+    errors.require(report.get("mode") in valid_modes, "mode must be one of %s" % sorted(valid_modes))
     errors.require(isinstance(report.get("scriptsAvailable"), bool), "scriptsAvailable must be a boolean")
     input_hash = report.get("inputHash")
     errors.require(_is_str(input_hash) and bool(INPUT_HASH_RE.match(input_hash or "")), "inputHash must match ^sha256:[0-9a-f]{64}$")
@@ -338,15 +355,30 @@ def validate_report(report: Any) -> List[str]:
             )
 
     mode = report.get("mode")
-    if mode == "quick":
-        for finding in valid_findings:
-            if finding.get("patch") is not None:
-                errors.add("mode 'quick' forbids a non-null patch (rule R-06), found on finding %s" % finding.get("id"))
-        if report.get("gasSuggestions"):
-            errors.add("mode 'quick' forbids gasSuggestions (rule R-06)")
+    mode_rules = modes_config["modes"].get(mode)
+    if mode_rules is not None:
+        if not mode_rules["allowPatch"]:
+            for finding in valid_findings:
+                if finding.get("patch") is not None:
+                    errors.add(
+                        "mode %r forbids a non-null patch (rule R-06; config/modes.json: allowPatch is false), "
+                        "found on finding %s" % (mode, finding.get("id"))
+                    )
+        if not mode_rules["allowGasSuggestions"] and report.get("gasSuggestions"):
+            errors.add("mode %r forbids gasSuggestions (rule R-06; config/modes.json: allowGasSuggestions is false)" % mode)
+        if not mode_rules["allowExecutiveSummary"] and report.get("executiveSummary"):
+            errors.add("mode %r forbids executiveSummary (rule R-09; config/modes.json: allowExecutiveSummary is false)" % mode)
+        if not mode_rules["allowArchitectureChecks"] and report.get("architectureNotes"):
+            errors.add("mode %r forbids architectureNotes (rule R-09; config/modes.json: allowArchitectureChecks is false)" % mode)
 
     if "gasSuggestions" in report and report["gasSuggestions"] is not None:
         _validate_gas_suggestions(report["gasSuggestions"], errors)
+
+    if "executiveSummary" in report and report["executiveSummary"] is not None:
+        errors.require(_is_str(report["executiveSummary"]), "executiveSummary must be a string")
+
+    if "architectureNotes" in report and report["architectureNotes"] is not None:
+        _validate_architecture_notes(report["architectureNotes"], errors)
 
     limitations = report.get("limitations")
     if errors.require(isinstance(limitations, list), "limitations must be an array"):
@@ -398,7 +430,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         report = _read_input(args.path)
         errors = validate_report(report)
-    except ReportValidationError as exc:
+    except (ReportValidationError, ModesConfigError) as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False), file=sys.stdout)
         return EXIT_FAILED
     payload = {

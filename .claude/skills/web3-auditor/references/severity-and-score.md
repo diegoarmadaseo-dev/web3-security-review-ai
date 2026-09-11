@@ -123,7 +123,9 @@ never gets silently rendered the same way as one that was actually checked and c
 
 - Every category referenced by a non-informational finding has `categoryCoverage` status `DETECTED`.
 - `scope.completeness` other than `complete` implies at least one `NOT_ASSESSED` category.
-- `mode: "quick"` forbids any finding with a non-null `patch` and forbids `gasSuggestions`.
+- Per-mode feature gating - which modes allow `patch`, `gasSuggestions`, an HTML report,
+  `architectureNotes`, or `executiveSummary` - lives in `config/modes.json`, not here (rules R-06/R-09);
+  this file only owns the score formula and deduplication rules above.
 - `status: "informational"` implies `severity: "INFORMATIONAL"`.
 - The top-level `scoreStatus` and `riskIndicator.scoreStatus` agree, and `riskIndicator.score`/`band`
   are present only when `scoreStatus` is `computed`.

@@ -32,15 +32,71 @@ EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_USAGE = 2
 
-# Provisional limits. config/modes.json (subphase 2.2) becomes the source of
-# truth; until then these values mirror the roadmap and can be overridden with
-# --max-loc.
-PROVISIONAL_LIMITS: Dict[str, Dict[str, Optional[int]]] = {
-    "quick": {"maxEffectiveLoc": 500, "maxSourceFiles": 1},
-    "standard": {"maxEffectiveLoc": 1500, "maxSourceFiles": None},
-    "pro": {"maxEffectiveLoc": 4000, "maxSourceFiles": None},
-}
-DEFAULT_MODE = "standard"
+# config/modes.json is the single source of truth for review-mode limits and
+# feature-gating (subphase 2.2). It is loaded at runtime, never hardcoded here
+# or duplicated in SKILL.md/guardrails.md - see docs/decisiones.md, D-023.
+SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MODES_CONFIG_PATH = os.path.join(SKILL_DIR, "config", "modes.json")
+
+_MODE_INT_OR_NULL_KEYS = ("maxEffectiveLoc", "maxSourceFiles")
+_MODE_BOOL_KEYS = (
+    "allowPatch",
+    "allowGasSuggestions",
+    "allowHtmlReport",
+    "allowArchitectureChecks",
+    "allowExecutiveSummary",
+)
+_MODE_REQUIRED_KEYS = _MODE_INT_OR_NULL_KEYS + _MODE_BOOL_KEYS
+
+
+class ModesConfigError(Exception):
+    """config/modes.json is missing, unreadable, or malformed.
+
+    There is no built-in fallback: mode limits and feature-gating come only
+    from this file, so a missing or corrupt config must fail loudly here
+    rather than let any script silently run with invented defaults.
+    """
+
+
+def load_modes_config(path: Optional[str] = None) -> Dict[str, Any]:
+    """Load and validate config/modes.json. Raises ModesConfigError - never
+    returns a built-in fallback - so a missing or malformed config stops the
+    caller instead of silently changing which limits or features apply."""
+    config_path = path or MODES_CONFIG_PATH
+    try:
+        with open(config_path, "r", encoding="utf-8") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        raise ModesConfigError("modes config not found or unreadable at %s: %s" % (config_path, exc)) from exc
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ModesConfigError("modes config at %s is not valid JSON: %s" % (config_path, exc)) from exc
+
+    if not isinstance(data, dict) or not isinstance(data.get("modes"), dict) or not data["modes"]:
+        raise ModesConfigError("modes config at %s must be a JSON object with a non-empty 'modes' object" % config_path)
+
+    modes = data["modes"]
+    for mode_name, mode_data in modes.items():
+        if not isinstance(mode_data, dict):
+            raise ModesConfigError("modes config at %s: mode %r must be an object" % (config_path, mode_name))
+        missing = [key for key in _MODE_REQUIRED_KEYS if key not in mode_data]
+        if missing:
+            raise ModesConfigError("modes config at %s: mode %r is missing required keys: %s" % (config_path, mode_name, sorted(missing)))
+        for key in _MODE_INT_OR_NULL_KEYS:
+            value = mode_data[key]
+            if value is not None and (not isinstance(value, int) or isinstance(value, bool)):
+                raise ModesConfigError("modes config at %s: mode %r key %r must be an integer or null, got %r" % (config_path, mode_name, key, value))
+        for key in _MODE_BOOL_KEYS:
+            if not isinstance(mode_data[key], bool):
+                raise ModesConfigError("modes config at %s: mode %r key %r must be a boolean, got %r" % (config_path, mode_name, key, mode_data[key]))
+
+    default_mode = data.get("defaultMode")
+    if not isinstance(default_mode, str) or default_mode not in modes:
+        raise ModesConfigError("modes config at %s: 'defaultMode' must name one of the modes in 'modes'" % config_path)
+
+    return data
+
 
 SOURCE_EXTENSIONS = {".sol": "solidity", ".vy": "vyper"}
 DOCUMENT_EXTENSIONS = {".md", ".markdown", ".txt", ".rst"}
@@ -2375,14 +2431,33 @@ def build_artifact(
 # CLI
 # ---------------------------------------------------------------------------
 
-def resolve_limits(mode: str, max_loc_override: Optional[int]) -> Dict[str, Optional[int]]:
-    limits = dict(PROVISIONAL_LIMITS.get(mode, PROVISIONAL_LIMITS[DEFAULT_MODE]))
+def resolve_limits(
+    mode: str,
+    max_loc_override: Optional[int],
+    modes_config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Optional[int]]:
+    config = modes_config if modes_config is not None else load_modes_config()
+    modes = config["modes"]
+    if mode not in modes:
+        raise ModesConfigError("mode %r is not defined in modes config (available: %s)" % (mode, sorted(modes.keys())))
+    limits: Dict[str, Optional[int]] = {
+        "maxEffectiveLoc": modes[mode]["maxEffectiveLoc"],
+        "maxSourceFiles": modes[mode]["maxSourceFiles"],
+    }
     if max_loc_override is not None:
         limits["maxEffectiveLoc"] = max_loc_override
     return limits
 
 
-def run(paths: List[str], *, mode: str, max_loc: Optional[int], use_stdin: bool, include_timestamp: bool) -> Dict[str, Any]:
+def run(
+    paths: List[str],
+    *,
+    mode: str,
+    max_loc: Optional[int],
+    use_stdin: bool,
+    include_timestamp: bool,
+    modes_config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     stdin_text = None
     if use_stdin:
         raw = sys.stdin.buffer.read()
@@ -2397,11 +2472,11 @@ def run(paths: List[str], *, mode: str, max_loc: Optional[int], use_stdin: bool,
     if not entries:
         raise PreprocessError("no analyzable input found")
     processed = [process_entry(entry) for entry in entries]
-    limits = resolve_limits(mode, max_loc)
+    limits = resolve_limits(mode, max_loc, modes_config=modes_config)
     return build_artifact(processed, mode=mode, limits=limits, include_timestamp=include_timestamp)
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
+def build_arg_parser(modes_config: Dict[str, Any]) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="preprocess.py",
         description="Deterministic preprocessing for smart contract source files. "
@@ -2409,7 +2484,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                      "Signals are hints, not findings.",
     )
     parser.add_argument("paths", nargs="*", help="Source files or directories to analyze.")
-    parser.add_argument("--mode", choices=sorted(PROVISIONAL_LIMITS.keys()), default=DEFAULT_MODE, help="Review mode; sets provisional LOC limits.")
+    parser.add_argument(
+        "--mode",
+        choices=sorted(modes_config["modes"].keys()),
+        default=modes_config["defaultMode"],
+        help="Review mode; limits and feature-gating come from config/modes.json.",
+    )
     parser.add_argument("--max-loc", type=int, default=None, help="Override the mode's maxEffectiveLoc limit.")
     parser.add_argument("--no-timestamp", action="store_true", help="Omit the timestamp field (useful for reproducibility tests).")
     parser.add_argument("--indent", type=int, default=2, help="JSON indentation (0 for compact output).")
@@ -2432,7 +2512,12 @@ def _force_utf8_stdio() -> None:
 
 def main(argv: Optional[List[str]] = None) -> int:
     _force_utf8_stdio()
-    parser = build_arg_parser()
+    try:
+        modes_config = load_modes_config()
+    except ModesConfigError as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False), file=sys.stdout)
+        return EXIT_FAILED
+    parser = build_arg_parser(modes_config)
     args = parser.parse_args(argv)
     use_stdin = not args.paths and not sys.stdin.isatty()
     try:
@@ -2442,6 +2527,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             max_loc=args.max_loc,
             use_stdin=use_stdin,
             include_timestamp=not args.no_timestamp,
+            modes_config=modes_config,
         )
     except PreprocessError as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False), file=sys.stdout)

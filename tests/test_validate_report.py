@@ -11,6 +11,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / ".claude" / "skills" / "web3-auditor" / "scripts"
@@ -156,6 +157,35 @@ class BusinessRuleTests(unittest.TestCase):
         errors = validate_report.validate_report(bad)
         self.assertTrue(any("R-08" in e for e in errors))
 
+    def test_r09_pro_mode_allows_executive_summary_and_architecture_notes(self):
+        ok = copy.deepcopy(self.report)
+        ok["mode"] = "pro"
+        ok["executiveSummary"] = "Overall risk is low within the analyzed scope."
+        ok["architectureNotes"] = [{"title": "Upgrade surface", "description": "The proxy admin is a single EOA."}]
+        errors = validate_report.validate_report(ok)
+        self.assertEqual(errors, [])
+
+    def test_r09_standard_mode_forbids_executive_summary(self):
+        bad = copy.deepcopy(self.report)
+        bad["mode"] = "standard"
+        bad["executiveSummary"] = "Should not be here."
+        errors = validate_report.validate_report(bad)
+        self.assertTrue(any("R-09" in e for e in errors))
+
+    def test_r09_standard_mode_forbids_architecture_notes(self):
+        bad = copy.deepcopy(self.report)
+        bad["mode"] = "standard"
+        bad["architectureNotes"] = [{"title": "t", "description": "d"}]
+        errors = validate_report.validate_report(bad)
+        self.assertTrue(any("R-09" in e for e in errors))
+
+    def test_r09_quick_mode_forbids_both(self):
+        bad = copy.deepcopy(self.report)
+        bad["mode"] = "quick"
+        bad["executiveSummary"] = "Should not be here."
+        errors = validate_report.validate_report(bad)
+        self.assertTrue(any("R-09" in e for e in errors))
+
 
 class ShapeAndEnumTests(unittest.TestCase):
     def test_missing_top_level_field_is_rejected(self):
@@ -223,6 +253,25 @@ class ShapeAndEnumTests(unittest.TestCase):
         errors = validate_report.validate_report(bad)
         self.assertTrue(any("duplicate finding id" in e for e in errors))
 
+    def test_architecture_note_missing_description_is_rejected(self):
+        bad = make_valid_report(mode="pro")
+        bad["mode"] = "pro"
+        bad["architectureNotes"] = [{"title": "Upgrade surface"}]
+        errors = validate_report.validate_report(bad)
+        self.assertTrue(any("architectureNotes[0].description" in e for e in errors))
+
+    def test_architecture_note_unknown_field_is_rejected(self):
+        bad = make_valid_report(mode="pro")
+        bad["architectureNotes"] = [{"title": "t", "description": "d", "extra": "nope"}]
+        errors = validate_report.validate_report(bad)
+        self.assertTrue(any("architectureNotes[0] has unknown fields" in e for e in errors))
+
+    def test_executive_summary_must_be_a_string(self):
+        bad = make_valid_report(mode="pro")
+        bad["executiveSummary"] = 12345
+        errors = validate_report.validate_report(bad)
+        self.assertTrue(any("executiveSummary must be a string" in e for e in errors))
+
 
 class InvalidInputTests(unittest.TestCase):
     def test_non_dict_top_level_raises(self):
@@ -246,6 +295,29 @@ class SchemaDriftTests(unittest.TestCase):
         schema_path = SCRIPTS_DIR.parent / "references" / "report-schema.json"
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
         self.assertEqual(set(schema["definitions"]["finding"]["required"]), set(validate_report.FINDING_REQUIRED))
+
+
+class ModesConfigFailsLoudlyTests(unittest.TestCase):
+    """A broken config/modes.json must stop validation, not fall back silently."""
+
+    def test_broken_modes_config_propagates_as_modes_config_error(self):
+        report = make_valid_report()
+        with mock.patch.object(validate_report, "load_modes_config", side_effect=validate_report.ModesConfigError("boom")):
+            with self.assertRaises(validate_report.ModesConfigError):
+                validate_report.validate_report(report)
+
+    def test_cli_reports_broken_modes_config_as_a_clean_error_envelope(self):
+        old = sys.stdin
+        sys.stdin = io.StringIO(json.dumps(make_valid_report()))
+        buf = io.StringIO()
+        try:
+            with mock.patch.object(validate_report, "load_modes_config", side_effect=validate_report.ModesConfigError("boom")):
+                with contextlib.redirect_stdout(buf):
+                    exit_code = validate_report.main([])
+        finally:
+            sys.stdin = old
+        self.assertEqual(exit_code, validate_report.EXIT_FAILED)
+        self.assertFalse(json.loads(buf.getvalue())["ok"])
 
 
 class CLITests(unittest.TestCase):

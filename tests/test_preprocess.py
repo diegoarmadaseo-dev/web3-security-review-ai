@@ -497,6 +497,26 @@ class LimitsTests(unittest.TestCase):
             codes = [r["code"] for r in artifact["completeness"]["reasons"]]
             self.assertIn("LOC_LIMIT_EXCEEDED", codes)
 
+    def test_standard_mode_enforces_its_own_file_limit(self):
+        # Subfase 2.2: standard and pro must no longer share the same (previously
+        # both-unlimited) file-count limit - see config/modes.json.
+        with tempfile.TemporaryDirectory() as tmp:
+            standard_limit = preprocess.load_modes_config()["modes"]["standard"]["maxSourceFiles"]
+            for i in range(standard_limit + 1):
+                write(tmp, "C%d.sol" % i, "pragma solidity 0.8.20;\ncontract C%d {}\n" % i)
+            artifact = run_paths([tmp], mode="standard")
+            codes = [r["code"] for r in artifact["completeness"]["reasons"]]
+            self.assertIn("FILE_LIMIT_EXCEEDED", codes)
+
+    def test_pro_mode_has_no_file_limit_for_the_same_file_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            standard_limit = preprocess.load_modes_config()["modes"]["standard"]["maxSourceFiles"]
+            for i in range(standard_limit + 1):
+                write(tmp, "C%d.sol" % i, "pragma solidity 0.8.20;\ncontract C%d {}\n" % i)
+            artifact = run_paths([tmp], mode="pro")
+            codes = [r["code"] for r in artifact["completeness"]["reasons"]]
+            self.assertNotIn("FILE_LIMIT_EXCEEDED", codes)
+
 
 class SecretsTests(unittest.TestCase):
     def test_hex64_near_private_key_keyword_is_redacted_and_never_echoed(self):

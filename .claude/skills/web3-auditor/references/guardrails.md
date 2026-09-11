@@ -73,13 +73,20 @@ tell the user plainly, in their own language, that a value which looks like a cr
 what they submitted and that they should rotate or revoke it immediately - without repeating the value
 or any part of it, and without needing to know what it actually was.
 
-## 6. Mode limits
+## 6. Mode limits and feature-gating
 
-Quick/Standard/Pro's line-count limits are **provisional** and live in exactly one place:
-`PROVISIONAL_LIMITS` inside `scripts/preprocess.py` (`config/modes.json`, subphase 2.2, will become the
-real source once it exists). Do not restate the numbers here or in `SKILL.md` - always read the
-`limits` field from `preprocess.py`'s own JSON output for the mode actually used, so this file can
-never silently drift out of sync with the script.
+Quick/Standard/Pro's limits (`maxEffectiveLoc`, `maxSourceFiles`) and feature-gating (`allowPatch`,
+`allowGasSuggestions`, `allowHtmlReport`, `allowArchitectureChecks`, `allowExecutiveSummary`) are
+**provisional** and live in exactly one place: `config/modes.json`, next to `SKILL.md`. It is loaded at
+runtime by `scripts/preprocess.py` (limits), `scripts/validate_report.py` (patch/gas/executive-summary/
+architecture-notes gating, rules R-06/R-09) and `scripts/render_report.py` (HTML gating, rule R-06) -
+none of them hardcodes a second copy. Do not restate a number or a per-mode feature name here or in
+`SKILL.md` as if it were fixed - always read the `limits` field from `preprocess.py`'s own JSON output
+for the mode actually used, so this file can never silently drift out of sync with the config.
+
+If `config/modes.json` is missing or malformed, every script above fails explicitly (a clear error,
+non-zero exit) instead of guessing a default limit or permission. Treat that exactly like the affected
+script being unavailable (section 9) - never proceed as if some default mode's rules applied.
 
 If `completeness.reasons` contains `LOC_LIMIT_EXCEEDED` or `FILE_LIMIT_EXCEEDED`: **stop before analyzing.** Tell the user the total effective LOC (or file count) against the mode's limit, list what
 `priorityRanking` proposes covering first, and ask how they want to proceed (narrow the input, accept a

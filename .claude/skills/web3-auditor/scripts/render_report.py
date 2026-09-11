@@ -9,7 +9,8 @@ AI-authored narrative fields (finding descriptions, recommendations) carry
 the user's language, because the analysis step already wrote them that way.
 
 HTML output is self-contained (inline CSS only, no external requests) and
-only available for mode "pro" (rule R-06). Every value that originates from
+only available for modes where config/modes.json sets allowHtmlReport: true
+(currently "pro"; rule R-06). Every value that originates from
 analyzed, potentially adversarial source code (evidence, diffs, file paths,
 descriptions) is HTML-escaped before being written out, so the report itself
 never becomes an injection vector when opened in a browser.
@@ -29,7 +30,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
-from preprocess import CATEGORIES  # noqa: E402
+from preprocess import CATEGORIES, ModesConfigError, load_modes_config  # noqa: E402
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -166,6 +167,13 @@ def render_markdown(report: Dict[str, Any]) -> str:
     lines.extend(MANDATORY_NOTICE_LINES)
     lines.append("")
 
+    executive_summary = report.get("executiveSummary")
+    if executive_summary:
+        lines.append("## Executive Summary")
+        lines.append("")
+        lines.append(executive_summary)
+        lines.append("")
+
     scope = report.get("scope") or {}
     lines.append("## Scope")
     lines.append("")
@@ -197,6 +205,16 @@ def render_markdown(report: Dict[str, Any]) -> str:
         note = entry.get("note") or (NOT_DETECTED_NOTE if status == "NOT_DETECTED" else "")
         lines.append("| %s | %s | %s |" % (_category_label(entry.get("category", "")), COVERAGE_STATUS_LABEL.get(status, status), note))
     lines.append("")
+
+    architecture_notes = report.get("architectureNotes") or []
+    if architecture_notes:
+        lines.append("## Architecture Notes")
+        lines.append("")
+        for note in architecture_notes:
+            lines.append("### %s" % note.get("title", ""))
+            lines.append("")
+            lines.append(note.get("description", ""))
+            lines.append("")
 
     findings = _sorted_findings(report.get("findings") or [])
     real_findings = [f for f in findings if f.get("status") != "informational"]
@@ -296,8 +314,13 @@ def _html_finding(finding: Dict[str, Any]) -> str:
 
 
 def render_html(report: Dict[str, Any]) -> str:
-    if report.get("mode") != "pro":
-        raise ReportRenderError("HTML rendering is only available for mode 'pro' (rule R-06), got %r" % report.get("mode"))
+    # No silent fallback: a missing or malformed config/modes.json must stop
+    # rendering rather than guess whether this mode may produce HTML.
+    modes_config = load_modes_config()
+    mode = report.get("mode")
+    mode_rules = modes_config["modes"].get(mode)
+    if mode_rules is None or not mode_rules["allowHtmlReport"]:
+        raise ReportRenderError("HTML rendering is not enabled for mode %r (rule R-06; see config/modes.json)" % mode)
 
     parts: List[str] = []
     lang = _esc(report.get("language") or "en")
@@ -323,6 +346,11 @@ def render_html(report: Dict[str, Any]) -> str:
         else:
             parts.append("<p>%s</p>" % _esc(stripped))
     parts.append("</div>")
+
+    executive_summary = report.get("executiveSummary")
+    if executive_summary:
+        parts.append("<h2>Executive Summary</h2>")
+        parts.append("<p>%s</p>" % _esc(executive_summary))
 
     scope = report.get("scope") or {}
     parts.append("<h2>Scope</h2>")
@@ -355,6 +383,13 @@ def render_html(report: Dict[str, Any]) -> str:
             _esc(_category_label(entry.get("category", ""))), _esc(COVERAGE_STATUS_LABEL.get(status, status)), _esc(note),
         ))
     parts.append("</table>")
+
+    architecture_notes = report.get("architectureNotes") or []
+    if architecture_notes:
+        parts.append("<h2>Architecture Notes</h2>")
+        for note in architecture_notes:
+            parts.append("<h3>%s</h3>" % _esc(note.get("title", "")))
+            parts.append("<p>%s</p>" % _esc(note.get("description", "")))
 
     findings = _sorted_findings(report.get("findings") or [])
     real_findings = [f for f in findings if f.get("status") != "informational"]
@@ -442,7 +477,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         report = _read_input(args.path)
         rendered = render_html(report) if args.format == "html" else render_markdown(report)
-    except ReportRenderError as exc:
+    except (ReportRenderError, ModesConfigError) as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False), file=sys.stdout)
         return EXIT_FAILED
     if args.out:

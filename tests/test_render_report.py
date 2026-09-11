@@ -12,6 +12,7 @@ import re
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / ".claude" / "skills" / "web3-auditor" / "scripts"
@@ -135,6 +136,29 @@ class MarkdownRenderTests(unittest.TestCase):
         second = render_report.render_markdown(copy.deepcopy(report))
         self.assertEqual(first, second)
 
+    def test_executive_summary_is_rendered_when_present(self):
+        report = make_report(mode="pro")
+        report["executiveSummary"] = "Overall risk is low within the analyzed scope."
+        text = render_report.render_markdown(report)
+        self.assertIn("## Executive Summary", text)
+        self.assertIn("Overall risk is low within the analyzed scope.", text)
+
+    def test_executive_summary_section_absent_when_not_present(self):
+        text = render_report.render_markdown(make_report())
+        self.assertNotIn("## Executive Summary", text)
+
+    def test_architecture_notes_are_rendered_when_present(self):
+        report = make_report(mode="pro")
+        report["architectureNotes"] = [{"title": "Upgrade surface", "description": "The proxy admin is a single EOA."}]
+        text = render_report.render_markdown(report)
+        self.assertIn("## Architecture Notes", text)
+        self.assertIn("### Upgrade surface", text)
+        self.assertIn("The proxy admin is a single EOA.", text)
+
+    def test_architecture_notes_section_absent_when_not_present(self):
+        text = render_report.render_markdown(make_report())
+        self.assertNotIn("## Architecture Notes", text)
+
 
 class HTMLRenderTests(unittest.TestCase):
     def test_html_refused_outside_pro_mode(self):
@@ -178,6 +202,52 @@ class HTMLRenderTests(unittest.TestCase):
         del report["language"]
         html_text = render_report.render_html(report)
         self.assertIn('lang="en"', html_text)
+
+    def test_executive_summary_is_rendered_in_html(self):
+        report = make_report(mode="pro")
+        report["executiveSummary"] = "Overall risk is low within the analyzed scope."
+        html_text = render_report.render_html(report)
+        self.assertIn("Executive Summary", html_text)
+        self.assertIn("Overall risk is low within the analyzed scope.", html_text)
+
+    def test_architecture_notes_are_rendered_in_html(self):
+        report = make_report(mode="pro")
+        report["architectureNotes"] = [{"title": "Upgrade surface", "description": "The proxy admin is a single EOA."}]
+        html_text = render_report.render_html(report)
+        self.assertIn("Architecture Notes", html_text)
+        self.assertIn("Upgrade surface", html_text)
+
+    def test_architecture_notes_escape_adversarial_content(self):
+        report = make_report(mode="pro")
+        report["architectureNotes"] = [{"title": "<script>alert(4)</script>", "description": "Payload: <img src=x onerror=alert(5)>"}]
+        html_text = render_report.render_html(report)
+        self.assertNotIn("<script>alert", html_text)
+        self.assertIn("&lt;script&gt;alert(4)&lt;/script&gt;", html_text)
+        live_tags = set(re.findall(r"<\s*/?\s*([a-zA-Z0-9!-]+)", html_text))
+        self.assertEqual(live_tags - KNOWN_TEMPLATE_TAGS, set())
+
+
+class ModesConfigFailsLoudlyTests(unittest.TestCase):
+    """A broken config/modes.json must stop HTML rendering, not guess a default."""
+
+    def test_broken_modes_config_propagates_from_render_html(self):
+        report = make_report(mode="pro")
+        with mock.patch.object(render_report, "load_modes_config", side_effect=render_report.ModesConfigError("boom")):
+            with self.assertRaises(render_report.ModesConfigError):
+                render_report.render_html(report)
+
+    def test_cli_reports_broken_modes_config_as_a_clean_error_envelope(self):
+        old = sys.stdin
+        sys.stdin = io.StringIO(json.dumps(make_report(mode="pro")))
+        buf = io.StringIO()
+        try:
+            with mock.patch.object(render_report, "load_modes_config", side_effect=render_report.ModesConfigError("boom")):
+                with contextlib.redirect_stdout(buf):
+                    exit_code = render_report.main(["--format", "html"])
+        finally:
+            sys.stdin = old
+        self.assertEqual(exit_code, render_report.EXIT_FAILED)
+        self.assertFalse(json.loads(buf.getvalue())["ok"])
 
 
 class CLITests(unittest.TestCase):
