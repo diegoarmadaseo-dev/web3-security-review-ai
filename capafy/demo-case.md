@@ -1,6 +1,9 @@
 # Demo / Test Case — Draft
 
-Proposal for the example shown in the Capafy listing (screenshot, sample output, or a "try it" prompt).
+Capafy is the distribution channel for `Security Review Analyzer` V1, reopened for that purpose only
+(`docs/decisiones.md`, D-030) — the core stays fully independent of Capafy (D-026), unchanged by this
+file. Proposal for the example shown in the Capafy listing (screenshot, sample output, or a "try it"
+prompt).
 
 ## Do not reuse the Subfase 3.1 eval outputs as the demo
 

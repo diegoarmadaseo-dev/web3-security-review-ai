@@ -1,8 +1,12 @@
 # Data Declaration — Draft
 
-Draft for whatever data-handling disclosure Capafy's listing flow requires. Follows RISK-006
+Capafy is the distribution channel for `Security Review Analyzer` V1, reopened for that purpose only
+(`docs/decisiones.md`, D-030) — the core stays fully independent of Capafy (D-026), unchanged by this
+file. Draft for whatever data-handling disclosure Capafy's listing flow requires. Follows RISK-006
 (`docs/legal-risk-register.md`) and the retention wording fixed in `docs/commercial-claims.md`. Every
-`[CAPAFY-VERIFY]` item below is unconfirmed against the live console/ToS; every `[DIEGO]` item needs a
+`[CAPAFY-VERIFY]` item below is unconfirmed against the live console/ToS - reopening Capafy does not
+resolve any of them by itself, since none were ever actually checked against the live product (they
+were only marked moot while Capafy was off the roadmap, per D-030); every `[DIEGO]` item needs a
 decision or a source only Diego can supply. Do not fill either placeholder with an invented value.
 
 ## What this Skill does with submitted code
@@ -51,6 +55,8 @@ LLM processing via Capafy infrastructure.
 
 ## What must never appear in this declaration
 
-Any claim from `docs/commercial-claims.md`'s prohibited-vocabulary list (level A), or any equivalent
-promise this Skill or Capafy has not actually made and verified. That list is not reproduced here —
-see the source document, and re-run this repo's forbidden-terms grep over this file before publishing.
+Any claim from `docs/commercial-claims.md`'s prohibited-vocabulary list (level A) - including the
+broadened rule from D-029 covering any unscoped absolute safety/security claim, not just the terms
+listed by name - or any equivalent promise this Skill or Capafy has not actually made and verified.
+That list is not reproduced here — see the source document, and re-run this repo's forbidden-terms
+grep over this file before publishing.

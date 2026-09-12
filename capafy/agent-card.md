@@ -1,6 +1,8 @@
 # Agent Card — Draft
 
-Draft values for the Capafy listing form (see `docs/capafy-notas.md` for the verified field list:
+Capafy is the distribution channel for `Security Review Analyzer` V1, reopened for that purpose only
+(`docs/decisiones.md`, D-030) — the core stays fully independent of Capafy (D-026), unchanged by this
+file. Draft values for the Capafy listing form (see `docs/capafy-notas.md` for the verified field list:
 `title`, `shortDescription`, `detailedDescription`, `versionUpdateInfo`, `welcomeMessage`, `logoUrl`,
 `tags`, `categoryId`/`categoryName`, `purpose` per skill, `lang`). Nothing here is published by itself;
 Diego copies these values into the Capafy web form. Wording follows `references/guardrails.md` and
@@ -97,5 +99,7 @@ prose in whatever language the user writes in (see `references/guardrails.md`, s
 ## Vocabulary check
 
 Every string above is a direct reuse or close paraphrase of already-reviewed content in `SKILL.md`,
-`references/guardrails.md`, and `docs/commercial-claims.md`'s permitted-vocabulary list. Re-run the
-project's forbidden-terms grep over this file before publishing (see `capafy/publish-checklist.md`).
+`references/guardrails.md`, and `docs/commercial-claims.md`'s permitted-vocabulary list, including the
+broadened absolute-claims rule from D-029 (see that document for the actual list — not reproduced
+here). Re-run the project's forbidden-terms grep over this file before publishing (see
+`capafy/publish-checklist.md`).
