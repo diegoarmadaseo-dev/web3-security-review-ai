@@ -15,13 +15,16 @@ import re
 from typing import Any, Dict, List
 
 from .context import collapse_ws, fn_at, in_assembly, loop_spans, locate_scope, param_names, statement_at
-from text_utils import truncate
+from text_utils import matching_paren, truncate
 
 DIVISION_RE = re.compile(r"[\w\)\]]\s*/(?![/=*])\s*[\w\(\[][^;{}]*?(?<![*/])\*(?!\*|/)")
 HARDCODED_ADDRESS_RE = re.compile(r"\b0x[0-9a-fA-F]{40}\b")
 RANDOM_SOURCE_RE = re.compile(r"\bblock\.timestamp\b|\bnow\b|\bblock\.prevrandao\b|\bblock\.difficulty\b|\bblockhash\s*\(|\bblock\.number\b|\bblock\.coinbase\b|\bgasleft\s*\(")
 RANDOM_USE_RE = re.compile(r"keccak256|abi\.encodePacked|abi\.encode\b|%|\brandom|\bseed\b|\blottery|\bwinner|\bdraw\b|\bdice|\broll\b|\braffle", re.I)
 RANDOM_FUNCTION_RE = re.compile(r"random|lottery|draw|winner|seed|dice|roll|raffle|jackpot", re.I)
+# --- V2.1 detector-expansion, second block (docs/decisiones.md D-033) ---
+NARROW_CAST_RE = re.compile(r"\b(u?int)(\d{1,3})\s*\(")
+LITERAL_ARG_RE = re.compile(r"^(\d+|0x[0-9a-fA-F]+)$")
 
 
 def detect_hardcoded_address(ctx: Dict[str, Any]) -> None:
@@ -209,6 +212,33 @@ def detect_gas_unbounded_storage_array_push(ctx: Dict[str, Any]) -> None:
             ctx["collector"].add("gas-unbounded-storage-array-push.general", offset, ctx["cname"], scope, {"array": name, "function": scope.get("function")})
 
 
+def detect_unsafe_downcast(ctx: Dict[str, Any]) -> None:
+    """V2.1 detector-expansion, second block (docs/decisiones.md D-033).
+    An explicit narrowing cast (`uint128(x)`, `int64(x)`, ...) truncates
+    silently instead of reverting, unlike OpenZeppelin's SafeCast
+    (`x.toUint128()` - a different, camelCase method-name syntax that this
+    cast-syntax regex never matches, so no explicit SafeCast exclusion is
+    needed). Skips casts of a plain numeric/hex literal (provably safe,
+    cannot overflow) to cut the most obvious false positives."""
+    contract, span_start, body, masked = ctx["contract"], ctx["span_start"], ctx["body"], ctx["masked"]
+    for match in NARROW_CAST_RE.finditer(body):
+        bits = int(match.group(2))
+        if bits >= 256 or bits % 8 != 0:
+            continue
+        offset = span_start + match.start()
+        if in_assembly(ctx, offset):
+            continue
+        open_paren = span_start + match.end() - 1
+        close_paren = matching_paren(masked, open_paren)
+        if close_paren == -1:
+            continue
+        arg = collapse_ws(masked[open_paren + 1:close_paren])
+        if LITERAL_ARG_RE.match(arg):
+            continue
+        scope = locate_scope(contract, offset)
+        ctx["collector"].add("unsafe-downcast.general", offset, ctx["cname"], scope, {"targetType": match.group(1) + match.group(2), "expression": truncate(arg, 80)[0]})
+
+
 CHECKS = [
     ("hardcoded-address.general", detect_hardcoded_address),
     ("unchecked-block.general", detect_unchecked_block),
@@ -219,4 +249,5 @@ CHECKS = [
     ("msg-value-in-loop.general", detect_msg_value_in_loop),
     ("external-call-in-loop.general", detect_external_call_in_loop),
     ("gas-unbounded-storage-array-push.general", detect_gas_unbounded_storage_array_push),
+    ("unsafe-downcast.general", detect_unsafe_downcast),
 ]

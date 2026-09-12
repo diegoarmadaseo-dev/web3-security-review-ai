@@ -70,6 +70,13 @@ CHECK_METADATA: Dict[str, Dict[str, Any]] = {
     "ecrecover-zero-address-unchecked.general": {"family": "ecrecover-zero-address-unchecked", "categories": ["SC05"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
     "oracle-answer-unchecked.general": {"family": "oracle-answer-unchecked", "categories": ["SC03", "SC04"], "needsContext": True, "fpRisk": "high", "groupHint": None},
     "gas-unbounded-storage-array-push.general": {"family": "gas-unbounded-storage-array-push", "categories": ["EXTRA-dos-gas"], "needsContext": True, "fpRisk": "high", "groupHint": None},
+    # --- V2.1 detector-expansion, second block (docs/decisiones.md D-033) ---
+    "hardcoded-role-holder.general": {"family": "hardcoded-role-holder", "categories": ["SC01"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
+    "external-call-in-modifier.general": {"family": "external-call-in-modifier", "categories": ["SC08"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
+    "call-value-from-parameter.general": {"family": "call-value-from-parameter", "categories": ["SC06", "SC01"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
+    "implementation-not-disabled.general": {"family": "implementation-not-disabled", "categories": ["SC10"], "needsContext": True, "fpRisk": "high", "groupHint": None},
+    "signature-missing-nonce-or-deadline.general": {"family": "signature-missing-nonce-or-deadline", "categories": ["EXTRA-replay-permit"], "needsContext": True, "fpRisk": "high", "groupHint": None},
+    "unsafe-downcast.general": {"family": "unsafe-downcast", "categories": ["SC09"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
 }
 
 # Phase order matters (see module docstring). Do not alphabetize or reorder
@@ -80,6 +87,7 @@ SCOPE_CHECKS: List[Tuple[str, Callable[[Dict[str, Any]], None]]] = (
     list(calls_and_transfers.CHECKS)
     + list(defi.CHECKS)
     + list(arithmetic_and_gas.CHECKS)
+    + list(access_control.CHECKS)
 )
 
 FUNCTION_CHECKS: List[Tuple[str, Callable[[Dict[str, Any]], None]]] = list(access_control.FUNCTION_CHECKS)

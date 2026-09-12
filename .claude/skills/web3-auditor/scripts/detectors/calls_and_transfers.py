@@ -26,6 +26,11 @@ from .context import ASSEMBLY_OPCODES_RE, classify_call_hint, collapse_ws, fn_at
 from text_utils import ELEMENTARY_TYPES, matching_paren, split_top_level
 
 ETH_LIKE_BASE_RE = re.compile(r"^(payable\s*\(|address\s*\(|msg\.sender$|tx\.origin$|owner$|_owner$|recipient$|to$|_to$|receiver$|beneficiary$)")
+# --- V2.1 detector-expansion, second block (docs/decisiones.md D-033) ---
+CALL_VALUE_RE = re.compile(r"\.(call|send)\s*\{([^}]*)\}\s*\(")
+VALUE_ARG_RE = re.compile(r"\bvalue\s*:\s*([A-Za-z_$][\w$]*)\s*(,|$)")
+BALANCE_CHECK_RE_TEMPLATE = r"\b([A-Za-z_$][\w$]*)\s*\[[^\]]*\]\s*>=\s*{v}\b"
+BALANCE_DECREMENT_RE_TEMPLATE = r"\b{name}\s*\[[^\]]*\]\s*-=\s*{v}\b"
 
 
 def detect_tx_origin(ctx: Dict[str, Any]) -> None:
@@ -230,6 +235,49 @@ def detect_assembly_block(ctx: Dict[str, Any]) -> None:
         ctx["collector"].add("assembly-block.general", match_start, ctx["cname"], scope, {"opcodes": opcodes, "memorySafe": memory_safe, "lineEnd": ctx["line_index"].line_of(close_brace)})
 
 
+def detect_call_value_from_parameter(ctx: Dict[str, Any]) -> None:
+    """V2.1 detector-expansion, second block (docs/decisiones.md D-033).
+    `.call{value: X}(...)`/`.send{value: X}(...)` where X is exactly a
+    caller-supplied function parameter (not a derived expression - the
+    trailing `(,|$)` in VALUE_ARG_RE requires the captured identifier to be
+    the *whole* value option, so `value: amt / 2` does not match). Reuses
+    `param_names`/`in_assembly`/`locate_scope`, already imported for the
+    module's other checks.
+
+    Suppresses the extremely common, checks-effects-interactions-correct
+    withdraw idiom - `require(balances[msg.sender] >= amount); balances[msg.
+    sender] -= amount; ... .call{value: amount}(...)` - by looking, in the
+    text strictly before the call within the same function, for a
+    `mapping[...] >= amount`-shaped check *and* a `mapping[...] -= amount`
+    decrement of that same mapping, both before the call. Found via the
+    FP audit against evals/cases/ (docs/decisiones.md D-033): the
+    unrefined version fired on 2 of the suite's "clean" fixtures using
+    exactly this idiom - fixed here, not shipped with the looser fpRisk
+    that would have masked it."""
+    contract, span_start, body, masked = ctx["contract"], ctx["span_start"], ctx["body"], ctx["masked"]
+    for match in CALL_VALUE_RE.finditer(body):
+        offset = span_start + match.start()
+        if in_assembly(ctx, offset):
+            continue
+        opts = collapse_ws(match.group(2)).strip()
+        value_match = VALUE_ARG_RE.search(opts)
+        if not value_match:
+            continue
+        value_expr = value_match.group(1)
+        fn = _fn_at(ctx, offset)
+        if value_expr not in param_names(fn):
+            continue
+        if fn["_bodyStart"] is not None:
+            before_call = masked[fn["_bodyStart"]:offset]
+            check_match = re.search(BALANCE_CHECK_RE_TEMPLATE.format(v=re.escape(value_expr)), before_call)
+            if check_match:
+                decrement_re = re.compile(BALANCE_DECREMENT_RE_TEMPLATE.format(name=re.escape(check_match.group(1)), v=re.escape(value_expr)))
+                if decrement_re.search(before_call):
+                    continue
+        scope = locate_scope(contract, offset)
+        ctx["collector"].add("call-value-from-parameter.general", offset, ctx["cname"], scope, {"kind": match.group(1), "valueParam": value_expr})
+
+
 CHECKS = [
     ("assembly-block.general", detect_assembly_block),
     ("low-level-call.general", detect_low_level_call),
@@ -240,4 +288,5 @@ CHECKS = [
     ("tx-origin.general", detect_tx_origin),
     ("delegatecall.general", detect_delegatecall),
     ("selfdestruct.general", detect_selfdestruct),
+    ("call-value-from-parameter.general", detect_call_value_from_parameter),
 ]

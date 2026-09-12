@@ -237,6 +237,13 @@ SIGNAL_FIXTURES = {
     "ecrecover-zero-address-unchecked": 'contract A { address public owner; function verify(bytes32 h, uint8 v, bytes32 r, bytes32 s) external view returns (bool) { address signer = ecrecover(h, v, r, s); return signer == owner; } }',
     "oracle-answer-unchecked": 'contract A { IFeed feed; function price() external view returns (int256) { (, int256 answer, , , ) = feed.latestRoundData(); return answer; } }',
     "gas-unbounded-storage-array-push": 'contract A { uint256[] public items; function add(uint256 x) external { items.push(x); } }',
+    # --- V2.1 detector-expansion, second block (docs/decisiones.md D-033) ---
+    "hardcoded-role-holder": 'contract A { function setup() external { _grantRole(keccak256("ADMIN"), 0x1111111111111111111111111111111111111111); } }',
+    "external-call-in-modifier": 'contract A { address registry; modifier onlyAllowed() { (bool ok, ) = registry.call(""); require(ok); _; } function f() external onlyAllowed {} }',
+    "call-value-from-parameter": 'contract A { function withdraw(address payable to, uint256 amt) external { (bool ok, ) = to.call{value: amt}(""); require(ok); } }',
+    "implementation-not-disabled": 'contract A is Initializable { function initialize() public initializer {} }',
+    "signature-missing-nonce-or-deadline": 'contract A { address owner; mapping(address=>uint256) balances; function claim(bytes32 h, uint8 v, bytes32 r, bytes32 s, uint256 amount) external { address signer = ecrecover(h, v, r, s); require(signer == owner); balances[msg.sender] += amount; } }',
+    "unsafe-downcast": 'contract A { function pack(uint256 x) external pure returns (uint128) { return uint128(x); } }',
 }
 
 
@@ -402,6 +409,71 @@ class SignalFamilyNegativeControlTests(unittest.TestCase):
         )
         signals = self._signals_for(source)
         self.assertFalse(signals_of({"signals": signals}, "gas-unbounded-storage-array-push"))
+
+    # --- V2.1 detector-expansion, second block (docs/decisiones.md D-033) ---
+
+    def test_role_granted_to_parameter_is_not_flagged_hardcoded(self):
+        source = 'contract A { function setup(address admin) external { _grantRole(keccak256("ADMIN"), admin); } }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "hardcoded-role-holder"))
+
+    def test_modifier_without_external_call_is_not_flagged(self):
+        source = 'contract A { address owner; modifier onlyOwner() { require(msg.sender == owner); _; } function f() external onlyOwner {} }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "external-call-in-modifier"))
+
+    def test_call_value_from_derived_expression_is_not_flagged(self):
+        source = 'contract A { function withdraw(address payable to) external { (bool ok, ) = to.call{value: address(this).balance}(""); require(ok); } }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "call-value-from-parameter"))
+
+    def test_balance_checked_and_settled_before_call_is_not_flagged(self):
+        # The checks-effects-interactions-correct withdraw idiom: found firing
+        # on this exact pattern in 2 of evals/cases/'s "clean" fixtures during
+        # the D-033 FP audit - fixed, and locked in here (docs/decisiones.md).
+        source = (
+            'contract A { mapping(address => uint256) public balances;'
+            ' function withdraw(uint256 amount) external {'
+            ' require(balances[msg.sender] >= amount, "insufficient");'
+            ' balances[msg.sender] -= amount;'
+            ' (bool ok, ) = msg.sender.call{value: amount}(""); require(ok, "failed"); } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "call-value-from-parameter"))
+
+    def test_balance_decremented_after_call_is_still_flagged(self):
+        # Same shape as above but the decrement happens AFTER the call (the
+        # classic reentrancy bug) - settlement is not complete before the
+        # funds leave, so this must still fire.
+        source = (
+            'contract A { mapping(address => uint256) public balances;'
+            ' function withdraw(uint256 amount) external {'
+            ' require(balances[msg.sender] >= amount, "insufficient");'
+            ' (bool ok, ) = msg.sender.call{value: amount}(""); require(ok, "failed");'
+            ' balances[msg.sender] -= amount; } }'
+        )
+        signals = self._signals_for(source)
+        self.assertTrue(signals_of({"signals": signals}, "call-value-from-parameter"))
+
+    def test_disabled_initializers_suppresses_implementation_not_disabled(self):
+        source = 'contract A is Initializable { constructor() { _disableInitializers(); } function initialize() public initializer {} }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "implementation-not-disabled"))
+
+    def test_nonce_check_suppresses_signature_missing_nonce_or_deadline(self):
+        source = (
+            'contract A { address owner; mapping(address=>uint256) balances; mapping(address=>uint256) public nonces;'
+            ' function claim(bytes32 h, uint8 v, bytes32 r, bytes32 s, uint256 amount, uint256 nonce) external {'
+            ' require(nonce == nonces[msg.sender]++); address signer = ecrecover(h, v, r, s);'
+            ' require(signer == owner); balances[msg.sender] += amount; } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "signature-missing-nonce-or-deadline"))
+
+    def test_literal_argument_suppresses_unsafe_downcast(self):
+        source = 'contract A { function pack(uint256 x) external pure returns (uint128) { return uint128(100); } }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "unsafe-downcast"))
 
 
 class HardenedContractTests(unittest.TestCase):

@@ -17,6 +17,7 @@ import re
 from typing import Any, Dict
 
 from .context import INTERNAL_STATE_CALL_RE, find_state_writes, locate_scope
+from text_utils import matching_paren
 
 ADMIN_NAME_RE = re.compile(r"^(set|update|change|configure|withdraw|sweep|rescue|drain|emergency|pause|unpause|mint|burn|upgrade|migrate|whitelist|blacklist|add|remove|grant|revoke|kill|destroy|transferOwnership|renounce|register|unregister|enable|disable|toggle|reset|claim(All|Fees)?)", re.I)
 ADMIN_NAME_EXCLUDE_RE = re.compile(r"^(addLiquidity|removeLiquidity|mintTo|burnFrom|setApprovalForAll|withdrawTo)$")
@@ -40,6 +41,40 @@ KNOWN_PUBLIC_SLOTS = {
 CALLBACK_NAME_RE = re.compile(r"^(onFlashLoan|executeOperation|uniswapV2Call|uniswapV3FlashCallback|receiveFlashLoan|onERC721Received|onERC1155Received|onERC1155BatchReceived|tokensReceived|onTokenTransfer)$")
 ARRAY_TYPE_RE = re.compile(r"\[\s*\d*\s*\]\s*$")
 GAP_VAR_RE = re.compile(r"^_{0,2}(storage)?gap\d*$", re.I)
+
+# --- V2.1 detector-expansion, second block (docs/decisiones.md D-033) ---
+ROLE_GRANT_RE = re.compile(r"\b(_setupRole|_grantRole|grantRole)\s*\(")
+HARDCODED_ADDRESS_IN_ROLE_RE = re.compile(r"\b0x[0-9a-fA-F]{40}\b")
+EXTERNAL_CALL_IN_MODIFIER_RE = re.compile(r"\.(call|send|staticcall|callcode|delegatecall)\s*(\{[^}]*\})?\s*\(")
+
+
+# --- scope-phase checks -----------------------------------------------------
+
+def detect_hardcoded_role_holder(ctx: Dict[str, Any]) -> None:
+    """A role granted directly to a literal address (rather than a
+    constructor/function parameter) is a centralization signal: the holder
+    can never be changed without a contract upgrade or a separate admin
+    call. Reuses the same 20-byte hex literal shape as arithmetic_and_gas.py's
+    `hardcoded-address` (a fresh local constant, not a cross-module import,
+    to avoid coupling two independent detector modules for one regex)."""
+    contract, span_start, body, masked = ctx["contract"], ctx["span_start"], ctx["body"], ctx["masked"]
+    for match in ROLE_GRANT_RE.finditer(body):
+        offset = span_start + match.start()
+        open_paren = span_start + match.end() - 1
+        close_paren = matching_paren(masked, open_paren)
+        if close_paren == -1:
+            continue
+        args_text = masked[open_paren + 1:close_paren]
+        addr = HARDCODED_ADDRESS_IN_ROLE_RE.search(args_text)
+        if not addr:
+            continue
+        scope = locate_scope(contract, offset)
+        ctx["collector"].add("hardcoded-role-holder.general", offset, ctx["cname"], scope, {"call": match.group(1), "address": addr.group(0)})
+
+
+CHECKS = [
+    ("hardcoded-role-holder.general", detect_hardcoded_role_holder),
+]
 
 
 # --- function-phase checks -------------------------------------------------
@@ -272,6 +307,49 @@ def detect_reentrancy_inconsistent_guarding(ctx: Dict[str, Any]) -> None:
         ctx["collector"].add("reentrancy-inconsistent-guarding.general", offset, cname, {"function": s["function"], "modifier": None, "kind": None}, {"guardedSiblingFunctions": guarded_names})
 
 
+def detect_implementation_not_disabled(ctx: Dict[str, Any]) -> None:
+    """V2.1 detector-expansion, second block (docs/decisiones.md D-033).
+    An upgradeable-indicated contract (same `PROXY_BASE_RE` gate as
+    storage-gap-missing, applied to the already-parsed `bases` list) that
+    declares an `initialize`-shaped function should disable initializers on
+    the implementation itself (`_disableInitializers()` in its constructor,
+    or in a no-constructor default) so nobody can call `initialize` directly
+    on the deployed logic contract. Potential signal only: an abstract base
+    never deployed on its own does not need this - hence fpRisk high, same
+    caveat class as storage-gap-missing."""
+    contract, cname = ctx["contract"], ctx["cname"]
+    if cname is None or not any(PROXY_BASE_RE.search(base) for base in contract["bases"]):
+        return
+    function_names = [fn["name"] for fn in contract["functions"] if fn["name"]]
+    if not any(INITIALIZER_NAME_RE.match(n) for n in function_names):
+        return
+    ctor = next((fn for fn in contract["functions"] if fn["kind"] == "constructor"), None)
+    if ctor and "_disableInitializers" in ctor.get("_body", ""):
+        return
+    ctx["collector"].add("implementation-not-disabled.general", contract["_start"], cname, {"function": None, "modifier": None, "kind": None}, {"hasConstructor": ctor is not None})
+
+
+def detect_external_call_in_modifier(ctx: Dict[str, Any]) -> None:
+    """V2.1 detector-expansion, second block (docs/decisiones.md D-033).
+    A modifier's code runs *before* the function body it guards - an
+    external call inside a modifier is a distinct reentrancy-adjacent
+    surface from reentrancy-pattern.general (which only looks at function
+    bodies). `contract["modifiers"]` entries carry `_start`/`_end` offsets
+    (preprocess.py's parse_modifiers) but no pre-sliced `_body` string like
+    functions do, so the span is sliced here directly from `ctx["masked"]` -
+    confirmed reliable before implementing (docs/decisiones.md D-033)."""
+    contract, cname, masked = ctx["contract"], ctx["cname"], ctx["masked"]
+    if cname is None:
+        return
+    for mod in contract["modifiers"]:
+        span = masked[mod["_start"]:mod["_end"]]
+        match = EXTERNAL_CALL_IN_MODIFIER_RE.search(span)
+        if not match:
+            continue
+        offset = mod["_start"] + match.start()
+        ctx["collector"].add("external-call-in-modifier.general", offset, cname, {"function": None, "modifier": mod["name"], "kind": None}, {"modifier": mod["name"], "call": match.group(1)})
+
+
 FUNCTION_CHECKS = [
     ("initializer-unprotected.general", detect_initializer_unprotected),
     ("zero-address-unchecked.general", detect_zero_address_unchecked),
@@ -287,4 +365,6 @@ CONTRACT_CHECKS = [
     ("single-step-ownership-transfer.general", detect_single_step_ownership_transfer),
     ("storage-gap-missing.general", detect_storage_gap_missing),
     ("reentrancy-inconsistent-guarding.general", detect_reentrancy_inconsistent_guarding),
+    ("implementation-not-disabled.general", detect_implementation_not_disabled),
+    ("external-call-in-modifier.general", detect_external_call_in_modifier),
 ]

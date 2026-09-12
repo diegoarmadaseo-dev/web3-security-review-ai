@@ -159,6 +159,31 @@ def detect_oracle_answer_unchecked(ctx: Dict[str, Any]) -> None:
         ctx["collector"].add("oracle-answer-unchecked.general", offset, ctx["cname"], scope, {"method": "latestRoundData"})
 
 
+def detect_signature_missing_nonce_or_deadline(ctx: Dict[str, Any]) -> None:
+    """V2.1 detector-expansion, second block (docs/decisiones.md D-033).
+    Narrows signature-replay-surface's informational, whole-file
+    `nonceFound`/`deadlineFound` flags into a gated signal scoped to the
+    *enclosing function* only - a nonce or deadline check elsewhere in the
+    file (e.g. in an unrelated function) does not protect this one. Reuses
+    `SIGNATURE_RE` verbatim (same constant, not a re-derived pattern) and
+    the same nonce/deadline keyword shapes as the existing check, applied to
+    `fn["_body"]` instead of the whole scope body. Does not modify
+    detect_signature_replay_surface."""
+    contract, span_start, body = ctx["contract"], ctx["span_start"], ctx["body"]
+    for match in SIGNATURE_RE.finditer(body):
+        offset = span_start + match.start()
+        fn = fn_at(ctx, offset)
+        fbody = fn.get("_body", "") if fn else ""
+        if not fbody:
+            continue
+        nonce_found = bool(re.search(r"\bnonces?\b", fbody, re.I))
+        deadline_found = bool(re.search(r"deadline|expir|validUntil|validBefore|notAfter", fbody, re.I))
+        if nonce_found or deadline_found:
+            continue
+        scope = locate_scope(contract, offset)
+        ctx["collector"].add("signature-missing-nonce-or-deadline.general", offset, ctx["cname"], scope, {"api": collapse_ws(match.group(0)).rstrip("(")})
+
+
 CHECKS = [
     ("oracle-usage.general", detect_oracle_usage),
     ("flash-loan-surface.general", detect_flash_loan_surface),
@@ -167,4 +192,5 @@ CHECKS = [
     ("signature-replay-surface.general", detect_signature_replay_surface),
     ("ecrecover-zero-address-unchecked.general", detect_ecrecover_zero_address_unchecked),
     ("oracle-answer-unchecked.general", detect_oracle_answer_unchecked),
+    ("signature-missing-nonce-or-deadline.general", detect_signature_missing_nonce_or_deadline),
 ]

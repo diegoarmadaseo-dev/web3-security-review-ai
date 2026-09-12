@@ -82,11 +82,19 @@ strong corroborating evidence exists.
 | `ecrecover-zero-address-unchecked` | SC05 | yes | medium | The result of `ecrecover(...)` (or the variable it is assigned to) used later in the function without ever being compared to `address(0)`, `ecrecover`'s own failure sentinel. | The zero-address comparison happens through a wrapping library call (e.g. OpenZeppelin's `ECDSA.recover`, which already reverts internally) rather than inline in the same function. |
 | `oracle-answer-unchecked` | SC03, SC04 | yes | high | A Chainlink-shaped `latestRoundData()` call whose enclosing function shows neither a staleness/round check nor an `answer` sanity check - a tighter, gated narrowing of `oracle-usage`'s informational flag. | The validation happens in a separate internal function called right after, outside the heuristic's single-function-body window. |
 | `gas-unbounded-storage-array-push` | EXTRA-dos-gas | yes | high | A `.push()` onto a storage array from a public/external function, with no visible `array.length`-based upper-bound check in the same function. | The array's growth is bounded by an orthogonal business rule enforced elsewhere (e.g. a capped whitelist) that this heuristic cannot see. |
+| `hardcoded-role-holder` | SC01 | yes | medium | A role-granting call (`grantRole`/`_grantRole`/`_setupRole`) whose account argument is a literal address rather than a parameter/variable. | The literal is the deployer's own multisig, set once and intentionally documented as the initial admin. |
+| `external-call-in-modifier` | SC08 | yes | medium | A `modifier`'s body containing a low-level call/`delegatecall` shape - the modifier runs before the function it guards, a distinct reentrancy-adjacent surface from `reentrancy-pattern`. | The call is to a well-known, trusted, already-deployed registry/whitelist contract with no state-changing side effects reachable from it. |
+| `call-value-from-parameter` | SC06, SC01 | yes | medium | `.call{value: X}(...)`/`.send{value: X}(...)` where X is exactly a caller-supplied parameter, unmodified. | The parameter was already checked against, and deducted from, a `mapping[msg.sender]`-shaped balance earlier in the same function (the standard checks-effects-interactions withdraw idiom) - detected and excluded automatically. |
+| `implementation-not-disabled` | SC10 | yes | high | An upgradeable-indicated contract with an `initialize`-shaped function whose constructor (or absence of one) never calls `_disableInitializers()`. | The contract is an abstract base never meant to be deployed directly - only a concrete, deployed implementation actually needs this call. |
+| `signature-missing-nonce-or-deadline` | EXTRA-replay-permit | yes | high | A signature-verification API (`ecrecover`, `.recover`, ...) used in a function that shows neither a nonce nor a deadline check in that same function - a tighter, function-scoped narrowing of `signature-replay-surface`'s file-wide informational flags. | The nonce/deadline check is performed inside a called internal/library helper this heuristic does not follow. |
+| `unsafe-downcast` | SC09 | yes | medium | An explicit narrowing integer cast (`uint128(x)`, `int64(x)`, ...) of a non-literal expression, without OpenZeppelin's `SafeCast`. | The value is provably bounded by an earlier `require` this heuristic cannot connect to the cast site. |
 
-The eight families above (`unprotected-callback-handler` through `gas-unbounded-storage-array-push`) are the
+The eight families from `unprotected-callback-handler` through `gas-unbounded-storage-array-push` are the
 first detector-expansion block added under the V2.1 registry architecture (`scripts/detectors/`); see
-`docs/decisiones.md` D-032. Each reuses context already built for an existing check (loop analysis, access-
-control info, call offsets, state-variable inventory) rather than adding a new source-text scan.
+`docs/decisiones.md` D-032. The six families from `hardcoded-role-holder` through `unsafe-downcast` are the
+second block (D-033). Each reuses context already built for an existing check (loop analysis, access-
+control info, call offsets, state-variable inventory, modifier `_start`/`_end` offsets) rather than adding a
+new source-text scan.
 
 ### EIP-1967-style storage slots
 
