@@ -1,11 +1,15 @@
-# CLAUDE.md — Web3 Security Review AI (reglas de desarrollo)
+# CLAUDE.md — Security Review Analyzer (reglas de desarrollo)
 
 Este archivo NO se publica y no describe comportamiento runtime: eso vive en
 `.claude/skills/web3-auditor/SKILL.md` y en los archivos publicados junto a él.
 
 ## Proyecto
-- Skill para Capafy: revisión automatizada y asistida por IA de smart contracts (Solidity 0.8.x
-  principal; cobertura limitada para versiones antiguas y Vyper). Nombre técnico: `web3-auditor`.
+- `Security Review Analyzer`: núcleo de revisión automatizada y asistida por IA de smart contracts
+  (Solidity 0.8.x principal; cobertura limitada para versiones antiguas y Vyper), independiente de
+  cualquier plataforma de distribución (D-026 — Capafy queda fuera del roadmap comercial). Nombre
+  técnico: `web3-auditor`. Empaquetado actual: Skill de Claude Code en `.claude/skills/web3-auditor/`;
+  debe seguir siendo reutilizable después desde web, API, CLI, GitHub/CI, B2B o widgets/embeds sin que
+  ninguna plataforma externa se vuelva una dependencia del core.
 - Posicionamiento único: "Automated AI-assisted smart contract security review". Nunca auditoría,
   certificación, garantía, pentest ni sustituto de un auditor humano.
 - Única carpeta publicable: `.claude/skills/web3-auditor/`. Nunca contiene `tests/`, `evals/`,
@@ -33,8 +37,10 @@ Este archivo NO se publica y no describe comportamiento runtime: eso vive en
 - Ningún script (`preprocess.py`, `validate_report.py`, `score.py`, `render_report.py`) llama a un LLM:
   todos son deterministas o de transformación.
 - Tests: `python -m unittest`. Cada script cubre como mínimo caso normal, caso límite y entrada inválida.
-- Sin refactors innecesarios ni arquitectura no requerida. No crear APIs, backend, SDKs de IA,
-  bases de datos, pagos, webhooks ni endpoints: Capafy resuelve esa infraestructura.
+- Sin refactors innecesarios ni arquitectura no requerida. Por ahora no crear APIs, backend, SDKs de
+  IA, bases de datos, pagos, webhooks ni endpoints: no es porque una plataforma externa los resuelva,
+  sino porque no forman parte de ninguna subfase aprobada todavía (D-026) — el core debe seguir siendo
+  reutilizable para cuando sí se aborden.
 - Versionar cada cambio significativo (checklist, scoring, schema, runtime, prompts internos,
   clasificación, reglas multilingües). Nunca cambiar en silencio el significado de un score.
 
