@@ -45,12 +45,21 @@ de `references/guardrails.md`. Es la lista que ejecuta el grep automático.
 | official | implica respaldo institucional |
 | safe to deploy | recomendación de despliegue |
 | guaranteed | garantía |
-| 100% secure | seguridad absoluta |
+| 100% secure / fully secure | seguridad absoluta |
 | vulnerability-free | ausencia total de vulnerabilidades |
 | no vulnerabilities / no vulnerabilities found / no vulnerabilities exist | ausencia total de vulnerabilidades |
+| no security issues | ausencia total de problemas de seguridad |
 | production-ready (referido a patches) | patch validado para producción |
 | zero retention / no logs / never stored / private by default | promesas de retención que la Skill no controla |
 | deploy with confidence / secure your contract / eliminate vulnerabilities / audit your contract | eslóganes que prometen resultado |
+
+Esta lista es ilustrativa, no exhaustiva: cualquier afirmación absoluta y sin acotar sobre seguridad o
+ausencia de problemas ("completely safe", "risk-free", etc.) cae bajo la misma prohibición aunque no
+figure literalmente arriba - usar siempre la fórmula acotada al alcance de la sección "Fórmulas
+obligatorias". Esto aplica también cuando el texto describe o parafrasea lo que una entrada no confiable
+(p. ej. un intento de prompt injection detectado) afirma falsamente sobre el código: citarlo literalmente
+(marcado como cita, la misma excepción que ya tiene `evidence[]`) o describirlo con redacción propia
+acotada al alcance - nunca repetir el claim absoluto tal cual, sin comillas, como frase propia.
 
 ## Restricted — nivel B: solo en negación o limitación (revisión manual)
 
@@ -89,7 +98,7 @@ limitativas y se revisan a mano en cada commit.
 Antes de cada commit, sobre `.claude/skills/` y `capafy/` (no sobre `docs/`, que define la lista):
 
 ```bash
-grep -rniE "certified|certificaci[oó]n|audited|audit completed|complete audit|professional audit|official|safe to deploy|guaranteed|100% secure|vulnerability-free|no vulnerabilities|production-ready|zero retention|no logs|never stored|private by default|deploy with confidence|secure your contract|eliminate vulnerabilities|audit your contract" --exclude=guardrails.md --exclude=preprocess.py --exclude=render_report.py .claude/skills capafy
+grep -rniE "certified|certificaci[oó]n|audited|audit completed|complete audit|professional audit|official|safe to deploy|guaranteed|100% secure|fully secure|vulnerability-free|no vulnerabilities|no security issues|production-ready|zero retention|no logs|never stored|private by default|deploy with confidence|secure your contract|eliminate vulnerabilities|audit your contract" --exclude=guardrails.md --exclude=preprocess.py --exclude=render_report.py .claude/skills capafy
 ```
 
 - Resultado esperado: sin coincidencias.
