@@ -248,8 +248,12 @@ class SignalFamilyPositiveTests(unittest.TestCase):
                 self.assertTrue(found, "expected family %r to fire for fixture" % family)
 
     def test_every_family_is_registered_in_signal_families(self):
+        # Metadata moved to detectors/registry.py as CHECK_METADATA, keyed by
+        # checkId ("family.variant") rather than bare family name (V2.1).
+        from detectors.registry import CHECK_METADATA
+        registered_families = {meta["family"] for meta in CHECK_METADATA.values()}
         for family in SIGNAL_FIXTURES:
-            self.assertIn(family, preprocess.SIGNAL_FAMILIES)
+            self.assertIn(family, registered_families)
 
 
 class SignalFamilyNegativeControlTests(unittest.TestCase):

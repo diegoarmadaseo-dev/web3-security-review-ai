@@ -1,0 +1,170 @@
+# -*- coding: utf-8 -*-
+"""Scope-level arithmetic/gas/randomness checks (phase="scope"). Moved
+verbatim from the pre-V2.1 detect_solidity_signals monolith.
+
+unbounded-loop and msg-value-in-loop both need the same per-loop analysis
+(loop_spans() plus which arrays/external-calls/state-writes appear in each
+loop body); rather than share that analysis in a mutable side list, each
+detector below recomputes it via _analyze_loops - a bounded cost (proportional
+to the number of loops in the contract, not file size) that keeps both
+detectors genuinely independent and callable on their own.
+"""
+from __future__ import annotations
+
+import re
+from typing import Any, Dict, List
+
+from .context import collapse_ws, fn_at, in_assembly, loop_spans, locate_scope, param_names, statement_at
+from text_utils import truncate
+
+DIVISION_RE = re.compile(r"[\w\)\]]\s*/(?![/=*])\s*[\w\(\[][^;{}]*?(?<![*/])\*(?!\*|/)")
+HARDCODED_ADDRESS_RE = re.compile(r"\b0x[0-9a-fA-F]{40}\b")
+RANDOM_SOURCE_RE = re.compile(r"\bblock\.timestamp\b|\bnow\b|\bblock\.prevrandao\b|\bblock\.difficulty\b|\bblockhash\s*\(|\bblock\.number\b|\bblock\.coinbase\b|\bgasleft\s*\(")
+RANDOM_USE_RE = re.compile(r"keccak256|abi\.encodePacked|abi\.encode\b|%|\brandom|\bseed\b|\blottery|\bwinner|\bdraw\b|\bdice|\broll\b|\braffle", re.I)
+RANDOM_FUNCTION_RE = re.compile(r"random|lottery|draw|winner|seed|dice|roll|raffle|jackpot", re.I)
+
+
+def detect_hardcoded_address(ctx: Dict[str, Any]) -> None:
+    contract, span_start, body, masked = ctx["contract"], ctx["span_start"], ctx["body"], ctx["masked"]
+    for match in HARDCODED_ADDRESS_RE.finditer(body):
+        offset = span_start + match.start()
+        scope = locate_scope(contract, offset)
+        stmt, _ = statement_at(masked, offset, span_start, ctx["span_end"])
+        ctx["collector"].add("hardcoded-address.general", offset, ctx["cname"], scope, {"value": match.group(0), "statement": truncate(collapse_ws(stmt), 120)[0]})
+
+
+def detect_unchecked_block(ctx: Dict[str, Any]) -> None:
+    contract, span_start, body, masked = ctx["contract"], ctx["span_start"], ctx["body"], ctx["masked"]
+    pairs = ctx["pairs"]
+    for match in re.finditer(r"\bunchecked\s*\{", body):
+        offset = span_start + match.start()
+        open_brace = span_start + match.end() - 1
+        close_brace = pairs.get(open_brace, ctx["span_end"])
+        block = masked[open_brace:close_brace]
+        scope = locate_scope(contract, offset)
+        ctx["collector"].add("unchecked-block.general", offset, ctx["cname"], scope, {
+            "lineEnd": ctx["line_index"].line_of(close_brace),
+            "containsArithmetic": bool(re.search(r"[\w\)\]]\s*[+\-*]\s*[\w\(]|\+\+|--|[+\-*]=", block)),
+            "containsSubtraction": bool(re.search(r"[\w\)\]]\s*-\s*[\w\(]|-=|--", block)),
+        })
+
+
+def detect_timestamp_dependence(ctx: Dict[str, Any]) -> None:
+    contract, span_start, body, masked = ctx["contract"], ctx["span_start"], ctx["body"], ctx["masked"]
+    for match in re.finditer(r"\bblock\.timestamp\b|(?<![\w.])now(?![\w(])", body):
+        offset = span_start + match.start()
+        scope = locate_scope(contract, offset)
+        stmt, _ = statement_at(masked, offset, span_start, ctx["span_end"])
+        collapsed = collapse_ws(stmt)
+        if RANDOM_USE_RE.search(collapsed):
+            usage = "randomness"
+        elif re.search(r"[<>]=?|==|!=", collapsed):
+            usage = "comparison"
+        elif re.search(r"[+\-*/]", collapsed):
+            usage = "arithmetic"
+        else:
+            usage = "other"
+        ctx["collector"].add("timestamp-dependence.general", offset, ctx["cname"], scope, {"usage": usage})
+
+
+def detect_weak_randomness(ctx: Dict[str, Any]) -> None:
+    contract, span_start, body, masked = ctx["contract"], ctx["span_start"], ctx["body"], ctx["masked"]
+    seen: set = set()
+    for match in RANDOM_SOURCE_RE.finditer(body):
+        offset = span_start + match.start()
+        stmt, stmt_start = statement_at(masked, offset, span_start, ctx["span_end"])
+        if stmt_start in seen:
+            continue
+        collapsed = collapse_ws(stmt)
+        fn = fn_at(ctx, offset)
+        fn_name = (fn["name"] or "") if fn else ""
+        if not (RANDOM_USE_RE.search(collapsed) or RANDOM_FUNCTION_RE.search(fn_name)):
+            continue
+        seen.add(stmt_start)
+        scope = locate_scope(contract, offset)
+        sources = sorted(set(collapse_ws(m.group(0)).rstrip("(") for m in RANDOM_SOURCE_RE.finditer(collapsed)))
+        ctx["collector"].add("weak-randomness.general", offset, ctx["cname"], scope, {
+            "sources": sources,
+            "usedWithHash": bool(re.search(r"keccak256|abi\.encodePacked|abi\.encode\b", collapsed)),
+            "usedWithModulo": "%" in collapsed,
+        })
+
+
+def detect_division_before_multiplication(ctx: Dict[str, Any]) -> None:
+    contract, span_start, body, masked = ctx["contract"], ctx["span_start"], ctx["body"], ctx["masked"]
+    for match in DIVISION_RE.finditer(body):
+        offset = span_start + match.start()
+        if in_assembly(ctx, offset):
+            continue
+        stmt, _ = statement_at(masked, offset, span_start, ctx["span_end"])
+        collapsed = collapse_ws(stmt)
+        if not re.search(r"=|\breturn\b", collapsed):
+            continue
+        scope = locate_scope(contract, offset)
+        ctx["collector"].add("division-before-multiplication.general", offset, ctx["cname"], scope, {"expression": truncate(collapsed, 120)[0]})
+
+
+def _analyze_loops(ctx: Dict[str, Any]) -> List[Dict[str, Any]]:
+    masked, span_start, span_end, pairs = ctx["masked"], ctx["span_start"], ctx["span_end"], ctx["pairs"]
+    state_types = ctx["state_types"]
+    results = []
+    for loop in loop_spans(masked, span_start, span_end, pairs):
+        fn = fn_at(ctx, loop["start"])
+        header = loop["header"]
+        arrays: List[Dict[str, str]] = []
+        for arr in re.findall(r"([A-Za-z_$][\w$.]*)\s*\.length\b", header):
+            root = arr.split(".")[0]
+            if root in state_types:
+                kind = "state"
+            elif fn and root in param_names(fn):
+                kind = "parameter"
+            else:
+                kind = "unknown"
+            arrays.append({"name": arr, "kind": kind})
+        no_condition = header.replace(" ", "") in ("", ";;", "true") or re.match(r"^\s*;\s*;\s*$", header) is not None
+        loop_body = masked[loop["bodyStart"]:loop["bodyEnd"]]
+        external_in_loop = any(loop["bodyStart"] <= off <= loop["bodyEnd"] for off, _ in ctx["external_call_offsets"])
+        msg_value_in_loop = re.search(r"\bmsg\.value\b", loop_body) is not None
+        unbounded = no_condition or any(a["kind"] in ("state", "unknown") for a in arrays) or (external_in_loop and bool(arrays))
+        results.append({"loop": loop, "arrays": arrays, "noCondition": no_condition, "loopBody": loop_body, "externalInLoop": external_in_loop, "msgValueInLoop": msg_value_in_loop, "unbounded": unbounded})
+    return results
+
+
+def detect_unbounded_loop(ctx: Dict[str, Any]) -> None:
+    contract = ctx["contract"]
+    for r in _analyze_loops(ctx):
+        if not r["unbounded"]:
+            continue
+        loop = r["loop"]
+        scope = locate_scope(contract, loop["start"])
+        ctx["collector"].add("unbounded-loop.general", loop["start"], ctx["cname"], scope, {
+            "loopKind": loop["kind"],
+            "arrays": r["arrays"],
+            "noCondition": r["noCondition"],
+            "externalCallInLoop": r["externalInLoop"],
+            "msgValueInLoop": r["msgValueInLoop"],
+            "stateWriteInLoop": bool(ctx["state_names"]) and any(re.search(r"\b" + re.escape(name) + r"\b(\s*\[[^\]]*\])*\s*(=(?!=)|\+=|-=|\+\+|--)|\b" + re.escape(name) + r"\s*\.\s*push\s*\(", r["loopBody"]) for name in ctx["state_names"]),
+            "lineEnd": ctx["line_index"].line_of(loop["bodyEnd"]),
+        })
+
+
+def detect_msg_value_in_loop(ctx: Dict[str, Any]) -> None:
+    contract = ctx["contract"]
+    for r in _analyze_loops(ctx):
+        if not r["msgValueInLoop"]:
+            continue
+        loop = r["loop"]
+        mv = re.search(r"\bmsg\.value\b", r["loopBody"])
+        mv_offset = loop["bodyStart"] + (mv.start() if mv else 0)
+        ctx["collector"].add("msg-value-in-loop.general", mv_offset, ctx["cname"], locate_scope(contract, mv_offset), {"loopLine": ctx["line_index"].line_of(loop["start"])})
+
+
+CHECKS = [
+    ("hardcoded-address.general", detect_hardcoded_address),
+    ("unchecked-block.general", detect_unchecked_block),
+    ("timestamp-dependence.general", detect_timestamp_dependence),
+    ("weak-randomness.general", detect_weak_randomness),
+    ("division-before-multiplication.general", detect_division_before_multiplication),
+    ("unbounded-loop.general", detect_unbounded_loop),
+    ("msg-value-in-loop.general", detect_msg_value_in_loop),
+]
