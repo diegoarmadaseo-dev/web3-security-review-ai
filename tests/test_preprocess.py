@@ -455,6 +455,24 @@ class SignalFamilyNegativeControlTests(unittest.TestCase):
         signals = self._signals_for(source)
         self.assertTrue(signals_of({"signals": signals}, "call-value-from-parameter"))
 
+    def test_balance_indexed_by_arbitrary_parameter_is_still_flagged(self):
+        # D-034: the CEI suppression must require the mapping index to be
+        # LITERALLY msg.sender. An earlier version accepted any index
+        # (`balances[recipient]`), which silently suppressed this genuine
+        # arbitrary-recipient balance-drain: anyone can call
+        # payout(victim, victim'sBalance) and receive the victim's funds,
+        # since the require/decrement check victim's balance, not the
+        # caller's. Diego found this during the D-033 audit; must fire.
+        source = (
+            'contract A { mapping(address => uint256) public balances;'
+            ' function payout(address recipient, uint256 amount) external {'
+            ' require(balances[recipient] >= amount, "insufficient");'
+            ' balances[recipient] -= amount;'
+            ' (bool ok, ) = msg.sender.call{value: amount}(""); require(ok, "failed"); } }'
+        )
+        signals = self._signals_for(source)
+        self.assertTrue(signals_of({"signals": signals}, "call-value-from-parameter"))
+
     def test_disabled_initializers_suppresses_implementation_not_disabled(self):
         source = 'contract A is Initializable { constructor() { _disableInitializers(); } function initialize() public initializer {} }'
         signals = self._signals_for(source)

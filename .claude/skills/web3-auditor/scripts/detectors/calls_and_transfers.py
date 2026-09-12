@@ -29,8 +29,8 @@ ETH_LIKE_BASE_RE = re.compile(r"^(payable\s*\(|address\s*\(|msg\.sender$|tx\.ori
 # --- V2.1 detector-expansion, second block (docs/decisiones.md D-033) ---
 CALL_VALUE_RE = re.compile(r"\.(call|send)\s*\{([^}]*)\}\s*\(")
 VALUE_ARG_RE = re.compile(r"\bvalue\s*:\s*([A-Za-z_$][\w$]*)\s*(,|$)")
-BALANCE_CHECK_RE_TEMPLATE = r"\b([A-Za-z_$][\w$]*)\s*\[[^\]]*\]\s*>=\s*{v}\b"
-BALANCE_DECREMENT_RE_TEMPLATE = r"\b{name}\s*\[[^\]]*\]\s*-=\s*{v}\b"
+BALANCE_CHECK_RE_TEMPLATE = r"\b([A-Za-z_$][\w$]*)\s*\[\s*msg\.sender\s*\]\s*>=\s*{v}\b"
+BALANCE_DECREMENT_RE_TEMPLATE = r"\b{name}\s*\[\s*msg\.sender\s*\]\s*-=\s*{v}\b"
 
 
 def detect_tx_origin(ctx: Dict[str, Any]) -> None:
@@ -248,12 +248,17 @@ def detect_call_value_from_parameter(ctx: Dict[str, Any]) -> None:
     withdraw idiom - `require(balances[msg.sender] >= amount); balances[msg.
     sender] -= amount; ... .call{value: amount}(...)` - by looking, in the
     text strictly before the call within the same function, for a
-    `mapping[...] >= amount`-shaped check *and* a `mapping[...] -= amount`
-    decrement of that same mapping, both before the call. Found via the
-    FP audit against evals/cases/ (docs/decisiones.md D-033): the
-    unrefined version fired on 2 of the suite's "clean" fixtures using
-    exactly this idiom - fixed here, not shipped with the looser fpRisk
-    that would have masked it."""
+    `mapping[msg.sender] >= amount`-shaped check *and* a
+    `mapping[msg.sender] -= amount` decrement of that same mapping, both
+    before the call. The index MUST be literally `msg.sender`, never an
+    arbitrary identifier: an earlier version matched any `mapping[...]`
+    index, which silently suppressed a real arbitrary-recipient
+    balance-drain (`function payout(address recipient, uint256 amount) {
+    require(balances[recipient] >= amount); balances[recipient] -= amount;
+    msg.sender.call{value: amount}(...); }` - anyone could drain any
+    victim's tracked balance to themselves) - found and fixed during review
+    (docs/decisiones.md D-034); see
+    test_balance_indexed_by_arbitrary_parameter_is_still_flagged."""
     contract, span_start, body, masked = ctx["contract"], ctx["span_start"], ctx["body"], ctx["masked"]
     for match in CALL_VALUE_RE.finditer(body):
         offset = span_start + match.start()
