@@ -1,0 +1,108 @@
+{
+  "analysisEngineVersion": "1.0.0",
+  "architectureNotes": [
+    {
+      "description": "The contract already declares a _bootstrapped boolean intended to mark completed setup, but no function reads it. This suggests the guard was planned but not wired in, rather than the contract being designed as intentionally re-initializable - worth confirming with whoever owns this logic contract before assuming any other behavior here is equally intentional.",
+      "title": "Bootstrap flag exists but is not enforced"
+    }
+  ],
+  "categoryCoverage": [
+    {
+      "category": "SC01",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC02",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC03",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC04",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC05",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC06",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC07",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC08",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC09",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC10",
+      "status": "DETECTED"
+    }
+  ],
+  "checklistVersion": "2026.1",
+  "compilerVersion": "0.8.20",
+  "executiveSummary": "This review found one critical issue: the contract's initialize function can be called by anyone at any time to reassign ownership, because the internal flag meant to prevent a second call is set but never actually checked. Combined with the owner-only sweep function, this allows a full takeover of deposited funds. No other issues were identified within the analyzed scope.",
+  "findings": [
+    {
+      "category": "SC10",
+      "confidence": "high",
+      "description": "initialize() is public with no initializer/onlyInitializing-style modifier, and _bootstrapped is written but never checked before allowing another call. Anyone can call initialize() at any time to reassign owner to themselves, then call sweepToOwner() to drain totalDeposits.",
+      "evidence": [
+        "function initialize(address newOwner) public {",
+        "    owner = newOwner;",
+        "    _bootstrapped = true;",
+        "}"
+      ],
+      "id": "F-198f3fae",
+      "locations": [
+        {
+          "contract": "UpgradeableVaultLogic",
+          "file": "sc10_unprotected_initializer.sol",
+          "function": "initialize",
+          "lineEnd": 12,
+          "lineStart": 9
+        }
+      ],
+      "mergedCount": 1,
+      "patch": null,
+      "recommendation": "Add a guard that reverts if _bootstrapped is already true (or adopt an initializer modifier from an upgrade-safe base) before this function runs its body.",
+      "severity": "CRITICAL",
+      "signature": "reinitializable-owner-takeover",
+      "stableKey": "sha256:198f3faee241c1aefe8b5860c3cb1bdeb7195d0ba62eb583d979cb304622d352",
+      "status": "suspected"
+    }
+  ],
+  "generatedBy": "ai",
+  "inputHash": "sha256:0d4110a9cc4e3030976e86d271b6eb45a5bf55888e3d78a859cb18a9ae3fe0ea",
+  "language": "en",
+  "limitations": [
+    "Off-chain logic, deployment configuration and key management were not assessed.",
+    "Operational security, infrastructure and tokenomics outside the analyzed code were not assessed.",
+    "Deployed contract state and third-party systems were not assessed."
+  ],
+  "mode": "pro",
+  "riskIndicator": {
+    "band": "HIGH",
+    "explanation": "This indicator reflects findings detected within the analyzed scope. It is not a measure of overall protocol security.",
+    "scopeNote": "according to the analyzed scope",
+    "score": 40,
+    "scoreStatus": "computed"
+  },
+  "scope": {
+    "completeness": "complete",
+    "reasons": []
+  },
+  "scoreStatus": "computed",
+  "scoreVersion": "2026.1",
+  "scriptsAvailable": true,
+  "skillVersion": "1.0.0"
+}

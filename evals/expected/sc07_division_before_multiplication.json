@@ -1,0 +1,11 @@
+{
+  "caseType": "vulnerable",
+  "mode": "standard",
+  "language": "en",
+  "targetCategory": "SC07",
+  "allowedCategories": ["SC07"],
+  "expectedCompleteness": "complete",
+  "expectedCompletenessReasonCodes": [],
+  "injectionExpected": false,
+  "notes": "calculateReward() computes (shares[account] / totalShares) * totalRewards - integer division first truncates to 0 for any account whose share is smaller than totalShares, losing essentially all reward for every holder but the single largest one. claimReward()'s name matches the admin-function-unprotected heuristic ('claim'), but it is the documented self-service false positive (scoped to msg.sender's own shares) and must not be reported as a separate SC01 finding."
+}

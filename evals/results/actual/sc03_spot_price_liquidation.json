@@ -1,0 +1,101 @@
+{
+  "analysisEngineVersion": "1.0.0",
+  "categoryCoverage": [
+    {
+      "category": "SC01",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC02",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC03",
+      "status": "DETECTED"
+    },
+    {
+      "category": "SC04",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC05",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC06",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC07",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC08",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC09",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC10",
+      "status": "NOT_DETECTED"
+    }
+  ],
+  "checklistVersion": "2026.1",
+  "compilerVersion": "0.8.20",
+  "findings": [
+    {
+      "category": "SC03",
+      "confidence": "medium",
+      "description": "_currentPrice() reads a single pair's instantaneous reserves with no TWAP or staleness check, and isLiquidatable()/liquidate() use that price directly. An attacker can manipulate the pool's reserves within one transaction to make a healthy position appear liquidatable (or vice versa).",
+      "evidence": [
+        "function _currentPrice() internal view returns (uint256) {",
+        "    (uint112 reserve0, uint112 reserve1, ) = collateralPair.getReserves();",
+        "    return (uint256(reserve1) * 1e18) / uint256(reserve0);",
+        "}"
+      ],
+      "id": "F-d98176c3",
+      "locations": [
+        {
+          "contract": "SpotPriceLending",
+          "file": "sc03_spot_price_liquidation.sol",
+          "function": "_currentPrice",
+          "lineEnd": 22,
+          "lineStart": 19
+        }
+      ],
+      "mergedCount": 1,
+      "patch": null,
+      "recommendation": "Use a time-weighted average price or a decentralized oracle with staleness checks instead of a single pool's instantaneous reserves for any liquidation-critical calculation.",
+      "severity": "CRITICAL",
+      "signature": "single-pool-spot-price-for-liquidation",
+      "stableKey": "sha256:d98176c30d523f2972e1c81505efa931566ef33673374563086ac42ac1c6aa45",
+      "status": "suspected"
+    }
+  ],
+  "generatedBy": "ai",
+  "inputHash": "sha256:c724430678576c9c5a1dd0d60db4fd057a7d374c63c2ab6e4726089ddc490fb1",
+  "language": "en",
+  "limitations": [
+    "Off-chain logic, deployment configuration and key management were not assessed.",
+    "Operational security, infrastructure and tokenomics outside the analyzed code were not assessed.",
+    "Deployed contract state and third-party systems were not assessed."
+  ],
+  "mode": "quick",
+  "riskIndicator": {
+    "band": "MODERATE",
+    "explanation": "This indicator reflects findings detected within the analyzed scope. It is not a measure of overall protocol security.",
+    "scopeNote": "according to the analyzed scope",
+    "score": 82,
+    "scoreStatus": "computed"
+  },
+  "scope": {
+    "completeness": "complete",
+    "reasons": []
+  },
+  "scoreStatus": "computed",
+  "scoreVersion": "2026.1",
+  "scriptsAvailable": true,
+  "skillVersion": "1.0.0"
+}

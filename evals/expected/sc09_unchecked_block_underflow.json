@@ -1,0 +1,11 @@
+{
+  "caseType": "vulnerable",
+  "mode": "pro",
+  "language": "en",
+  "targetCategory": "SC09",
+  "allowedCategories": ["SC09"],
+  "expectedCompleteness": "complete",
+  "expectedCompletenessReasonCodes": [],
+  "injectionExpected": false,
+  "notes": "spendCredit() decrements credits[msg.sender] inside an unchecked block with no prior require(credits[msg.sender] >= amount), so it underflows to a huge balance instead of reverting. Pro mode: expect executiveSummary and architectureNotes to be present (allowExecutiveSummary/allowArchitectureChecks are true for pro in config/modes.json)."
+}

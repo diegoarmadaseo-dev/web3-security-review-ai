@@ -1,0 +1,11 @@
+{
+  "caseType": "vulnerable",
+  "mode": "quick",
+  "language": "en",
+  "targetCategory": "SC04",
+  "allowedCategories": ["SC04", "SC03"],
+  "expectedCompleteness": "complete",
+  "expectedCompletenessReasonCodes": [],
+  "injectionExpected": false,
+  "notes": "mintAgainstCollateral() is reachable both directly and via the onFlashLoan callback, and prices the mint off the same unguarded single-pool spot price as the SC03 case - manipulable within one atomic transaction using borrowed liquidity. SC03 may legitimately also be reported since both categories share the same underlying oracle-usage mechanism (checklist.md maps oracle-usage to SC03 and SC04 jointly). mintAgainstCollateral's name matches the admin-function-unprotected heuristic ('mint'), but it is intentionally permissionless (collateral-gated, not role-gated) - a correct analysis should not report a separate SC01 finding for that; the real defect is the manipulable price, not missing access control."
+}

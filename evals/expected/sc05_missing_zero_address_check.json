@@ -1,0 +1,11 @@
+{
+  "caseType": "vulnerable",
+  "mode": "standard",
+  "language": "en",
+  "targetCategory": "SC05",
+  "allowedCategories": ["SC05"],
+  "expectedCompleteness": "complete",
+  "expectedCompletenessReasonCodes": [],
+  "injectionExpected": false,
+  "notes": "setFeeRecipient(address) is correctly owner-gated but never checks newRecipient against address(0); collectFee() then forwards msg.value to whatever feeRecipient holds, so a mistaken zero-address assignment permanently burns every subsequent fee payment. Standard mode: a gas note or patch for this finding is optional but permitted."
+}

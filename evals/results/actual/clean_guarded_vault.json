@@ -1,0 +1,73 @@
+{
+  "analysisEngineVersion": "1.0.0",
+  "categoryCoverage": [
+    {
+      "category": "SC01",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC02",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC03",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC04",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC05",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC06",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC07",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC08",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC09",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC10",
+      "status": "NOT_DETECTED"
+    }
+  ],
+  "checklistVersion": "2026.1",
+  "compilerVersion": "0.8.20",
+  "findings": [],
+  "generatedBy": "ai",
+  "inputHash": "sha256:22ccd1ec84c50e85195183c6673566568c7dc79a4e1e78293d6fa0ed7216116f",
+  "language": "en",
+  "limitations": [
+    "Off-chain logic, deployment configuration and key management were not assessed.",
+    "Operational security, infrastructure and tokenomics outside the analyzed code were not assessed.",
+    "Deployed contract state and third-party systems were not assessed."
+  ],
+  "mode": "quick",
+  "riskIndicator": {
+    "band": "LOW",
+    "explanation": "This indicator reflects findings detected within the analyzed scope. It is not a measure of overall protocol security.",
+    "lowBandNote": "A LOW automated risk indicator does not mean that deployment is safe.",
+    "scopeNote": "according to the analyzed scope",
+    "score": 100,
+    "scoreStatus": "computed"
+  },
+  "scope": {
+    "completeness": "complete",
+    "reasons": []
+  },
+  "scoreStatus": "computed",
+  "scoreVersion": "2026.1",
+  "scriptsAvailable": true,
+  "skillVersion": "1.0.0"
+}

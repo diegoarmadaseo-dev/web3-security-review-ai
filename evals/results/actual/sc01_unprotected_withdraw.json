@@ -1,0 +1,101 @@
+{
+  "analysisEngineVersion": "1.0.0",
+  "categoryCoverage": [
+    {
+      "category": "SC01",
+      "status": "DETECTED"
+    },
+    {
+      "category": "SC02",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC03",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC04",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC05",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC06",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC07",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC08",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC09",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC10",
+      "status": "NOT_DETECTED"
+    }
+  ],
+  "checklistVersion": "2026.1",
+  "compilerVersion": "0.8.20",
+  "findings": [
+    {
+      "category": "SC01",
+      "confidence": "high",
+      "description": "withdrawAll has no access-control check and sends the contract's entire ETH balance to an arbitrary caller-supplied address, so any account can drain all funds deposited by every user.",
+      "evidence": [
+        "function withdrawAll(address payable to) external {",
+        "    uint256 balance = address(this).balance;",
+        "    to.transfer(balance);",
+        "}"
+      ],
+      "id": "F-0b79458e",
+      "locations": [
+        {
+          "contract": "TreasuryVault",
+          "file": "sc01_unprotected_withdraw.sol",
+          "function": "withdrawAll",
+          "lineEnd": 14,
+          "lineStart": 11
+        }
+      ],
+      "mergedCount": 1,
+      "patch": null,
+      "recommendation": "Restrict withdrawAll to an authorized role (e.g. an onlyOwner modifier) or remove it in favor of a per-account withdrawal scoped to each depositor's own recorded balance.",
+      "severity": "CRITICAL",
+      "signature": "unprotected-withdraw-all",
+      "stableKey": "sha256:0b79458efea2dc3cf5ef2fbf8ca99e019ec6e04983f01549a88bbbb69210752c",
+      "status": "suspected"
+    }
+  ],
+  "generatedBy": "ai",
+  "inputHash": "sha256:43bf0da763f71011dcbe1eb2d90ff775e78868a7349afc7b39fb1d15978f6751",
+  "language": "en",
+  "limitations": [
+    "Off-chain logic, deployment configuration and key management were not assessed.",
+    "Operational security, infrastructure and tokenomics outside the analyzed code were not assessed.",
+    "Deployed contract state and third-party systems were not assessed."
+  ],
+  "mode": "quick",
+  "riskIndicator": {
+    "band": "HIGH",
+    "explanation": "This indicator reflects findings detected within the analyzed scope. It is not a measure of overall protocol security.",
+    "scopeNote": "according to the analyzed scope",
+    "score": 40,
+    "scoreStatus": "computed"
+  },
+  "scope": {
+    "completeness": "complete",
+    "reasons": []
+  },
+  "scoreStatus": "computed",
+  "scoreVersion": "2026.1",
+  "scriptsAvailable": true,
+  "skillVersion": "1.0.0"
+}

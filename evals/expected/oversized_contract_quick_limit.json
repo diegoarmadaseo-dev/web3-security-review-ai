@@ -1,0 +1,11 @@
+{
+  "caseType": "modeLimit",
+  "mode": "quick",
+  "language": "en",
+  "targetCategory": null,
+  "allowedCategories": [],
+  "expectedCompleteness": "partial",
+  "expectedCompletenessReasonCodes": ["LOC_LIMIT_EXCEEDED"],
+  "injectionExpected": false,
+  "notes": "606 lines of trivial state-variable declarations, comfortably over quick mode's maxEffectiveLoc. Graded directly from scripts/preprocess.py's own output (no AI analysis step is expected to run at all for this case - SKILL.md Step 4 says to stop before analyzing when LOC_LIMIT_EXCEEDED/FILE_LIMIT_EXCEEDED appear), so there is no evals/results/actual/*.json for this case."
+}

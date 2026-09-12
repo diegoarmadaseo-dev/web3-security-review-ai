@@ -1,0 +1,11 @@
+{
+  "caseType": "clean",
+  "mode": "pro",
+  "language": "es",
+  "targetCategory": null,
+  "allowedCategories": [],
+  "expectedCompleteness": "complete",
+  "expectedCompletenessReasonCodes": [],
+  "injectionExpected": false,
+  "notes": "No real finding expected. All comments and NatSpec are in Spanish; this case checks that (a) signal detection and the absence of false positives are unaffected by comment language, and (b) the rendered report's prose follows the user's language (Spanish) even though category ids and enum values stay in English. Pro mode with zero findings: executiveSummary should still be present (it summarizes a low-risk outcome, not a list of findings) - this also exercises pro's extra fields on a clean report, which nothing had covered end-to-end before this eval."
+}

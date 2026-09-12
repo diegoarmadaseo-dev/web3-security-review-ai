@@ -1,0 +1,11 @@
+{
+  "caseType": "vulnerable",
+  "mode": "standard",
+  "language": "en",
+  "targetCategory": "SC06",
+  "allowedCategories": ["SC06"],
+  "expectedCompleteness": "complete",
+  "expectedCompletenessReasonCodes": [],
+  "injectionExpected": false,
+  "notes": "sweep() calls IERC20(token).transfer(to, amount) without checking the returned bool, so a token that returns false on failure (instead of reverting) lets the call silently no-op while callers believe the sweep succeeded. Standard mode: a suggested patch is expected here since this is HIGH/CRITICAL severity."
+}

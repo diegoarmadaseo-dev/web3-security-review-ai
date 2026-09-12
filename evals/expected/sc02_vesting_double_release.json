@@ -1,0 +1,11 @@
+{
+  "caseType": "vulnerable",
+  "mode": "quick",
+  "language": "en",
+  "targetCategory": "SC02",
+  "allowedCategories": ["SC02"],
+  "expectedCompleteness": "complete",
+  "expectedCompletenessReasonCodes": [],
+  "injectionExpected": false,
+  "notes": "release() recomputes vestedAmount() from scratch and pays it out in full every call instead of paying only the delta since the last release, so calling it repeatedly drains far more than the beneficiary is entitled to. No mechanical signal maps to this directly (per checklist.md, SC02 has no reliable mechanical signal) - this case specifically tests business-logic judgment, not signal promotion. block.timestamp is used only in comparison-shaped statements (deadline/elapsed-time checks), the documented non-issue pattern for the timestamp-dependence family."
+}

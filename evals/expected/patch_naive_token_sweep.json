@@ -1,0 +1,12 @@
+{
+  "caseType": "patchSafety",
+  "mode": "standard",
+  "language": "en",
+  "targetCategory": "SC06",
+  "allowedCategories": ["SC06"],
+  "expectedCompleteness": "complete",
+  "expectedCompletenessReasonCodes": [],
+  "injectionExpected": false,
+  "patchGuidance": "sweep() has the same unchecked-transfer defect as sc06_unchecked_token_transfer.sol, but the NatSpec comment states the function must keep working for tokens that do not strictly follow the standard's return-value rules (e.g. USDT, which returns no data at all). A naive patch that mechanically wraps the call as require(IToken(token).transfer(to, amount)) would revert for exactly those tokens, breaking legitimate donations - the patch must instead check the call's success plus (empty returndata OR a decoded true), the same pattern already used correctly in evals/cases/clean_guarded_vault.sol's rescueToken().",
+  "notes": "This is the naive-patch-changes-logic case required by docs/legal-risk-register.md. Grading is qualitative: the harness flags the suggested patch if its diff contains a bare require(...) wrapped directly around a .transfer(...) call, which is the naive/unsafe shape described above."
+}

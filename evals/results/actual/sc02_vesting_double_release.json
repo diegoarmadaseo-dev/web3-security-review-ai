@@ -1,0 +1,103 @@
+{
+  "analysisEngineVersion": "1.0.0",
+  "categoryCoverage": [
+    {
+      "category": "SC01",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC02",
+      "status": "DETECTED"
+    },
+    {
+      "category": "SC03",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC04",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC05",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC06",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC07",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC08",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC09",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC10",
+      "status": "NOT_DETECTED"
+    }
+  ],
+  "checklistVersion": "2026.1",
+  "compilerVersion": "0.8.20",
+  "findings": [
+    {
+      "category": "SC02",
+      "confidence": "high",
+      "description": "release() pays out the full vestedAmount() on every call instead of the amount newly vested since the last release. Nothing tracks how much has already been paid, so calling release() repeatedly (e.g. once per block once vesting completes) drains far more than the beneficiary is entitled to, up to the contract's entire balance.",
+      "evidence": [
+        "function release() external {",
+        "    require(msg.sender == beneficiary, \"not beneficiary\");",
+        "    uint256 amount = vestedAmount();",
+        "    (bool ok, ) = beneficiary.call{value: amount}(\"\");",
+        "    require(ok, \"transfer failed\");"
+      ],
+      "id": "F-32387263",
+      "locations": [
+        {
+          "contract": "SimpleVesting",
+          "file": "sc02_vesting_double_release.sol",
+          "function": "release",
+          "lineEnd": 29,
+          "lineStart": 24
+        }
+      ],
+      "mergedCount": 1,
+      "patch": null,
+      "recommendation": "Track cumulative released amount in a state variable and pay only vestedAmount() minus that running total on each call, updating the tracker before the external call.",
+      "severity": "HIGH",
+      "signature": "vesting-repeated-full-release",
+      "stableKey": "sha256:32387263f7e2b9c87652e5310b8c6c6d0eb9d458cbe859864a1f80ef2771b94f",
+      "status": "suspected"
+    }
+  ],
+  "generatedBy": "ai",
+  "inputHash": "sha256:cd06200e928e2fad1dc9cf39c6093cddd0d3e51e45e2c1e171b72087593767cb",
+  "language": "en",
+  "limitations": [
+    "Off-chain logic, deployment configuration and key management were not assessed.",
+    "Operational security, infrastructure and tokenomics outside the analyzed code were not assessed.",
+    "Deployed contract state and third-party systems were not assessed."
+  ],
+  "mode": "quick",
+  "riskIndicator": {
+    "band": "LOW",
+    "explanation": "This indicator reflects findings detected within the analyzed scope. It is not a measure of overall protocol security.",
+    "lowBandNote": "A LOW automated risk indicator does not mean that deployment is safe.",
+    "scopeNote": "according to the analyzed scope",
+    "score": 85,
+    "scoreStatus": "computed"
+  },
+  "scope": {
+    "completeness": "complete",
+    "reasons": []
+  },
+  "scoreStatus": "computed",
+  "scoreVersion": "2026.1",
+  "scriptsAvailable": true,
+  "skillVersion": "1.0.0"
+}

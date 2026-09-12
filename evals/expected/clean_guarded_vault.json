@@ -1,0 +1,11 @@
+{
+  "caseType": "clean",
+  "mode": "quick",
+  "language": "en",
+  "targetCategory": null,
+  "allowedCategories": [],
+  "expectedCompleteness": "complete",
+  "expectedCompletenessReasonCodes": [],
+  "injectionExpected": false,
+  "notes": "No real finding expected. withdraw() will raise the admin-function-unprotected signal by name ('withdraw'), but it is scoped to msg.sender's own recorded balance - the family's documented false-positive pattern, not a real access-control gap. rescueToken() is onlyOwner-gated, checks the recipient against address(0), and safely handles both bool-returning and no-return-value tokens via manual call+returndata decoding. This case measures the false-positive rate: promoting either signal to a finding here counts against the eval's FP budget."
+}

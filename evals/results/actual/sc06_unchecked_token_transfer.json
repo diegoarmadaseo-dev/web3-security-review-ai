@@ -1,0 +1,104 @@
+{
+  "analysisEngineVersion": "1.0.0",
+  "categoryCoverage": [
+    {
+      "category": "SC01",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC02",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC03",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC04",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC05",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC06",
+      "status": "DETECTED"
+    },
+    {
+      "category": "SC07",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC08",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC09",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC10",
+      "status": "NOT_DETECTED"
+    }
+  ],
+  "checklistVersion": "2026.1",
+  "compilerVersion": "0.8.20",
+  "findings": [
+    {
+      "category": "SC06",
+      "confidence": "high",
+      "description": "sweep() calls transfer() without checking its returned bool. A token that signals failure by returning false (instead of reverting) lets the call silently no-op while the caller believes the transfer succeeded.",
+      "evidence": [
+        "function sweep(address token, address to, uint256 amount) external onlyOwner {",
+        "    IERC20(token).transfer(to, amount);",
+        "}"
+      ],
+      "id": "F-8b90ab03",
+      "locations": [
+        {
+          "contract": "TokenSweeper",
+          "file": "sc06_unchecked_token_transfer.sol",
+          "function": "sweep",
+          "lineEnd": 22,
+          "lineStart": 20
+        }
+      ],
+      "mergedCount": 1,
+      "patch": {
+        "diff": "--- a/sc06_unchecked_token_transfer.sol\n+++ b/sc06_unchecked_token_transfer.sol\n@@ -19,3 +19,3 @@\n     function sweep(address token, address to, uint256 amount) external onlyOwner {\n-        IERC20(token).transfer(to, amount);\n+        require(IERC20(token).transfer(to, amount), \"transfer failed\");\n     }\n",
+        "format": "unified-diff"
+      },
+      "recommendation": "Check the return value, e.g. require(IERC20(token).transfer(to, amount), \"transfer failed\").",
+      "severity": "HIGH",
+      "signature": "unchecked-ierc20-transfer-return",
+      "stableKey": "sha256:8b90ab032faf269638c5291f954d12424460fcd841b4755667579de1b7dd9879",
+      "status": "suspected"
+    }
+  ],
+  "generatedBy": "ai",
+  "inputHash": "sha256:deb99fd15714dd5df962b3ef44806e804019d6789b7d017829fab6c4d4e0a31a",
+  "language": "en",
+  "limitations": [
+    "Off-chain logic, deployment configuration and key management were not assessed.",
+    "Operational security, infrastructure and tokenomics outside the analyzed code were not assessed.",
+    "Deployed contract state and third-party systems were not assessed."
+  ],
+  "mode": "standard",
+  "riskIndicator": {
+    "band": "LOW",
+    "explanation": "This indicator reflects findings detected within the analyzed scope. It is not a measure of overall protocol security.",
+    "lowBandNote": "A LOW automated risk indicator does not mean that deployment is safe.",
+    "scopeNote": "according to the analyzed scope",
+    "score": 85,
+    "scoreStatus": "computed"
+  },
+  "scope": {
+    "completeness": "complete",
+    "reasons": []
+  },
+  "scoreStatus": "computed",
+  "scoreVersion": "2026.1",
+  "scriptsAvailable": true,
+  "skillVersion": "1.0.0"
+}

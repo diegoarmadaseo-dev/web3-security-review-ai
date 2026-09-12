@@ -1,0 +1,11 @@
+{
+  "caseType": "vulnerable",
+  "mode": "standard",
+  "language": "en",
+  "targetCategory": "SC08",
+  "allowedCategories": ["SC08"],
+  "expectedCompleteness": "complete",
+  "expectedCompletenessReasonCodes": [],
+  "injectionExpected": false,
+  "notes": "withdraw() performs the external call{value: amount}(\"\") before decrementing balances[msg.sender], with no reentrancy guard - a classic checks-effects-interactions violation letting a malicious receive()/fallback re-enter withdraw() and drain the contract. withdraw's name also matches the admin-function-unprotected heuristic, but it is the documented self-service false positive and must not be reported as a separate SC01 finding - the real, severe issue here is the reentrancy ordering, not access control."
+}

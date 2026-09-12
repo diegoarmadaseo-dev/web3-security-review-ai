@@ -1,0 +1,101 @@
+{
+  "analysisEngineVersion": "1.0.0",
+  "categoryCoverage": [
+    {
+      "category": "SC01",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC02",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC03",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC04",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC05",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC06",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC07",
+      "status": "DETECTED"
+    },
+    {
+      "category": "SC08",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC09",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC10",
+      "status": "NOT_DETECTED"
+    }
+  ],
+  "checklistVersion": "2026.1",
+  "compilerVersion": "0.8.20",
+  "findings": [
+    {
+      "category": "SC07",
+      "confidence": "high",
+      "description": "calculateReward divides shares[account] by totalShares before multiplying by totalRewards. Integer division truncates the intermediate result to 0 whenever shares[account] < totalShares (the common case for any holder that is not the single largest one), so almost every account receives zero reward regardless of their actual share.",
+      "evidence": [
+        "function calculateReward(address account) public view returns (uint256) {",
+        "    return (shares[account] / totalShares) * totalRewards;",
+        "}"
+      ],
+      "id": "F-de498dc5",
+      "locations": [
+        {
+          "contract": "RewardPool",
+          "file": "sc07_division_before_multiplication.sol",
+          "function": "calculateReward",
+          "lineEnd": 31,
+          "lineStart": 29
+        }
+      ],
+      "mergedCount": 1,
+      "patch": null,
+      "recommendation": "Multiply before dividing: (shares[account] * totalRewards) / totalShares, using a fixed-point scaling factor if additional precision is needed.",
+      "severity": "HIGH",
+      "signature": "reward-division-before-multiplication",
+      "stableKey": "sha256:de498dc5dc033927a82218a14108c7aade36b449db9f5e89c20c2b3e89cd8742",
+      "status": "suspected"
+    }
+  ],
+  "generatedBy": "ai",
+  "inputHash": "sha256:d3ada7467f5f04f79d89d746ba7c49b1c7e492aec12eb8e0fda24db4b3b15040",
+  "language": "en",
+  "limitations": [
+    "Off-chain logic, deployment configuration and key management were not assessed.",
+    "Operational security, infrastructure and tokenomics outside the analyzed code were not assessed.",
+    "Deployed contract state and third-party systems were not assessed."
+  ],
+  "mode": "standard",
+  "riskIndicator": {
+    "band": "LOW",
+    "explanation": "This indicator reflects findings detected within the analyzed scope. It is not a measure of overall protocol security.",
+    "lowBandNote": "A LOW automated risk indicator does not mean that deployment is safe.",
+    "scopeNote": "according to the analyzed scope",
+    "score": 85,
+    "scoreStatus": "computed"
+  },
+  "scope": {
+    "completeness": "complete",
+    "reasons": []
+  },
+  "scoreStatus": "computed",
+  "scoreVersion": "2026.1",
+  "scriptsAvailable": true,
+  "skillVersion": "1.0.0"
+}

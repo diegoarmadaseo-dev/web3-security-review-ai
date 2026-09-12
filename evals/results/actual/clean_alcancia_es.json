@@ -1,0 +1,80 @@
+{
+  "analysisEngineVersion": "1.0.0",
+  "architectureNotes": [
+    {
+      "description": "Alcancia no importa ni hereda de ningun otro contrato y no depende de oraculos, tokens externos ni de otros contratos del protocolo, por lo que no hay superficie de confianza entre contratos que evaluar en este caso.",
+      "title": "Alcance limitado a un unico contrato autonomo"
+    }
+  ],
+  "categoryCoverage": [
+    {
+      "category": "SC01",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC02",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC03",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC04",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC05",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC06",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC07",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC08",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC09",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC10",
+      "status": "NOT_DETECTED"
+    }
+  ],
+  "checklistVersion": "2026.1",
+  "compilerVersion": "0.8.20",
+  "executiveSummary": "Esta revision no encontro hallazgos de seguridad dentro del alcance analizado. El contrato aplica correctamente el control de acceso para la funcion de pausa, actualiza el estado antes de enviar fondos en retirar() y limita cada retiro al saldo propio de quien lo solicita.",
+  "findings": [],
+  "generatedBy": "ai",
+  "inputHash": "sha256:73f2c1018903d088eecf2cbfeacfa99dd3f67cb4f4a479d02175fb03f14d9b0b",
+  "language": "es",
+  "limitations": [
+    "No se evaluo la logica fuera de la cadena, la configuracion de despliegue ni la gestion de claves.",
+    "No se evaluaron la seguridad operativa, la infraestructura ni la tokenomica fuera del codigo analizado.",
+    "No se evaluo el estado del contrato ya desplegado ni sistemas de terceros."
+  ],
+  "mode": "pro",
+  "riskIndicator": {
+    "band": "LOW",
+    "explanation": "This indicator reflects findings detected within the analyzed scope. It is not a measure of overall protocol security.",
+    "lowBandNote": "A LOW automated risk indicator does not mean that deployment is safe.",
+    "scopeNote": "according to the analyzed scope",
+    "score": 100,
+    "scoreStatus": "computed"
+  },
+  "scope": {
+    "completeness": "complete",
+    "reasons": []
+  },
+  "scoreStatus": "computed",
+  "scoreVersion": "2026.1",
+  "scriptsAvailable": true,
+  "skillVersion": "1.0.0"
+}

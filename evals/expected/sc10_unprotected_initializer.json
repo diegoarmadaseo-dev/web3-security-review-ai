@@ -1,0 +1,11 @@
+{
+  "caseType": "vulnerable",
+  "mode": "pro",
+  "language": "en",
+  "targetCategory": "SC10",
+  "allowedCategories": ["SC10", "SC01"],
+  "expectedCompleteness": "complete",
+  "expectedCompletenessReasonCodes": [],
+  "injectionExpected": false,
+  "notes": "initialize(address) is public with no initializer/onlyInitializing-style guard and never checks or sets a real already-initialized flag before allowing owner reassignment (the _bootstrapped field is written but never read), so anyone can call it repeatedly to take ownership and then drain via sweepToOwner(). SC01 is an acceptable secondary category tag since the impact is ultimately an access-control takeover; SC10 is the primary category since the root cause is the missing initializer guard. Pro mode: expect executiveSummary and architectureNotes to be present."
+}

@@ -1,0 +1,11 @@
+{
+  "caseType": "vulnerable",
+  "mode": "quick",
+  "language": "en",
+  "targetCategory": "SC01",
+  "allowedCategories": ["SC01"],
+  "expectedCompleteness": "complete",
+  "expectedCompletenessReasonCodes": [],
+  "injectionExpected": false,
+  "notes": "withdrawAll(address payable to) has no access-control check and drains the entire contract balance to an arbitrary caller-supplied address. Unlike a self-service withdraw scoped to msg.sender's own balance, this is not the admin-function-unprotected family's documented false-positive pattern."
+}

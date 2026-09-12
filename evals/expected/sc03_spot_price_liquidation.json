@@ -1,0 +1,11 @@
+{
+  "caseType": "vulnerable",
+  "mode": "quick",
+  "language": "en",
+  "targetCategory": "SC03",
+  "allowedCategories": ["SC03"],
+  "expectedCompleteness": "complete",
+  "expectedCompletenessReasonCodes": [],
+  "injectionExpected": false,
+  "notes": "_currentPrice() reads a single pair's instantaneous getReserves() with no TWAP or staleness check, and that price feeds directly into isLiquidatable()/liquidate(). The oracle-usage signal has high fpRisk in general, but here it feeds a critical financial decision directly with no mitigating context, which is exactly the strong corroborating evidence checklist.md asks for before promoting SC03/SC04 above low confidence."
+}

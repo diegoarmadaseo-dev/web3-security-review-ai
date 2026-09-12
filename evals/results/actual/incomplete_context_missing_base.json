@@ -1,0 +1,84 @@
+{
+  "analysisEngineVersion": "1.0.0",
+  "categoryCoverage": [
+    {
+      "category": "SC01",
+      "note": "deposit() gates on isMember(msg.sender), inherited from ExternalRegistry, which was not provided in the submitted bundle. Whether that check is a genuine, correctly implemented access-control gate cannot be assessed from the code available here.",
+      "status": "NOT_ASSESSED"
+    },
+    {
+      "category": "SC02",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC03",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC04",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC05",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC06",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC07",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC08",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC09",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC10",
+      "status": "NOT_DETECTED"
+    }
+  ],
+  "checklistVersion": "2026.1",
+  "compilerVersion": "0.8.20",
+  "executiveSummary": "This review is partial: MembershipVault inherits from ExternalRegistry, whose source was not provided, so the access-control check gating deposits could not be assessed. No issues were identified in the code that was available; withdraw() correctly updates state before making its external call. Provide ExternalRegistry.sol for a complete review of the access-control surface.",
+  "findings": [],
+  "generatedBy": "ai",
+  "inputHash": "sha256:9389382667d247fea988d0a37c50927f14d81fd1dd033e2c305814109c4877c7",
+  "language": "en",
+  "limitations": [
+    "Off-chain logic, deployment configuration and key management were not assessed.",
+    "Operational security, infrastructure and tokenomics outside the analyzed code were not assessed.",
+    "Deployed contract state and third-party systems were not assessed."
+  ],
+  "mode": "pro",
+  "riskIndicator": {
+    "band": "LOW",
+    "explanation": "This indicator reflects findings detected within the analyzed scope. It is not a measure of overall protocol security.",
+    "lowBandNote": "A LOW automated risk indicator does not mean that deployment is safe.",
+    "scopeNote": "according to the analyzed scope",
+    "score": 100,
+    "scoreStatus": "computed"
+  },
+  "scope": {
+    "completeness": "partial",
+    "reasons": [
+      {
+        "code": "MISSING_IMPORT",
+        "detail": "Import './ExternalRegistry.sol' referenced in incomplete_context_missing_base.sol was not found among the provided files."
+      },
+      {
+        "code": "UNRESOLVED_BASE",
+        "detail": "Base contract 'ExternalRegistry' used by incomplete_context_missing_base.sol#MembershipVault was not found among the provided files or resolvable imports."
+      }
+    ]
+  },
+  "scoreStatus": "computed",
+  "scoreVersion": "2026.1",
+  "scriptsAvailable": true,
+  "skillVersion": "1.0.0"
+}

@@ -1,0 +1,11 @@
+{
+  "caseType": "incompleteContext",
+  "mode": "pro",
+  "language": "en",
+  "targetCategory": null,
+  "allowedCategories": [],
+  "expectedCompleteness": "partial",
+  "expectedCompletenessReasonCodes": ["MISSING_IMPORT", "UNRESOLVED_BASE"],
+  "injectionExpected": false,
+  "notes": "This is the incomplete-context/missing-dependency case required by docs/legal-risk-register.md. MembershipVault is ExternalRegistry, but ExternalRegistry.sol is a relative import not included in the bundle, so isMember()'s implementation - which gates deposit() - is unknown. SC01 must be NOT_ASSESSED (access control cannot be evaluated without the base contract), not silently NOT_DETECTED. withdraw() itself is correctly ordered (state write before the external call) and is the same self-service pattern as the other cases - not a separate finding. scope.completeness must be 'partial', never 'complete', and categoryCoverage must contain at least one NOT_ASSESSED entry (rule R-05)."
+}

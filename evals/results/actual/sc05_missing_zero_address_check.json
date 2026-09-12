@@ -1,0 +1,101 @@
+{
+  "analysisEngineVersion": "1.0.0",
+  "categoryCoverage": [
+    {
+      "category": "SC01",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC02",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC03",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC04",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC05",
+      "status": "DETECTED"
+    },
+    {
+      "category": "SC06",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC07",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC08",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC09",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC10",
+      "status": "NOT_DETECTED"
+    }
+  ],
+  "checklistVersion": "2026.1",
+  "compilerVersion": "0.8.20",
+  "findings": [
+    {
+      "category": "SC05",
+      "confidence": "high",
+      "description": "setFeeRecipient never checks newRecipient against address(0). If the owner mistakenly sets it to the zero address, every subsequent collectFee() call permanently burns the fee payment.",
+      "evidence": [
+        "function setFeeRecipient(address newRecipient) external onlyOwner {",
+        "    feeRecipient = newRecipient;",
+        "}"
+      ],
+      "id": "F-1312a727",
+      "locations": [
+        {
+          "contract": "FeeCollector",
+          "file": "sc05_missing_zero_address_check.sol",
+          "function": "setFeeRecipient",
+          "lineEnd": 20,
+          "lineStart": 18
+        }
+      ],
+      "mergedCount": 1,
+      "patch": null,
+      "recommendation": "Add require(newRecipient != address(0)) before assigning feeRecipient.",
+      "severity": "MEDIUM",
+      "signature": "fee-recipient-missing-zero-address-check",
+      "stableKey": "sha256:1312a7275b4e5e159328b831e59f5500158fcae3d4db6ceb4373790092b10416",
+      "status": "suspected"
+    }
+  ],
+  "generatedBy": "ai",
+  "inputHash": "sha256:75720168cf141e1f5098134b16bea628d7415047d72d8c5c767bdadeeaa1af87",
+  "language": "en",
+  "limitations": [
+    "Off-chain logic, deployment configuration and key management were not assessed.",
+    "Operational security, infrastructure and tokenomics outside the analyzed code were not assessed.",
+    "Deployed contract state and third-party systems were not assessed."
+  ],
+  "mode": "standard",
+  "riskIndicator": {
+    "band": "LOW",
+    "explanation": "This indicator reflects findings detected within the analyzed scope. It is not a measure of overall protocol security.",
+    "lowBandNote": "A LOW automated risk indicator does not mean that deployment is safe.",
+    "scopeNote": "according to the analyzed scope",
+    "score": 93,
+    "scoreStatus": "computed"
+  },
+  "scope": {
+    "completeness": "complete",
+    "reasons": []
+  },
+  "scoreStatus": "computed",
+  "scoreVersion": "2026.1",
+  "scriptsAvailable": true,
+  "skillVersion": "1.0.0"
+}

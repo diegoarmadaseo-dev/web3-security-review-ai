@@ -1,0 +1,102 @@
+{
+  "analysisEngineVersion": "1.0.0",
+  "categoryCoverage": [
+    {
+      "category": "SC01",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC02",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC03",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC04",
+      "status": "DETECTED"
+    },
+    {
+      "category": "SC05",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC06",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC07",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC08",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC09",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC10",
+      "status": "NOT_DETECTED"
+    }
+  ],
+  "checklistVersion": "2026.1",
+  "compilerVersion": "0.8.20",
+  "findings": [
+    {
+      "category": "SC04",
+      "confidence": "high",
+      "description": "mintAgainstCollateral prices the mint off a single pool's spot reserves and is reachable both directly and from the onFlashLoan callback. Within one flash-loaned transaction, an attacker can swap to skew the pool's price, then mint synthetic tokens at that manipulated price with no capital of their own at risk.",
+      "evidence": [
+        "function mintAgainstCollateral(uint256 collateralAmount) public {",
+        "    (uint112 reserve0, uint112 reserve1, ) = pricingPair.getReserves();",
+        "    uint256 price = (uint256(reserve1) * 1e18) / uint256(reserve0);",
+        "    uint256 mintAmount = (collateralAmount * price) / 1e18;",
+        "    syntheticBalance[msg.sender] += mintAmount;"
+      ],
+      "id": "F-ab62c98e",
+      "locations": [
+        {
+          "contract": "SyntheticMinter",
+          "file": "sc04_flashloan_priced_mint.sol",
+          "function": "mintAgainstCollateral",
+          "lineEnd": 31,
+          "lineStart": 26
+        }
+      ],
+      "mergedCount": 1,
+      "patch": null,
+      "recommendation": "Do not price mints off spot reserves reachable within the same transaction as borrowed liquidity; use a TWAP or external oracle, and consider a same-block or same-transaction mint/borrow guard.",
+      "severity": "CRITICAL",
+      "signature": "flashloan-manipulable-mint-price",
+      "stableKey": "sha256:ab62c98e956043c5b2358526d100b6e450a9abec53b92766f8cce798d83a8113",
+      "status": "suspected"
+    }
+  ],
+  "generatedBy": "ai",
+  "inputHash": "sha256:2d1a4a7fc50523f0ec683545696f4bc64130872b59610991d8988e2b100c3638",
+  "language": "en",
+  "limitations": [
+    "Off-chain logic, deployment configuration and key management were not assessed.",
+    "Operational security, infrastructure and tokenomics outside the analyzed code were not assessed.",
+    "Deployed contract state and third-party systems were not assessed."
+  ],
+  "mode": "quick",
+  "riskIndicator": {
+    "band": "HIGH",
+    "explanation": "This indicator reflects findings detected within the analyzed scope. It is not a measure of overall protocol security.",
+    "scopeNote": "according to the analyzed scope",
+    "score": 40,
+    "scoreStatus": "computed"
+  },
+  "scope": {
+    "completeness": "complete",
+    "reasons": []
+  },
+  "scoreStatus": "computed",
+  "scoreVersion": "2026.1",
+  "scriptsAvailable": true,
+  "skillVersion": "1.0.0"
+}

@@ -1,0 +1,110 @@
+{
+  "analysisEngineVersion": "1.0.0",
+  "architectureNotes": [
+    {
+      "description": "CreditLedger has exactly one function that reduces a balance (spendCredit), and it is the one wrapped in unchecked{}. There is no separate safe-arithmetic helper or library in use, so any future balance-reducing function added to this contract should be reviewed for the same missing-check pattern rather than assumed safe by association with issueCredit.",
+      "title": "Single unchecked arithmetic block is the sole state-mutating path"
+    }
+  ],
+  "categoryCoverage": [
+    {
+      "category": "SC01",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC02",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC03",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC04",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC05",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC06",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC07",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC08",
+      "status": "NOT_DETECTED"
+    },
+    {
+      "category": "SC09",
+      "status": "DETECTED"
+    },
+    {
+      "category": "SC10",
+      "status": "NOT_DETECTED"
+    }
+  ],
+  "checklistVersion": "2026.1",
+  "compilerVersion": "0.8.20",
+  "executiveSummary": "This review found one high-severity issue: a credit-spending function can underflow to an enormous balance when called with more than the caller actually holds, because the subtraction is wrapped in an unchecked block with no prior balance check. No other issues were identified within the analyzed scope.",
+  "findings": [
+    {
+      "category": "SC09",
+      "confidence": "high",
+      "description": "spendCredit subtracts inside an unchecked block with no prior check that credits[msg.sender] >= amount. Calling it with an amount larger than the caller's balance underflows to a value near type(uint256).max instead of reverting.",
+      "evidence": [
+        "function spendCredit(uint256 amount) external {",
+        "    unchecked {",
+        "        credits[msg.sender] -= amount;",
+        "    }",
+        "}"
+      ],
+      "id": "F-59f10b14",
+      "locations": [
+        {
+          "contract": "CreditLedger",
+          "file": "sc09_unchecked_block_underflow.sol",
+          "function": "spendCredit",
+          "lineEnd": 25,
+          "lineStart": 21
+        }
+      ],
+      "mergedCount": 1,
+      "patch": null,
+      "recommendation": "Add require(credits[msg.sender] >= amount) before the subtraction, or drop the unchecked block so Solidity's built-in overflow/underflow checks apply.",
+      "severity": "HIGH",
+      "signature": "unchecked-credit-underflow",
+      "stableKey": "sha256:59f10b140bbcda5c5a0001884256fc7f0b62eb5a4f9ee86e3927fc9f71b61c91",
+      "status": "suspected"
+    }
+  ],
+  "generatedBy": "ai",
+  "inputHash": "sha256:bbd0f652c435fc2ef9f3b2179b866e2540087b728ac89c2d44c9c3c00e2745a1",
+  "language": "en",
+  "limitations": [
+    "Off-chain logic, deployment configuration and key management were not assessed.",
+    "Operational security, infrastructure and tokenomics outside the analyzed code were not assessed.",
+    "Deployed contract state and third-party systems were not assessed."
+  ],
+  "mode": "pro",
+  "riskIndicator": {
+    "band": "LOW",
+    "explanation": "This indicator reflects findings detected within the analyzed scope. It is not a measure of overall protocol security.",
+    "lowBandNote": "A LOW automated risk indicator does not mean that deployment is safe.",
+    "scopeNote": "according to the analyzed scope",
+    "score": 85,
+    "scoreStatus": "computed"
+  },
+  "scope": {
+    "completeness": "complete",
+    "reasons": []
+  },
+  "scoreStatus": "computed",
+  "scoreVersion": "2026.1",
+  "scriptsAvailable": true,
+  "skillVersion": "1.0.0"
+}
