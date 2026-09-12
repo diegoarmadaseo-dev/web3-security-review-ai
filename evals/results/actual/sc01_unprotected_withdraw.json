@@ -7,38 +7,46 @@
     },
     {
       "category": "SC02",
+      "note": "The only business-relevant defect (per-user deposits accounting being disconnected from withdrawal) shares the same root cause as the SC01 finding on withdrawAll; no additional standalone business-logic issue was identified.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC03",
+      "note": "No price or rate oracle reads, or any on-chain pricing logic, are present in this contract.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC04",
+      "note": "No flash-loan interfaces or borrow-and-repay-in-one-transaction logic are present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC05",
-      "status": "NOT_DETECTED"
+      "status": "DETECTED"
     },
     {
       "category": "SC06",
+      "note": "The only external interaction is a plain to.transfer(balance); there are no token transfers, low-level .call/.send usages, or unchecked return values to assess.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC07",
+      "note": "No division or fixed-point arithmetic is present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC08",
+      "note": "withdrawAll performs no state write at all (writesState: false) and uses transfer, which carries a 2300 gas stipend; no reentrancy pattern is present regardless of the access-control gap.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC09",
+      "note": "Compiler is a fixed 0.8.20 (built-in overflow/underflow checks apply); no unchecked blocks or legacy arithmetic are present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC10",
+      "note": "No proxy pattern, delegatecall, upgrade function, or initializer is present.",
       "status": "NOT_DETECTED"
     }
   ],
@@ -48,18 +56,18 @@
     {
       "category": "SC01",
       "confidence": "high",
-      "description": "withdrawAll has no access-control check and sends the contract's entire ETH balance to an arbitrary caller-supplied address, so any account can drain all funds deposited by every user.",
+      "description": "withdrawAll is external with no access-control modifier and no in-body authorization check of any kind - it does not require msg.sender to be an owner, and it does not check the caller's own recorded balance in the deposits mapping. It reads address(this).balance (the contract's entire ether balance, contributed by every depositor) and forwards all of it to an arbitrary address supplied by the caller. Because the deposits mapping is written in deposit() but never read or checked anywhere in withdrawAll, that per-user accounting provides no real protection. In practice, any external account can call withdrawAll(attackerAddress) in a single transaction and immediately steal every wei ever deposited by any user, and legitimate depositors have no separate way to withdraw only their own funds. This is a complete, unauthenticated loss-of-funds path with no preconditions.",
       "evidence": [
+        "mapping(address => uint256) public deposits;",
         "function withdrawAll(address payable to) external {",
-        "    uint256 balance = address(this).balance;",
-        "    to.transfer(balance);",
-        "}"
+        "uint256 balance = address(this).balance;",
+        "to.transfer(balance);"
       ],
-      "id": "F-0b79458e",
+      "id": "F-cafe508f",
       "locations": [
         {
           "contract": "TreasuryVault",
-          "file": "sc01_unprotected_withdraw.sol",
+          "file": "contract_c.sol",
           "function": "withdrawAll",
           "lineEnd": 14,
           "lineStart": 11
@@ -67,15 +75,41 @@
       ],
       "mergedCount": 1,
       "patch": null,
-      "recommendation": "Restrict withdrawAll to an authorized role (e.g. an onlyOwner modifier) or remove it in favor of a per-account withdrawal scoped to each depositor's own recorded balance.",
+      "recommendation": "Do not allow an unauthenticated caller to sweep the full contract balance to an arbitrary address. If a full-balance sweep is intentionally an admin/emergency function, gate it behind a proper access-control mechanism (e.g. OpenZeppelin's Ownable/AccessControl with onlyOwner or a dedicated role), ideally combined with a two-step or timelocked process for such a sensitive action. If the intent is to let each user withdraw their own deposit, replace withdrawAll with a user-scoped withdraw(uint256 amount) (or withdraw()) that checks deposits[msg.sender] >= amount, decrements deposits[msg.sender] before sending funds (checks-effects-interactions), and sends only that amount to msg.sender rather than an arbitrary destination funded from the whole contract balance.",
       "severity": "CRITICAL",
-      "signature": "unprotected-withdraw-all",
-      "stableKey": "sha256:0b79458efea2dc3cf5ef2fbf8ca99e019ec6e04983f01549a88bbbb69210752c",
-      "status": "suspected"
+      "signature": "unauthenticated-full-balance-withdrawal",
+      "stableKey": "sha256:cafe508f8682017fe426185f93069671a95f755e18f608e63b01ebbc89c35462",
+      "status": "confirmed"
+    },
+    {
+      "category": "SC05",
+      "confidence": "high",
+      "description": "The to parameter is never compared against address(0) before the contract balance is transferred to it, and there is no indirect validation (such as an allowlist lookup) either. This is a minor concern relative to the critical access-control issue on the same function, but if to were ever mistakenly left as the zero address, the full balance being withdrawn would be sent there and permanently lost, with no revert to catch the mistake.",
+      "evidence": [
+        "function withdrawAll(address payable to) external {",
+        "to.transfer(balance);"
+      ],
+      "id": "F-2023d63c",
+      "locations": [
+        {
+          "contract": "TreasuryVault",
+          "file": "contract_c.sol",
+          "function": "withdrawAll",
+          "lineEnd": 14,
+          "lineStart": 11
+        }
+      ],
+      "mergedCount": 1,
+      "patch": null,
+      "recommendation": "Add an explicit require(to != address(0), \"zero address\") check (or equivalent) before transferring funds, as basic input-validation hygiene independent of the access-control fix above.",
+      "severity": "LOW",
+      "signature": "zero-address-unchecked-withdraw-destination",
+      "stableKey": "sha256:2023d63c6bb658ef2f2d74f7a1cc59b031decf1eda393f7735567408bfecf5e6",
+      "status": "confirmed"
     }
   ],
   "generatedBy": "ai",
-  "inputHash": "sha256:43bf0da763f71011dcbe1eb2d90ff775e78868a7349afc7b39fb1d15978f6751",
+  "inputHash": "sha256:412ebbe3329eb78cc98f7cfe0742b380919b23e9ccca9711cb62487225f2aa54",
   "language": "en",
   "limitations": [
     "Off-chain logic, deployment configuration and key management were not assessed.",

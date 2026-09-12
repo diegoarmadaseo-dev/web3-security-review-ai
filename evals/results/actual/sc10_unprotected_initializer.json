@@ -2,45 +2,57 @@
   "analysisEngineVersion": "1.0.0",
   "architectureNotes": [
     {
-      "description": "The contract already declares a _bootstrapped boolean intended to mark completed setup, but no function reads it. This suggests the guard was planned but not wired in, rather than the contract being designed as intentionally re-initializable - worth confirming with whoever owns this logic contract before assuming any other behavior here is equally intentional.",
-      "title": "Bootstrap flag exists but is not enforced"
+      "description": "The contract's name (UpgradeableVaultLogic) and its use of an initialize() function instead of a constructor are consistent with the implementation ('logic') half of an upgradeable proxy pattern (e.g., Transparent or UUPS). This is inferred from naming and structure only - no proxy contract, storage-slot constants, delegatecall usage, or upgrade function are present in the reviewed source, so the actual deployment architecture cannot be confirmed from this file alone. If this contract is in fact deployed as a proxy's implementation, the unprotected-initializer finding above is especially significant, since implementation contracts of this kind are commonly callable directly on their own address (not only through the proxy) - a well-documented real-world attack class. The standard mitigation in that scenario is to add a constructor to this logic contract that calls _disableInitializers() (OpenZeppelin's pattern), in addition to fixing the re-initialization guard itself.",
+      "title": "Architecture observation"
+    },
+    {
+      "description": "Independent of the access-control defect, the contract's fund flow is one-directional by design: deposit() accepts ETH from any caller, but the only exit path is sweepToOwner(), which lets the owner alone withdraw the full balance at any time, with no per-depositor withdrawal function, no timelock, and no individual balance accounting. Even with a correctly-guarded owner, this concentrates full custody of all user funds in a single address - worth flagging to stakeholders as a trust-centralization consideration for a contract named as a 'vault', separate from the specific coding defects above.",
+      "title": "Architecture observation"
     }
   ],
   "categoryCoverage": [
     {
       "category": "SC01",
-      "status": "NOT_DETECTED"
+      "note": "Same root cause as the SC10 finding: the unprotected initializer lets any account become owner, i.e. a complete access-control compromise, not a separate defect.",
+      "status": "DETECTED"
     },
     {
       "category": "SC02",
+      "note": "No loops, no msg.value-in-loop pattern, and no transferFrom/approve usage present in this file.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC03",
+      "note": "No swap, slippage, or price-related logic present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC04",
+      "note": "No oracle reads or flash-loan interfaces present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC05",
-      "status": "NOT_DETECTED"
+      "status": "DETECTED"
     },
     {
       "category": "SC06",
+      "note": "No low-level calls, token transfers, or external contract/interface calls present; .transfer() to a plain address is the only value transfer.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC07",
+      "note": "No division or multiplication arithmetic present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC08",
+      "note": "sweepToOwner writes state (totalDeposits = 0) after an external interaction, but that interaction is .transfer(), which forwards only a 2300 gas stipend - the standard recognized non-reentrant pattern.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC09",
+      "note": "Pragma is pinned (not floating) at 0.8.20, a modern post-checked-arithmetic compiler version; no unchecked blocks present.",
       "status": "NOT_DETECTED"
     },
     {
@@ -50,39 +62,79 @@
   ],
   "checklistVersion": "2026.1",
   "compilerVersion": "0.8.20",
-  "executiveSummary": "This review found one critical issue: the contract's initialize function can be called by anyone at any time to reassign ownership, because the internal flag meant to prevent a second call is set but never actually checked. Combined with the owner-only sweep function, this allows a full takeover of deposited funds. No other issues were identified within the analyzed scope.",
+  "executiveSummary": "This contract has a serious, high-priority problem: the function that sets who owns the vault - and therefore who can withdraw every deposit in it - can be run by anyone, at any time, not just once by the rightful operator. In practice, this means an outside party could name themselves the owner and then withdraw all the funds ever deposited. This should be treated as a blocking issue and fixed before the contract is used with real money. A smaller, related gap - not checking that the new owner address isn't blank/invalid - should be fixed at the same time to avoid accidentally locking funds in the future.",
   "findings": [
     {
       "category": "SC10",
       "confidence": "high",
-      "description": "initialize() is public with no initializer/onlyInitializing-style modifier, and _bootstrapped is written but never checked before allowing another call. Anyone can call initialize() at any time to reassign owner to themselves, then call sweepToOwner() to drain totalDeposits.",
+      "description": "initialize() is public, state-changing, and carries no protection whatsoever against being called more than once or by an unauthorized caller. A `_bootstrapped` flag is declared and set to true, but it is never read or checked anywhere in the contract - there is no `require(!_bootstrapped, ...)`, no `initializer` modifier, and no other guard. As written, any external account can call initialize(attacker) at deployment time (racing the legitimate deployer) or at any later point in the contract's life (since nothing ever blocks a second call), setting itself as owner. Because sweepToOwner() trusts owner unconditionally (`require(msg.sender == owner)`) to authorize sending the entire tracked balance (totalDeposits) to that same address, an attacker who calls initialize() can immediately follow up with sweepToOwner() and drain every deposit ever made to the contract. This is a complete, repeatable, low-complexity takeover-and-drain path requiring no special privileges.",
       "evidence": [
+        "bool private _bootstrapped;",
         "function initialize(address newOwner) public {",
-        "    owner = newOwner;",
-        "    _bootstrapped = true;",
-        "}"
+        "        owner = newOwner;",
+        "        _bootstrapped = true;",
+        "        require(msg.sender == owner, \"not owner\");"
       ],
-      "id": "F-198f3fae",
+      "id": "F-ca5455a6",
       "locations": [
         {
           "contract": "UpgradeableVaultLogic",
-          "file": "sc10_unprotected_initializer.sol",
+          "file": "contract_l.sol",
           "function": "initialize",
           "lineEnd": 12,
+          "lineStart": 9
+        },
+        {
+          "contract": "UpgradeableVaultLogic",
+          "file": "contract_l.sol",
+          "function": "sweepToOwner",
+          "lineEnd": 22,
+          "lineStart": 18
+        }
+      ],
+      "mergedCount": 1,
+      "patch": {
+        "diff": "--- a/contract_l.sol\n+++ b/contract_l.sol\n@@ -7,6 +7,7 @@\n     uint256 public totalDeposits;\n \n     function initialize(address newOwner) public {\n+        require(!_bootstrapped, \"already initialized\");\n         owner = newOwner;\n         _bootstrapped = true;\n     }\n",
+        "format": "unified-diff"
+      },
+      "recommendation": "Add a one-time guard before mutating state, e.g. `require(!_bootstrapped, \"already initialized\"); _bootstrapped = true;` at the very start of initialize (or adopt OpenZeppelin's Initializable and its `initializer` modifier). If this contract is intended to be deployed as the implementation behind a proxy, additionally add a constructor that calls `_disableInitializers()` so the bare implementation contract itself can never be initialized directly, and ensure the proxy's initialize call is made atomically in the same transaction/script that deploys the proxy so no window exists for front-running.",
+      "severity": "CRITICAL",
+      "signature": "unprotected-reinitializable-initializer",
+      "stableKey": "sha256:ca5455a631fd1622e16217adb97e76457b76aaa964097297bfe4328679fd8fc1",
+      "status": "confirmed"
+    },
+    {
+      "category": "SC05",
+      "confidence": "medium",
+      "description": "The newOwner parameter is assigned directly to owner with no check against address(0). If a zero address is ever supplied (by mistake, or by anyone exploiting the missing re-initialization guard covered in the companion SC10 finding), owner becomes address(0). Since sweepToOwner() requires msg.sender == owner, no ordinary transaction sender can ever satisfy that check once owner is the zero address, permanently blocking the intended withdrawal path. Under the contract's current code this is largely overshadowed by the fact that initialize can simply be called again to fix (or exploit) the owner value, but it becomes a standalone, serious fund-lock risk the moment the re-initialization gap above is fixed in isolation without also addressing this one.",
+      "evidence": [
+        "function initialize(address newOwner) public {",
+        "        owner = newOwner;"
+      ],
+      "id": "F-dd4f61ad",
+      "locations": [
+        {
+          "contract": "UpgradeableVaultLogic",
+          "file": "contract_l.sol",
+          "function": "initialize",
+          "lineEnd": 10,
           "lineStart": 9
         }
       ],
       "mergedCount": 1,
-      "patch": null,
-      "recommendation": "Add a guard that reverts if _bootstrapped is already true (or adopt an initializer modifier from an upgrade-safe base) before this function runs its body.",
-      "severity": "CRITICAL",
-      "signature": "reinitializable-owner-takeover",
-      "stableKey": "sha256:198f3faee241c1aefe8b5860c3cb1bdeb7195d0ba62eb583d979cb304622d352",
+      "patch": {
+        "diff": "--- a/contract_l.sol\n+++ b/contract_l.sol\n@@ -7,6 +7,7 @@\n     uint256 public totalDeposits;\n \n     function initialize(address newOwner) public {\n+        require(newOwner != address(0), \"zero address\");\n         owner = newOwner;\n         _bootstrapped = true;\n     }\n",
+        "format": "unified-diff"
+      },
+      "recommendation": "Add `require(newOwner != address(0), \"zero address\");` in initialize before assigning owner.",
+      "severity": "MEDIUM",
+      "signature": "initialize-zero-address-owner",
+      "stableKey": "sha256:dd4f61adb8f03a03354b92f1aec97cbf1346529e0cedb7ee515cb2608c6c4fe0",
       "status": "suspected"
     }
   ],
   "generatedBy": "ai",
-  "inputHash": "sha256:0d4110a9cc4e3030976e86d271b6eb45a5bf55888e3d78a859cb18a9ae3fe0ea",
+  "inputHash": "sha256:7b114f30cf14a954143a06368e5f2fa6d85d78aaa60a8825f0c19e287aab6676",
   "language": "en",
   "limitations": [
     "Off-chain logic, deployment configuration and key management were not assessed.",

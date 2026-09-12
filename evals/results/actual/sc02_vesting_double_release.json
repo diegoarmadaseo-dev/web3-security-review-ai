@@ -3,6 +3,7 @@
   "categoryCoverage": [
     {
       "category": "SC01",
+      "note": "release() is correctly restricted to beneficiary; there are no owner/admin roles or other privileged functions in this contract.",
       "status": "NOT_DETECTED"
     },
     {
@@ -11,34 +12,40 @@
     },
     {
       "category": "SC03",
+      "note": "No price or rate oracle is read anywhere in this contract.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC04",
+      "note": "No flash-loan interface or lending-protocol interaction is present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC05",
-      "status": "NOT_DETECTED"
+      "status": "DETECTED"
     },
     {
       "category": "SC06",
+      "note": "The single low-level call's boolean return value is checked via require immediately after the call.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC07",
+      "note": "vestedAmount() multiplies before dividing, which is the precision-preserving order; no division-before-multiplication pattern is present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC08",
-      "status": "NOT_DETECTED"
+      "status": "DETECTED"
     },
     {
       "category": "SC09",
+      "note": "Solidity 0.8.20 applies default overflow/underflow checks, no unchecked blocks are used, and startTime cannot exceed a later block's timestamp.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC10",
+      "note": "No delegatecall, proxy structure, or upgrade entry point is present.",
       "status": "NOT_DETECTED"
     }
   ],
@@ -46,37 +53,103 @@
   "compilerVersion": "0.8.20",
   "findings": [
     {
-      "category": "SC02",
+      "category": "SC08",
       "confidence": "high",
-      "description": "release() pays out the full vestedAmount() on every call instead of the amount newly vested since the last release. Nothing tracks how much has already been paid, so calling release() repeatedly (e.g. once per block once vesting completes) drains far more than the beneficiary is entitled to, up to the contract's entire balance.",
+      "description": "release() sends ETH to beneficiary via a low-level call and never writes to any state variable, either before or after that call. Because vestedAmount() depends only on block.timestamp, which does not change within a transaction, and no state tracks how much has already been paid out, the amount computed is identical on every call made in the same block. If beneficiary is, or later becomes, a contract, its receive/fallback function can call release() again before the outer call returns, and that reentrant call will pass the same beneficiary check and recompute the same payable amount. Nested reentrant calls can repeat this until the contract's ETH balance is exhausted, letting the beneficiary withdraw far more than the amount that has actually vested - potentially the entire balance held by the contract - in a single transaction, completely bypassing the time-based release schedule the contract exists to enforce.",
       "evidence": [
         "function release() external {",
-        "    require(msg.sender == beneficiary, \"not beneficiary\");",
-        "    uint256 amount = vestedAmount();",
-        "    (bool ok, ) = beneficiary.call{value: amount}(\"\");",
-        "    require(ok, \"transfer failed\");"
+        "uint256 amount = vestedAmount();",
+        "(bool ok, ) = beneficiary.call{value: amount}(\"\");",
+        "require(ok, \"transfer failed\");"
       ],
-      "id": "F-32387263",
+      "id": "F-faf2f7f0",
       "locations": [
         {
           "contract": "SimpleVesting",
-          "file": "sc02_vesting_double_release.sol",
+          "file": "contract_d.sol",
+          "function": "vestedAmount",
+          "lineEnd": 21,
+          "lineStart": 17
+        },
+        {
+          "contract": "SimpleVesting",
+          "file": "contract_d.sol",
           "function": "release",
-          "lineEnd": 29,
+          "lineEnd": 28,
           "lineStart": 24
         }
       ],
       "mergedCount": 1,
       "patch": null,
-      "recommendation": "Track cumulative released amount in a state variable and pay only vestedAmount() minus that running total on each call, updating the tracker before the external call.",
+      "recommendation": "Add a state variable (e.g. released) that records cumulative amount paid out, update it to reflect the new total before making the external call (checks-effects-interactions), and only transfer vestedAmount() - released. Additionally apply a reentrancy guard (e.g. OpenZeppelin's ReentrancyGuard/nonReentrant) as defense in depth.",
+      "severity": "CRITICAL",
+      "signature": "reentrant-release-drains-full-balance",
+      "stableKey": "sha256:faf2f7f016cfa78d53109905d29ab708f7878cb3dcf5f2169a8a41594f099b32",
+      "status": "suspected"
+    },
+    {
+      "category": "SC02",
+      "confidence": "high",
+      "description": "vestedAmount() always returns the total amount vested since startTime, not the amount still owed, and release() forwards this full to-date figure on every single call instead of the incremental unreleased balance. Even with a single, non-malicious beneficiary calling release() more than once as time passes - an ordinary way to interact with a vesting contract - the second call will try to resend the entire cumulative vested amount again. If the contract holds only totalAllocation, this second call reverts once the already-paid amount exceeds the remaining balance, permanently stranding the rest of the beneficiary's legitimately vested funds since no other withdrawal path exists. If the contract instead holds surplus ETH (for example, extra deposits through the payable receive() function), subsequent calls overpay the beneficiary beyond their true entitlement. Either way, the contract does not actually implement incremental vested-claim accounting.",
+      "evidence": [
+        "return (totalAllocation * (block.timestamp - startTime)) / duration;",
+        "uint256 amount = vestedAmount();",
+        "(bool ok, ) = beneficiary.call{value: amount}(\"\");"
+      ],
+      "id": "F-58ed17be",
+      "locations": [
+        {
+          "contract": "SimpleVesting",
+          "file": "contract_d.sol",
+          "function": "vestedAmount",
+          "lineEnd": 21,
+          "lineStart": 17
+        },
+        {
+          "contract": "SimpleVesting",
+          "file": "contract_d.sol",
+          "function": "release",
+          "lineEnd": 28,
+          "lineStart": 24
+        }
+      ],
+      "mergedCount": 1,
+      "patch": null,
+      "recommendation": "Introduce a released state variable, compute the newly claimable amount as vestedAmount() - released on each call, transfer only that delta, and update released before the transfer.",
       "severity": "HIGH",
-      "signature": "vesting-repeated-full-release",
-      "stableKey": "sha256:32387263f7e2b9c87652e5310b8c6c6d0eb9d458cbe859864a1f80ef2771b94f",
+      "signature": "vested-amount-ignores-prior-releases",
+      "stableKey": "sha256:58ed17be3a2637680ffa9875d11a29d788c24b14742283714ef90d62d04bf50c",
+      "status": "suspected"
+    },
+    {
+      "category": "SC05",
+      "confidence": "high",
+      "description": "The constructor stores _beneficiary without checking it against address(0), and the contract provides no function to update beneficiary afterward. If it is deployed with the zero address by mistake, release()'s require(msg.sender == beneficiary) can never succeed for any real caller, so any ETH later sent to the contract through the payable receive() function becomes permanently unrecoverable, with no owner or rescue mechanism present anywhere in the contract.",
+      "evidence": [
+        "constructor(address _beneficiary, uint256 _totalAllocation, uint256 _duration) {",
+        "beneficiary = _beneficiary;"
+      ],
+      "id": "F-4847e013",
+      "locations": [
+        {
+          "contract": "SimpleVesting",
+          "file": "contract_d.sol",
+          "function": "constructor",
+          "lineEnd": 15,
+          "lineStart": 10
+        }
+      ],
+      "mergedCount": 1,
+      "patch": null,
+      "recommendation": "Add require(_beneficiary != address(0), \"zero beneficiary\"); in the constructor.",
+      "severity": "LOW",
+      "signature": "unchecked-zero-address-beneficiary",
+      "stableKey": "sha256:4847e0137021d763341f94b974354d4945264316c06f0847be355ce0160d7ae5",
       "status": "suspected"
     }
   ],
   "generatedBy": "ai",
-  "inputHash": "sha256:cd06200e928e2fad1dc9cf39c6093cddd0d3e51e45e2c1e171b72087593767cb",
+  "inputHash": "sha256:0d6854ca2fca3eafd2891ed303c1d96f8af6018bdb636f570871cf3688cb521c",
   "language": "en",
   "limitations": [
     "Off-chain logic, deployment configuration and key management were not assessed.",
@@ -85,11 +158,10 @@
   ],
   "mode": "quick",
   "riskIndicator": {
-    "band": "LOW",
+    "band": "HIGH",
     "explanation": "This indicator reflects findings detected within the analyzed scope. It is not a measure of overall protocol security.",
-    "lowBandNote": "A LOW automated risk indicator does not mean that deployment is safe.",
     "scopeNote": "according to the analyzed scope",
-    "score": 85,
+    "score": 40,
     "scoreStatus": "computed"
   },
   "scope": {

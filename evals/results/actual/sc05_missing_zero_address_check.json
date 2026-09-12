@@ -3,42 +3,52 @@
   "categoryCoverage": [
     {
       "category": "SC01",
+      "note": "The only administrative function, setFeeRecipient, is correctly gated by onlyOwner; no tx.origin, selfdestruct, initializer, or upgrade-entry-point patterns are present. Ownership is set once with no transfer/renounce path, a minor centralization trust-assumption covered in the overall assessment rather than treated as a standalone access-control defect.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC02",
+      "note": "No timestamp dependence, loops, msg.value-in-loop, or token-approval logic is present in this minimal contract.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC03",
+      "note": "No swap calls, slippage parameters, or price-oracle reads are present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC04",
+      "note": "No oracle or flash-loan integration is present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC05",
+      "note": "setFeeRecipient never checks newRecipient != address(0); see findings.",
       "status": "DETECTED"
     },
     {
       "category": "SC06",
+      "note": "The only external interaction is a native-ETH transfer to feeRecipient; there is no unchecked return value, unchecked token transfer, or caller-supplied call target. Its gas-stipend denial-of-service risk is reported separately under EXTRA-dos-gas.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC07",
+      "note": "The contract performs no arithmetic operations of any kind.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC08",
+      "note": "collectFee's external call is not preceded or followed by any state read or write, so there is no reentrancy-exploitable state transition; the 2300 gas stipend also leaves essentially no room for a reentrant call to do anything.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC09",
+      "note": "Pragma is fixed at 0.8.20 (non-floating, not pre-0.8.0); no unchecked blocks or manual arithmetic are present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC10",
+      "note": "No delegatecall, proxy storage layout, initializer, or upgrade-entry-point patterns are present; this is a plain, non-upgradeable contract.",
       "status": "NOT_DETECTED"
     }
   ],
@@ -46,35 +56,70 @@
   "compilerVersion": "0.8.20",
   "findings": [
     {
-      "category": "SC05",
-      "confidence": "high",
-      "description": "setFeeRecipient never checks newRecipient against address(0). If the owner mistakenly sets it to the zero address, every subsequent collectFee() call permanently burns the fee payment.",
+      "category": "EXTRA-dos-gas",
+      "confidence": "medium",
+      "description": "collectFee() forwards its entire msg.value to feeRecipient using .transfer(), which hardcodes a 2300 gas stipend for the receiving call. setFeeRecipient places no restriction on what kind of address feeRecipient can be. If the owner ever points feeRecipient at a smart contract whose receive/fallback logic needs more than 2300 gas to run (multisig wallets such as Gnosis Safe are a common real-world example), every future call to collectFee() will revert, because the transfer itself cannot complete. That makes the contract's only externally useful function fully unusable until the owner calls setFeeRecipient again with a compatible address. No funds are stuck when this happens - the whole transaction reverts and the caller keeps their ETH - but fee collection is completely denied in the meantime, and the failure mode is only one owner transaction away since nothing checks what kind of address is being set.",
       "evidence": [
+        "function collectFee() external payable {",
+        "payable(feeRecipient).transfer(msg.value);",
         "function setFeeRecipient(address newRecipient) external onlyOwner {",
-        "    feeRecipient = newRecipient;",
-        "}"
+        "feeRecipient = newRecipient;"
       ],
-      "id": "F-1312a727",
+      "id": "F-8c8523b7",
       "locations": [
         {
           "contract": "FeeCollector",
-          "file": "sc05_missing_zero_address_check.sol",
+          "file": "contract_g.sol",
+          "function": "collectFee",
+          "lineEnd": 24,
+          "lineStart": 22
+        }
+      ],
+      "mergedCount": 1,
+      "patch": {
+        "diff": "--- a/contract_g.sol\n+++ b/contract_g.sol\n@@ -22,3 +22,4 @@\n     function collectFee() external payable {\n-        payable(feeRecipient).transfer(msg.value);\n+        (bool success, ) = payable(feeRecipient).call{value: msg.value}(\"\");\n+        require(success, \"fee transfer failed\");\n     }\n",
+        "format": "unified-diff"
+      },
+      "recommendation": "Replace .transfer() with a low-level call and an explicit success check, e.g. (bool success, ) = payable(feeRecipient).call{value: msg.value}(\"\"); require(success, \"fee transfer failed\");. This removes the fixed gas ceiling and works for both EOAs and contracts with normal-cost receive functions. Since collectFee reads and writes no state around the external call, switching to .call here does not introduce a reentrancy concern.",
+      "severity": "MEDIUM",
+      "signature": "fixed-gas-stipend-transfer-dos",
+      "stableKey": "sha256:8c8523b7e787b6bf8160e000431b71372336116f4f7320830f8d2b66b276477c",
+      "status": "suspected"
+    },
+    {
+      "category": "SC05",
+      "confidence": "high",
+      "description": "setFeeRecipient lets the owner point feeRecipient at any address, including address(0), with no validation anywhere in the contract (no require, no allowlist, no indirect check). Because collectFee() unconditionally forwards msg.value with payable(feeRecipient).transfer(msg.value), a call to setFeeRecipient(address(0)) - whether from a fat-fingered argument, an uninitialized variable in calling code/tooling, or any other operational mistake - causes every subsequent fee payment to be sent to the zero address, which has no controlling private key. That ETH is burned permanently: there is no recovery path for funds already sent, even though the owner can immediately correct feeRecipient for future calls. The people who bear this loss are whoever calls collectFee() during the misconfigured window, not the owner who made the mistake.",
+      "evidence": [
+        "function setFeeRecipient(address newRecipient) external onlyOwner {",
+        "feeRecipient = newRecipient;",
+        "function collectFee() external payable {",
+        "payable(feeRecipient).transfer(msg.value);"
+      ],
+      "id": "F-65ece298",
+      "locations": [
+        {
+          "contract": "FeeCollector",
+          "file": "contract_g.sol",
           "function": "setFeeRecipient",
           "lineEnd": 20,
           "lineStart": 18
         }
       ],
       "mergedCount": 1,
-      "patch": null,
-      "recommendation": "Add require(newRecipient != address(0)) before assigning feeRecipient.",
+      "patch": {
+        "diff": "--- a/contract_g.sol\n+++ b/contract_g.sol\n@@ -18,3 +18,4 @@\n     function setFeeRecipient(address newRecipient) external onlyOwner {\n+        require(newRecipient != address(0), \"zero address\");\n         feeRecipient = newRecipient;\n     }\n",
+        "format": "unified-diff"
+      },
+      "recommendation": "Add require(newRecipient != address(0), \"zero address\") (or an equivalent custom error) at the top of setFeeRecipient before the assignment. Also consider emitting an event (e.g., FeeRecipientUpdated(oldRecipient, newRecipient)) so recipient changes are auditable off-chain.",
       "severity": "MEDIUM",
-      "signature": "fee-recipient-missing-zero-address-check",
-      "stableKey": "sha256:1312a7275b4e5e159328b831e59f5500158fcae3d4db6ceb4373790092b10416",
-      "status": "suspected"
+      "signature": "fee-recipient-zero-address-unchecked",
+      "stableKey": "sha256:65ece2988d7252c3633fcd32ab9ebaee6ab68679d3f8955457e246f116d18111",
+      "status": "confirmed"
     }
   ],
   "generatedBy": "ai",
-  "inputHash": "sha256:75720168cf141e1f5098134b16bea628d7415047d72d8c5c767bdadeeaa1af87",
+  "inputHash": "sha256:f6ad35b526f74e99f29433e7ebcc25a0027e53bfbc7f50faa7952d8f1d54195a",
   "language": "en",
   "limitations": [
     "Off-chain logic, deployment configuration and key management were not assessed.",
@@ -87,7 +132,7 @@
     "explanation": "This indicator reflects findings detected within the analyzed scope. It is not a measure of overall protocol security.",
     "lowBandNote": "A LOW automated risk indicator does not mean that deployment is safe.",
     "scopeNote": "according to the analyzed scope",
-    "score": 93,
+    "score": 88,
     "scoreStatus": "computed"
   },
   "scope": {

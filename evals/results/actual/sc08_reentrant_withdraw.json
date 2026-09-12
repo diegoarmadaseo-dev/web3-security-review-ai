@@ -3,6 +3,7 @@
   "categoryCoverage": [
     {
       "category": "SC01",
+      "note": "The admin-function-unprotected signal on withdraw(amount) matches this family's documented false-positive pattern: authorization is via balances[msg.sender], a self-service withdrawal that can only ever move the caller's own recorded funds, not an owner-only action missing a guard. No tx.origin, selfdestruct, initializer, upgrade, or ownership-transfer constructs are present.",
       "status": "NOT_DETECTED"
     },
     {
@@ -11,18 +12,22 @@
     },
     {
       "category": "SC03",
+      "note": "No swap or price-oracle logic in scope.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC04",
+      "note": "No oracle or flash-loan integration present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC05",
+      "note": "No address-typed parameters or hardcoded addresses to assess.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC06",
+      "note": "The one low-level call has its boolean return checked (require(ok, ...)), so it is not an unchecked-call bug by itself; the real risk from this call is its ordering relative to the state write, reported under SC08.",
       "status": "NOT_DETECTED"
     },
     {
@@ -35,10 +40,12 @@
     },
     {
       "category": "SC09",
+      "note": "Pragma is pinned to an exact version (0.8.20), not floating; Solidity >=0.8 has built-in arithmetic overflow/underflow checks and no unchecked blocks are present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC10",
+      "note": "No delegatecall, proxy, upgrade function, or initializer pattern present.",
       "status": "NOT_DETECTED"
     }
   ],
@@ -48,35 +55,38 @@
     {
       "category": "SC08",
       "confidence": "high",
-      "description": "withdraw() sends ETH via a low-level call before decrementing balances[msg.sender], with no reentrancy guard. A contract receiving the call can re-enter withdraw() from its receive/fallback before the balance is reduced and repeat the withdrawal, draining the contract.",
+      "description": "withdraw() violates the checks-effects-interactions pattern: it verifies the caller's balance, then sends ETH to msg.sender via a raw .call before decrementing balances[msg.sender]. Because .call forwards all remaining gas (unlike .transfer/.send, which cap the callee at 2300 gas), a caller that is a contract can execute arbitrary logic in its receive/fallback function during that call - including calling withdraw() again. On each reentrant call, balances[msg.sender] still reflects the pre-withdrawal amount because the decrement at line 15 has not yet executed, so the balance check at line 12 keeps passing. This lets an attacker recursively drain ETH beyond their own deposit, up to the contract's entire balance (i.e. other users' funds), the same class of bug as the 2016 DAO exploit. The preprocessor's low-level-call signal on this same line shows the boolean return is checked (returnChecked: true), which rules out an unchecked-call bug, but checking the return value does nothing to prevent reentrancy - the ordering relative to the state write is the actual defect. The reentrancy-pattern signal's two listed false-positive conditions (a 2300-gas .transfer()/.send(), or a nonReentrant/equivalent guard) do not apply here: the call is a value-forwarding .call and guarded is false, so this is a genuine positive rather than the family's typical false alarm.",
       "evidence": [
         "function withdraw(uint256 amount) external {",
-        "    require(balances[msg.sender] >= amount, \"insufficient balance\");",
-        "    (bool ok, ) = msg.sender.call{value: amount}(\"\");",
-        "    require(ok, \"transfer failed\");",
-        "    balances[msg.sender] -= amount;"
+        "require(balances[msg.sender] >= amount, \"insufficient balance\");",
+        "(bool ok, ) = msg.sender.call{value: amount}(\"\");",
+        "require(ok, \"transfer failed\");",
+        "balances[msg.sender] -= amount;"
       ],
-      "id": "F-0e854ad9",
+      "id": "F-4a0c2099",
       "locations": [
         {
           "contract": "SimpleBank",
-          "file": "sc08_reentrant_withdraw.sol",
+          "file": "contract_j.sol",
           "function": "withdraw",
           "lineEnd": 16,
           "lineStart": 11
         }
       ],
       "mergedCount": 1,
-      "patch": null,
-      "recommendation": "Update balances[msg.sender] before making the external call (checks-effects-interactions), and add a reentrancy guard as defense in depth.",
+      "patch": {
+        "diff": "--- a/contract_j.sol\n+++ b/contract_j.sol\n@@ -11,6 +11,6 @@\n     function withdraw(uint256 amount) external {\n         require(balances[msg.sender] >= amount, \"insufficient balance\");\n-        (bool ok, ) = msg.sender.call{value: amount}(\"\");\n-        require(ok, \"transfer failed\");\n         balances[msg.sender] -= amount;\n+        (bool ok, ) = msg.sender.call{value: amount}(\"\");\n+        require(ok, \"transfer failed\");\n     }\n",
+        "format": "unified-diff"
+      },
+      "recommendation": "Reorder withdraw() so the effect happens before the interaction: decrement balances[msg.sender] immediately after the require check, before making the external call. As defense in depth, also consider adding a reentrancy guard (e.g. OpenZeppelin's ReentrancyGuard / nonReentrant) to withdraw().",
       "severity": "CRITICAL",
-      "signature": "withdraw-reentrancy-before-state-update",
-      "stableKey": "sha256:0e854ad926519d4f34b38083b71fdc869325c16a3268b9db887ccc0f8314dcce",
-      "status": "suspected"
+      "signature": "reentrancy-before-balance-update",
+      "stableKey": "sha256:4a0c20997687589683bebae63732b3a9566294267d881ca0683e04a9cdee9807",
+      "status": "confirmed"
     }
   ],
   "generatedBy": "ai",
-  "inputHash": "sha256:72e3097cbf6ff001712afb51c7408109bcd5d5309ef4551b3baf0c819bb93d7e",
+  "inputHash": "sha256:3feb07b86caae46d4c10bbd1c49c01edcad4f8b9dc1e9843c89e1ce0dd1c9a14",
   "language": "en",
   "limitations": [
     "Off-chain logic, deployment configuration and key management were not assessed.",

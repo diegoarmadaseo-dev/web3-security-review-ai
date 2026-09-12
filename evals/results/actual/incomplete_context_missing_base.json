@@ -1,54 +1,146 @@
 {
   "analysisEngineVersion": "1.0.0",
+  "architectureNotes": [
+    {
+      "description": "Because MembershipVault is ExternalRegistry, every public/external function, state variable, and modifier defined in ExternalRegistry becomes part of the deployed MembershipVault contract. A complete security review of the deployed system requires ExternalRegistry.sol alongside this file, not this file in isolation.",
+      "title": "Full contract surface depends on ExternalRegistry"
+    },
+    {
+      "description": "withdraw() does not call isMember() again, so a user who deposited while a member can still withdraw their own recorded balance even if later removed from the registry. This looks like a reasonable design choice that avoids permanently locking a former member's funds in the contract, but it is worth confirming as intentional once ExternalRegistry's membership-management logic is available for review.",
+      "title": "Withdrawal is not re-gated by membership"
+    },
+    {
+      "description": "MembershipVault defines no payable receive() or fallback(), so plain ETH transfers sent directly to the contract address outside of deposit() will revert. This is a generally safe default; the one edge case is ETH force-sent via selfdestruct from another contract, which would increase the contract's ETH balance without a corresponding entry in the balances mapping.",
+      "title": "No receive()/fallback() function"
+    }
+  ],
   "categoryCoverage": [
     {
       "category": "SC01",
-      "note": "deposit() gates on isMember(msg.sender), inherited from ExternalRegistry, which was not provided in the submitted bundle. Whether that check is a genuine, correctly implemented access-control gate cannot be assessed from the code available here.",
+      "note": "Access control depends on the inherited, unresolved ExternalRegistry base contract (MISSING_IMPORT / UNRESOLVED_BASE) - both isMember()'s real logic and any privileged functions ExternalRegistry contributes via inheritance are unknown. The one access-control-shaped signal visible in this file (withdraw flagged as admin-function-unprotected) was reviewed and found to be a false positive.",
       "status": "NOT_ASSESSED"
     },
     {
       "category": "SC02",
+      "note": "No timestamp dependence, msg.value-in-loop, caller-controlled transferFrom, or unlimited-approval pattern is present in the visible code.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC03",
+      "note": "No price/oracle reads, swaps, or slippage-sensitive logic are present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC04",
+      "note": "No flash-loan interfaces or logic are present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC05",
+      "note": "Neither function takes an address parameter, so there is no unchecked zero-address input; no hardcoded addresses appear in the file.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC06",
+      "note": "The single low-level call targets msg.sender (not a caller-supplied address), forwards no calldata, and its boolean return is checked with require immediately afterward; no unchecked token transfers or assembly blocks are present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC07",
+      "note": "The contract contains no division or multiplication.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC08",
+      "note": "withdraw() debits balances[msg.sender] before making its external call, correctly applying checks-effects-interactions; no reentrancy guard is needed for this pattern.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC09",
+      "note": "Pragma is pinned to 0.8.20 (not floating), which has built-in overflow/underflow checks; no unchecked{} blocks are present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC10",
+      "note": "No delegatecall, proxy scaffolding, initializer pattern, or upgrade-style function is present in the visible code.",
       "status": "NOT_DETECTED"
     }
   ],
   "checklistVersion": "2026.1",
   "compilerVersion": "0.8.20",
-  "executiveSummary": "This review is partial: MembershipVault inherits from ExternalRegistry, whose source was not provided, so the access-control check gating deposits could not be assessed. No issues were identified in the code that was available; withdraw() correctly updates state before making its external call. Provide ExternalRegistry.sol for a complete review of the access-control surface.",
-  "findings": [],
+  "executiveSummary": "This preliminary, AI-assisted review looked at one file, which lets registered members deposit and withdraw their own funds. The part we could fully check - how the contract pays money back out on withdrawal - follows the correct, standard order of operations and did not raise concerns within the analyzed scope. However, the review is incomplete: this contract depends on a second file to decide who counts as a 'member', and that file was not provided to us. Because that piece is missing, we cannot confirm how membership is granted or removed, or whether that missing code has its own weaknesses that would carry over into this contract. We recommend supplying the missing file so a follow-up review can cover it before this contract is relied on with real funds.",
+  "findings": [
+    {
+      "category": "SC01",
+      "confidence": "high",
+      "description": "MembershipVault inherits ExternalRegistry and depends entirely on that base contract's isMember() function to decide who may deposit, but ExternalRegistry.sol was not included among the provided files (MISSING_IMPORT / UNRESOLVED_BASE). This means the actual membership-granting logic behind deposit()'s access gate cannot be examined, and any additional public/external functions, state variables, or ownership/access-control model that ExternalRegistry contributes through inheritance also cannot be examined, even though they become part of the deployed MembershipVault contract's real attack surface. This is a scope limitation of the current review, not a confirmed defect in the code shown.",
+      "evidence": [
+        "import \"./ExternalRegistry.sol\";",
+        "contract MembershipVault is ExternalRegistry {",
+        "require(isMember(msg.sender), \"not a registered member\");"
+      ],
+      "id": "F-0fe66464",
+      "locations": [
+        {
+          "contract": null,
+          "file": "contract_o.sol",
+          "function": null,
+          "lineEnd": 4,
+          "lineStart": 4
+        },
+        {
+          "contract": "MembershipVault",
+          "file": "contract_o.sol",
+          "function": null,
+          "lineEnd": 6,
+          "lineStart": 6
+        },
+        {
+          "contract": "MembershipVault",
+          "file": "contract_o.sol",
+          "function": "deposit",
+          "lineEnd": 10,
+          "lineStart": 10
+        }
+      ],
+      "mergedCount": 1,
+      "patch": null,
+      "recommendation": "Provide ExternalRegistry.sol (and any of its own imports or base contracts) for a follow-up review before treating MembershipVault's access-control posture as reviewed. In particular, confirm how isMember() determines membership, who can add/remove members, and whether ExternalRegistry exposes any privileged functions of its own.",
+      "severity": "INFORMATIONAL",
+      "signature": "unresolved-externalregistry-base-contract",
+      "stableKey": "sha256:0fe66464f1963e40e955fa18ff765751bf7aff5a837efaff054e2cf352c47942",
+      "status": "informational"
+    },
+    {
+      "category": "SC01",
+      "confidence": "high",
+      "description": "Deterministic preprocessing flagged withdraw() under the admin-function-unprotected family because it is an external, state-changing function named like a privileged operation with no access-control modifier. On review, this is the family's well-documented false-positive pattern: withdraw()'s only authorization check is the caller's own balances[msg.sender] entry, so a caller can never move funds belonging to another address. No owner/role check is missing because none is needed for this self-service pattern.",
+      "evidence": [
+        "function withdraw(uint256 amount) external {",
+        "require(balances[msg.sender] >= amount, \"insufficient balance\");",
+        "balances[msg.sender] -= amount;"
+      ],
+      "id": "F-6605fb56",
+      "locations": [
+        {
+          "contract": "MembershipVault",
+          "file": "contract_o.sol",
+          "function": "withdraw",
+          "lineEnd": 19,
+          "lineStart": 14
+        }
+      ],
+      "mergedCount": 1,
+      "patch": null,
+      "recommendation": "No action required. Optionally, a short code comment noting that withdraw() is intentionally self-service could help future reviewers and tooling recognize the pattern immediately.",
+      "severity": "INFORMATIONAL",
+      "signature": "withdraw-admin-heuristic-false-positive",
+      "stableKey": "sha256:6605fb56212144ebbfc5279e2488094b886ca645b18152ec161dbc6463e71e39",
+      "status": "informational"
+    }
+  ],
   "generatedBy": "ai",
-  "inputHash": "sha256:9389382667d247fea988d0a37c50927f14d81fd1dd033e2c305814109c4877c7",
+  "inputHash": "sha256:41f8e7936ea87b86f85f43f55332a085396761bc1014a96bfa0429766f10d00f",
   "language": "en",
   "limitations": [
     "Off-chain logic, deployment configuration and key management were not assessed.",
@@ -69,11 +161,11 @@
     "reasons": [
       {
         "code": "MISSING_IMPORT",
-        "detail": "Import './ExternalRegistry.sol' referenced in incomplete_context_missing_base.sol was not found among the provided files."
+        "detail": "Import './ExternalRegistry.sol' referenced in contract_o.sol was not found among the provided files."
       },
       {
         "code": "UNRESOLVED_BASE",
-        "detail": "Base contract 'ExternalRegistry' used by incomplete_context_missing_base.sol#MembershipVault was not found among the provided files or resolvable imports."
+        "detail": "Base contract 'ExternalRegistry' used by contract_o.sol#MembershipVault was not found among the provided files or resolvable imports."
       }
     ]
   },

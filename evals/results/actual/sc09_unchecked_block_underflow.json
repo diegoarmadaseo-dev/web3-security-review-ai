@@ -2,88 +2,133 @@
   "analysisEngineVersion": "1.0.0",
   "architectureNotes": [
     {
-      "description": "CreditLedger has exactly one function that reduces a balance (spendCredit), and it is the one wrapped in unchecked{}. There is no separate safe-arithmetic helper or library in use, so any future balance-reducing function added to this contract should be reviewed for the same missing-check pattern rather than assumed safe by association with issueCredit.",
-      "title": "Single unchecked arithmetic block is the sole state-mutating path"
+      "description": "The issuer address is set once in the constructor with no function to rotate or transfer it. This avoids some ownership-handoff risks but also means the ability to legitimately issue credits is permanently tied to that one key, with no on-chain recovery path if it is lost or compromised. Whether that single point of failure is acceptable depends on the intended deployment and operational key-management practices, which are outside this file's scope.",
+      "title": "Single, non-transferable issuer role"
+    },
+    {
+      "description": "Neither issueCredit nor spendCredit emits an event. This limits off-chain visibility into credit issuance and spending (block explorers, monitoring, alerting), and would also make an issue like the spendCredit underflow harder to notice from transaction logs alone. Adding events for both state changes would improve transparency.",
+      "title": "No events emitted"
     }
   ],
   "categoryCoverage": [
     {
       "category": "SC01",
+      "note": "issueCredit is gated by onlyIssuer and checked against msg.sender; there is no admin-style function lacking a guard, and the contract has no ownership-transfer function at all (so no single-step-transfer weakness either).",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC02",
+      "note": "No timestamp usage, loops, msg.value handling, or swap-style logic in scope.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC03",
+      "note": "No oracle, price-feed, or external rate read of any kind is present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC04",
+      "note": "No flash-loan-related identifiers or borrowing logic present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC05",
-      "status": "NOT_DETECTED"
+      "note": "issueCredit's `to` parameter is never checked against address(0).",
+      "status": "DETECTED"
     },
     {
       "category": "SC06",
+      "note": "No low-level calls, external calls, token transfers, or assembly blocks exist in this contract.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC07",
+      "note": "No division or multiplication arithmetic is present; only additive/subtractive balance updates.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC08",
+      "note": "The contract makes no external calls, so there is no reentrancy surface.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC09",
+      "note": "unchecked subtraction in spendCredit removes underflow protection with no compensating check.",
       "status": "DETECTED"
     },
     {
       "category": "SC10",
+      "note": "No delegatecall, selfdestruct, proxy structure, upgrade function, or initializer pattern present.",
       "status": "NOT_DETECTED"
     }
   ],
   "checklistVersion": "2026.1",
   "compilerVersion": "0.8.20",
-  "executiveSummary": "This review found one high-severity issue: a credit-spending function can underflow to an enormous balance when called with more than the caller actually holds, because the subtraction is wrapped in an unchecked block with no prior balance check. No other issues were identified within the analyzed scope.",
+  "executiveSummary": "Our automated review found one serious problem: as written, any user could give themselves unlimited credits instead of only the designated issuer being able to create them, which would defeat the entire purpose of this ledger. We also flagged a minor input-validation gap on the function the issuer uses to grant credits. The serious issue should be fixed before this contract is used to represent anything of real value. This is a preliminary, automated finding, not a certification of security.",
   "findings": [
     {
       "category": "SC09",
       "confidence": "high",
-      "description": "spendCredit subtracts inside an unchecked block with no prior check that credits[msg.sender] >= amount. Calling it with an amount larger than the caller's balance underflows to a value near type(uint256).max instead of reverting.",
+      "description": "spendCredit decrements the caller's balance inside an unchecked block with no prior check that credits[msg.sender] >= amount. Solidity 0.8.20's default overflow/underflow protection is disabled inside `unchecked`, so calling spendCredit with an amount larger than the caller's current balance underflows the uint256, wrapping it to a value near 2^256 - 1. Any address (including one with a zero balance) can therefore self-grant an effectively unlimited credit balance with a single, unrestricted call, completely bypassing the onlyIssuer restriction that is supposed to be the only way to create credits. This breaks the core invariant the contract exists to enforce.",
       "evidence": [
         "function spendCredit(uint256 amount) external {",
-        "    unchecked {",
-        "        credits[msg.sender] -= amount;",
-        "    }",
+        "unchecked {",
+        "credits[msg.sender] -= amount;",
         "}"
       ],
-      "id": "F-59f10b14",
+      "id": "F-e3b1da56",
       "locations": [
         {
           "contract": "CreditLedger",
-          "file": "sc09_unchecked_block_underflow.sol",
+          "file": "contract_k.sol",
           "function": "spendCredit",
           "lineEnd": 25,
           "lineStart": 21
         }
       ],
       "mergedCount": 1,
-      "patch": null,
-      "recommendation": "Add require(credits[msg.sender] >= amount) before the subtraction, or drop the unchecked block so Solidity's built-in overflow/underflow checks apply.",
-      "severity": "HIGH",
-      "signature": "unchecked-credit-underflow",
-      "stableKey": "sha256:59f10b140bbcda5c5a0001884256fc7f0b62eb5a4f9ee86e3927fc9f71b61c91",
+      "patch": {
+        "diff": "--- a/contract_k.sol\n+++ b/contract_k.sol\n@@ -19,8 +19,7 @@\n     }\n \n     function spendCredit(uint256 amount) external {\n-        unchecked {\n-            credits[msg.sender] -= amount;\n-        }\n+        require(credits[msg.sender] >= amount, \"insufficient credits\");\n+        credits[msg.sender] -= amount;\n     }\n }\n",
+        "format": "unified-diff"
+      },
+      "recommendation": "Remove the unchecked block so the default checked arithmetic reverts on underflow, or explicitly guard the subtraction with a require, e.g. `require(credits[msg.sender] >= amount, \"insufficient credits\");` before decrementing. Add a test that calls spendCredit with amount > balance and asserts it reverts.",
+      "severity": "CRITICAL",
+      "signature": "unchecked-underflow-in-spendcredit",
+      "stableKey": "sha256:e3b1da56437fe6b1d6d5f4c4237894ad323d5410026d09d462eabca3fcbda26f",
+      "status": "confirmed"
+    },
+    {
+      "category": "SC05",
+      "confidence": "medium",
+      "description": "issueCredit never validates that `to` is non-zero before crediting it. Because the function is already restricted to onlyIssuer, this is not an attacker-exploitable path, but an operational mistake (a bad address passed by a script or UI) could credit address(0), and those credits would then be effectively unrecoverable since nothing can practically call spendCredit as address(0).",
+      "evidence": [
+        "function issueCredit(address to, uint256 amount) external onlyIssuer {",
+        "credits[to] += amount;"
+      ],
+      "id": "F-8a6fc206",
+      "locations": [
+        {
+          "contract": "CreditLedger",
+          "file": "contract_k.sol",
+          "function": "issueCredit",
+          "lineEnd": 19,
+          "lineStart": 17
+        }
+      ],
+      "mergedCount": 1,
+      "patch": {
+        "diff": "--- a/contract_k.sol\n+++ b/contract_k.sol\n@@ -16,4 +16,5 @@\n \n     function issueCredit(address to, uint256 amount) external onlyIssuer {\n+        require(to != address(0), \"zero address\");\n         credits[to] += amount;\n     }\n",
+        "format": "unified-diff"
+      },
+      "recommendation": "Add `require(to != address(0), \"zero address\");` at the start of issueCredit.",
+      "severity": "LOW",
+      "signature": "issuecredit-missing-zero-address-check",
+      "stableKey": "sha256:8a6fc20677f9508be0901abc1d8b65e8470a6e2f6693b2e95688350873799546",
       "status": "suspected"
     }
   ],
   "generatedBy": "ai",
-  "inputHash": "sha256:bbd0f652c435fc2ef9f3b2179b866e2540087b728ac89c2d44c9c3c00e2745a1",
+  "inputHash": "sha256:f88b9e7f056ed74a2d293b65caccccbe5f4c396e8e05b4ad850b205f1aab9bcb",
   "language": "en",
   "limitations": [
     "Off-chain logic, deployment configuration and key management were not assessed.",
@@ -92,11 +137,10 @@
   ],
   "mode": "pro",
   "riskIndicator": {
-    "band": "LOW",
+    "band": "HIGH",
     "explanation": "This indicator reflects findings detected within the analyzed scope. It is not a measure of overall protocol security.",
-    "lowBandNote": "A LOW automated risk indicator does not mean that deployment is safe.",
     "scopeNote": "according to the analyzed scope",
-    "score": 85,
+    "score": 40,
     "scoreStatus": "computed"
   },
   "scope": {

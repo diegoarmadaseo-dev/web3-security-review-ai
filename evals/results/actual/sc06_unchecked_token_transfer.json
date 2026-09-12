@@ -3,23 +3,27 @@
   "categoryCoverage": [
     {
       "category": "SC01",
+      "note": "The only state-changing/external function (sweep) is correctly restricted with onlyOwner; no tx.origin, selfdestruct, initializer, or upgrade-function patterns are present. The contract has no ownership-transfer function at all, which is a centralization/availability consideration rather than an access-control defect.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC02",
+      "note": "No transferFrom, approve, msg.value, or timestamp-based logic is present in this contract.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC03",
+      "note": "No swap, slippage, or price-oracle-adjacent logic is present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC04",
+      "note": "No oracle reads or flash-loan APIs are present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC05",
-      "status": "NOT_DETECTED"
+      "status": "DETECTED"
     },
     {
       "category": "SC06",
@@ -27,18 +31,22 @@
     },
     {
       "category": "SC07",
+      "note": "No arithmetic, division, or multiplication is performed anywhere in the contract.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC08",
+      "note": "sweep() makes a single external call with no state write before or after it, and re-entry is already blocked by onlyOwner unless the token address itself were the owner.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC09",
+      "note": "Pragma is pinned to a current compiler version (0.8.20) with built-in overflow checks; no unchecked blocks or legacy arithmetic are present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC10",
+      "note": "No delegatecall, assembly, proxy, initializer, or upgrade-function pattern is present.",
       "status": "NOT_DETECTED"
     }
   ],
@@ -48,17 +56,45 @@
     {
       "category": "SC06",
       "confidence": "high",
-      "description": "sweep() calls transfer() without checking its returned bool. A token that signals failure by returning false (instead of reverting) lets the call silently no-op while the caller believes the transfer succeeded.",
+      "description": "sweep() calls IERC20(token).transfer(to, amount) and discards the boolean success value the interface declares. The ERC-20 standard permits a token to signal failure by returning false instead of reverting, and a number of real tokens do exactly this (e.g. on blacklist checks, pause logic, or other custom conditions). Because the return value is never inspected, a failed transfer will not revert the transaction: sweep() will appear to complete successfully even though no tokens actually moved. Since the contract has no other state and emits no event, the only symptom is that the intended tokens silently remain in TokenSweeper's balance, which can easily go unnoticed. This is distinct from tokens that omit the return value entirely (e.g. older USDT-style implementations) - those calls would instead revert here due to ABI-decoding of the expected bool, which is a safe failure mode and not the concern of this finding.",
       "evidence": [
-        "function sweep(address token, address to, uint256 amount) external onlyOwner {",
-        "    IERC20(token).transfer(to, amount);",
-        "}"
+        "IERC20(token).transfer(to, amount);",
+        "function transfer(address to, uint256 amount) external returns (bool);"
       ],
-      "id": "F-8b90ab03",
+      "id": "F-3a1a5911",
       "locations": [
         {
           "contract": "TokenSweeper",
-          "file": "sc06_unchecked_token_transfer.sol",
+          "file": "contract_h.sol",
+          "function": "sweep",
+          "lineEnd": 21,
+          "lineStart": 21
+        }
+      ],
+      "mergedCount": 1,
+      "patch": {
+        "diff": "--- a/contract_h.sol\n+++ b/contract_h.sol\n@@ -18,6 +18,6 @@\n     }\n \n     function sweep(address token, address to, uint256 amount) external onlyOwner {\n-        IERC20(token).transfer(to, amount);\n+        require(IERC20(token).transfer(to, amount), \"TokenSweeper: transfer failed\");\n     }\n }\n",
+        "format": "unified-diff"
+      },
+      "recommendation": "Check the return value explicitly, e.g. require(IERC20(token).transfer(to, amount), \"transfer failed\"), or use OpenZeppelin's SafeERC20.safeTransfer(token, to, amount), which uniformly handles both false-returning and no-return tokens.",
+      "severity": "MEDIUM",
+      "signature": "unchecked-erc20-transfer-return-value",
+      "stableKey": "sha256:3a1a59112c00619f57013bc85d0310a952a7475363c48b9dc6e6f44e6f826bf7",
+      "status": "confirmed"
+    },
+    {
+      "category": "SC05",
+      "confidence": "low",
+      "description": "Neither the token nor the to parameter of sweep() is validated against address(0). Passing address(0) as token has no deployed code behind it, so the call will revert when Solidity tries to ABI-decode the expected bool return - a safe but confusing failure. Passing address(0) as to would attempt to send the swept tokens to the burn address; many standard implementations (e.g. OpenZeppelin-based ERC-20s) already revert on transfers to address(0), but this is not guaranteed for every token that might be swept. Because sweep() is restricted to onlyOwner, this cannot be triggered by an outside attacker - the realistic scenario is an operator mistake (a mistyped address, or a bug in whatever off-chain tooling invokes this function) rather than an adversarial exploit, which bounds both the likelihood and the impact.",
+      "evidence": [
+        "function sweep(address token, address to, uint256 amount) external onlyOwner {",
+        "        IERC20(token).transfer(to, amount);"
+      ],
+      "id": "F-5d46e77e",
+      "locations": [
+        {
+          "contract": "TokenSweeper",
+          "file": "contract_h.sol",
           "function": "sweep",
           "lineEnd": 22,
           "lineStart": 20
@@ -66,18 +102,18 @@
       ],
       "mergedCount": 1,
       "patch": {
-        "diff": "--- a/sc06_unchecked_token_transfer.sol\n+++ b/sc06_unchecked_token_transfer.sol\n@@ -19,3 +19,3 @@\n     function sweep(address token, address to, uint256 amount) external onlyOwner {\n-        IERC20(token).transfer(to, amount);\n+        require(IERC20(token).transfer(to, amount), \"transfer failed\");\n     }\n",
+        "diff": "--- a/contract_h.sol\n+++ b/contract_h.sol\n@@ -18,6 +18,8 @@\n     }\n \n     function sweep(address token, address to, uint256 amount) external onlyOwner {\n+        require(token != address(0), \"TokenSweeper: zero token address\");\n+        require(to != address(0), \"TokenSweeper: zero recipient address\");\n         IERC20(token).transfer(to, amount);\n     }\n }\n",
         "format": "unified-diff"
       },
-      "recommendation": "Check the return value, e.g. require(IERC20(token).transfer(to, amount), \"transfer failed\").",
-      "severity": "HIGH",
-      "signature": "unchecked-ierc20-transfer-return",
-      "stableKey": "sha256:8b90ab032faf269638c5291f954d12424460fcd841b4755667579de1b7dd9879",
+      "recommendation": "Add explicit require(token != address(0)) and require(to != address(0)) checks at the start of sweep() for defense-in-depth and clearer failure messages, even though the onlyOwner gate already limits who can reach this path.",
+      "severity": "LOW",
+      "signature": "sweep-missing-zero-address-validation",
+      "stableKey": "sha256:5d46e77e00a09953b9a451193cccabc48c1d205621b14308168074e5b2b08ab7",
       "status": "suspected"
     }
   ],
   "generatedBy": "ai",
-  "inputHash": "sha256:deb99fd15714dd5df962b3ef44806e804019d6789b7d017829fab6c4d4e0a31a",
+  "inputHash": "sha256:e1d0dd56d2162a311decbecb215c1b7cdc0e7df782fd19ab7365bc137be3416e",
   "language": "en",
   "limitations": [
     "Off-chain logic, deployment configuration and key management were not assessed.",
@@ -90,7 +126,7 @@
     "explanation": "This indicator reflects findings detected within the analyzed scope. It is not a measure of overall protocol security.",
     "lowBandNote": "A LOW automated risk indicator does not mean that deployment is safe.",
     "scopeNote": "according to the analyzed scope",
-    "score": 85,
+    "score": 92,
     "scoreStatus": "computed"
   },
   "scope": {

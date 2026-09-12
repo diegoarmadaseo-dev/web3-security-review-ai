@@ -3,11 +3,12 @@
   "categoryCoverage": [
     {
       "category": "SC01",
+      "note": "No owner/admin role or privileged function exists in this contract; liquidate() is intentionally permissionless.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC02",
-      "status": "NOT_DETECTED"
+      "status": "DETECTED"
     },
     {
       "category": "SC03",
@@ -15,26 +16,31 @@
     },
     {
       "category": "SC04",
+      "note": "This contract implements no flash-loan API itself; the flash-loan-facilitated exploitation route against the external AMM pair is analyzed under the SC03 spot-price-oracle-manipulation finding rather than as a separate finding.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC05",
-      "status": "NOT_DETECTED"
+      "status": "DETECTED"
     },
     {
       "category": "SC06",
+      "note": "The sole external call (getReserves) is read-only, forwards no value, and its return values are consumed rather than silently discarded; its risk as an untrusted data source is captured under SC03.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC07",
+      "note": "Every division is preceded by its multiplication, and the liquidation comparison cross-multiplies instead of dividing, avoiding precision loss.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC08",
+      "note": "liquidate() zeroes state before the ETH transfer (correct checks-effects-interactions) and uses transfer(), which forwards a fixed 2300 gas stipend; no reentrancy path is present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC09",
+      "note": "Solidity 0.8.20's built-in overflow checks are active and no unchecked blocks are used; the arithmetic-revert-driven denial of service this enables (via the uncapped borrow amount) is reported under SC02 instead.",
       "status": "NOT_DETECTED"
     },
     {
@@ -47,35 +53,138 @@
   "findings": [
     {
       "category": "SC03",
-      "confidence": "medium",
-      "description": "_currentPrice() reads a single pair's instantaneous reserves with no TWAP or staleness check, and isLiquidatable()/liquidate() use that price directly. An attacker can manipulate the pool's reserves within one transaction to make a healthy position appear liquidatable (or vice versa).",
+      "confidence": "high",
+      "description": "The collateral price used for liquidation decisions is computed directly from the instantaneous reserves of a single AMM pair (getReserves), as reserve1/reserve0, with no time-weighting, no staleness check against the returned blockTimestampLast (which is read and immediately discarded), and no deviation/sanity bound. This spot price feeds straight into isLiquidatable(), which gates the fund-moving liquidate() function. Because AMM reserves can be shifted arbitrarily within a single transaction (classically via a flash loan, since the manipulating capital only needs to be held for the duration of one transaction), an attacker can transiently depress the reported price, call liquidate() on a solvent victim who now appears undercollateralized, and reverse the trade after collecting the victim's collateral (see the related finding on liquidate() paying out 100% of collateral with no repayment, which makes this maximally profitable). The same mechanism could instead be used to inflate price and borrow against an over-valued position. No corroborating protection (TWAP, oracle staleness window, circuit breaker) exists anywhere in the contract.",
       "evidence": [
-        "function _currentPrice() internal view returns (uint256) {",
-        "    (uint112 reserve0, uint112 reserve1, ) = collateralPair.getReserves();",
-        "    return (uint256(reserve1) * 1e18) / uint256(reserve0);",
-        "}"
+        "(uint112 reserve0, uint112 reserve1, ) = collateralPair.getReserves();",
+        "return (uint256(reserve1) * 1e18) / uint256(reserve0);",
+        "uint256 collateralValue = (collateralDeposited[account] * _currentPrice()) / 1e18;",
+        "return debt * 10000 > collateralValue * LIQUIDATION_THRESHOLD_BPS;",
+        "require(isLiquidatable(account), \"healthy position\");"
       ],
-      "id": "F-d98176c3",
+      "id": "F-e41d8669",
       "locations": [
         {
           "contract": "SpotPriceLending",
-          "file": "sc03_spot_price_liquidation.sol",
+          "file": "contract_e.sol",
           "function": "_currentPrice",
           "lineEnd": 22,
           "lineStart": 19
+        },
+        {
+          "contract": "SpotPriceLending",
+          "file": "contract_e.sol",
+          "function": "isLiquidatable",
+          "lineEnd": 28,
+          "lineStart": 24
+        },
+        {
+          "contract": "SpotPriceLending",
+          "file": "contract_e.sol",
+          "function": "liquidate",
+          "lineEnd": 39,
+          "lineStart": 38
         }
       ],
       "mergedCount": 1,
       "patch": null,
-      "recommendation": "Use a time-weighted average price or a decentralized oracle with staleness checks instead of a single pool's instantaneous reserves for any liquidation-critical calculation.",
+      "recommendation": "Do not price collateral from a single spot read of AMM reserves. Use a manipulation-resistant source: a multi-block time-weighted average price derived from the pair's cumulative price accumulators, a decentralized oracle feed with an on-chain staleness/deviation check, or at minimum enforce a maximum allowed single-block price deviation before accepting a new price for liquidation or borrowing decisions.",
       "severity": "CRITICAL",
-      "signature": "single-pool-spot-price-for-liquidation",
-      "stableKey": "sha256:d98176c30d523f2972e1c81505efa931566ef33673374563086ac42ac1c6aa45",
+      "signature": "spot-price-oracle-manipulation",
+      "stableKey": "sha256:e41d8669c5f76d35fda12945ae6c8d2a4716175ee4b67015ca2a4fa75963c3a5",
+      "status": "suspected"
+    },
+    {
+      "category": "SC02",
+      "confidence": "high",
+      "description": "borrow() increments borrowed[msg.sender] by any caller-supplied amount with no check against the caller's deposited collateral value and no call into isLiquidatable/any LTV cap - the debt-origination path is entirely disconnected from the collateralization ratio LIQUIDATION_THRESHOLD_BPS is meant to enforce. This is directly weaponizable, not just a theoretical gap: because Solidity 0.8's checked arithmetic reverts on overflow, a caller can call borrow() once with amount at or above type(uint256).max / 10000 (~1.157920892e73) so that debt * 10000 in isLiquidatable() always overflows and reverts. Since liquidate() calls isLiquidatable() via require, this permanently and unilaterally makes that caller's own position un-liquidatable, no matter how insolvent it becomes, because the very check meant to detect insolvency can no longer execute.",
+      "evidence": [
+        "function borrow(uint256 amount) external {",
+        "borrowed[msg.sender] += amount;",
+        "return debt * 10000 > collateralValue * LIQUIDATION_THRESHOLD_BPS;"
+      ],
+      "id": "F-5743de7a",
+      "locations": [
+        {
+          "contract": "SpotPriceLending",
+          "file": "contract_e.sol",
+          "function": "borrow",
+          "lineEnd": 36,
+          "lineStart": 34
+        },
+        {
+          "contract": "SpotPriceLending",
+          "file": "contract_e.sol",
+          "function": "isLiquidatable",
+          "lineEnd": 27,
+          "lineStart": 27
+        }
+      ],
+      "mergedCount": 1,
+      "patch": null,
+      "recommendation": "Enforce a maximum-borrow check inside borrow() itself (reject the call unless post-borrow debt keeps the account at or above the liquidation threshold, using the same valuation logic as isLiquidatable). Separately, make the isLiquidatable comparison robust against attacker-supplied magnitudes, e.g. rewrite it as debt > (collateralValue * LIQUIDATION_THRESHOLD_BPS) / 10000 so no reachable value of borrowed can force a revert and disable liquidation.",
+      "severity": "HIGH",
+      "signature": "unbounded-borrow-no-collateral-check",
+      "stableKey": "sha256:5743de7a1cd4d99051167f66d19a63244a73bb292cdaa0ae7f190eaa5d47bf66",
+      "status": "confirmed"
+    },
+    {
+      "category": "SC02",
+      "confidence": "high",
+      "description": "liquidate() transfers the account's entire collateralDeposited balance to msg.sender and zeroes borrowed[account], without the caller ever repaying any portion of the outstanding debt - no asset changes hands anywhere in the contract to represent that repayment. In a conventional liquidation design, the liquidator repays some or all of the debt in the borrowed asset and receives collateral plus a bonus, with any remainder returned to the borrower. Here, the instant a position crosses the 80% threshold - even by a small margin, or as a result of the price-manipulation issue reported separately - the first caller to act receives 100% of the borrower's collateral for free and the debt is simply erased. This makes liquidation maximally punitive to borrowers and a pure, costless windfall to whoever calls it, independent of how far the position actually breached the threshold.",
+      "evidence": [
+        "uint256 seizedCollateral = collateralDeposited[account];",
+        "collateralDeposited[account] = 0;",
+        "borrowed[account] = 0;",
+        "payable(msg.sender).transfer(seizedCollateral);"
+      ],
+      "id": "F-712bd13a",
+      "locations": [
+        {
+          "contract": "SpotPriceLending",
+          "file": "contract_e.sol",
+          "function": "liquidate",
+          "lineEnd": 44,
+          "lineStart": 38
+        }
+      ],
+      "mergedCount": 1,
+      "patch": null,
+      "recommendation": "Require the liquidator to transfer in the debt (or the portion being liquidated) before releasing any collateral. Seize only an amount proportional to the debt repaid plus a fixed liquidation bonus (e.g. seized = debtRepaid * (1 + bonusBps/10000) / price), and return any leftover collateral to the borrower instead of paying out the full balance to the liquidator.",
+      "severity": "HIGH",
+      "signature": "liquidation-seizes-full-collateral-no-repayment",
+      "stableKey": "sha256:712bd13a7806194ae17d5096e784a7a6205f6b106f99cfa8574c707b532e7954",
+      "status": "confirmed"
+    },
+    {
+      "category": "SC05",
+      "confidence": "medium",
+      "description": "The constructor stores pair into the immutable collateralPair without verifying pair != address(0). Because collateralPair can never be changed after deployment, an accidental zero-address (or otherwise invalid) argument would make every call to _currentPrice() revert (an external call to an address with no contract code reverts when Solidity tries to decode the return data), permanently disabling isLiquidatable() and liquidate() while deposit()/borrow() remain callable - i.e. collateral could be deposited and debt recorded, but the protocol could never assess or act on undercollateralized positions.",
+      "evidence": [
+        "constructor(address pair) {",
+        "collateralPair = IPair(pair);"
+      ],
+      "id": "F-0e705ee1",
+      "locations": [
+        {
+          "contract": "SpotPriceLending",
+          "file": "contract_e.sol",
+          "function": "constructor",
+          "lineEnd": 17,
+          "lineStart": 15
+        }
+      ],
+      "mergedCount": 1,
+      "patch": null,
+      "recommendation": "Add require(pair != address(0), \"zero pair\"); in the constructor, and consider verifying at deployment time that the address actually exposes a working getReserves() before accepting it.",
+      "severity": "LOW",
+      "signature": "zero-address-pair-constructor",
+      "stableKey": "sha256:0e705ee14b3209574dc35dfaa63b4a45e8fa6c6fb8c2e485f3953347653338a7",
       "status": "suspected"
     }
   ],
   "generatedBy": "ai",
-  "inputHash": "sha256:c724430678576c9c5a1dd0d60db4fd057a7d374c63c2ab6e4726089ddc490fb1",
+  "inputHash": "sha256:d0e9c31eff758c6edcae7b7fa47a2b223fa933d81be708bda07eb3fd4b8488b5",
   "language": "en",
   "limitations": [
     "Off-chain logic, deployment configuration and key management were not assessed.",
@@ -84,10 +193,10 @@
   ],
   "mode": "quick",
   "riskIndicator": {
-    "band": "MODERATE",
+    "band": "HIGH",
     "explanation": "This indicator reflects findings detected within the analyzed scope. It is not a measure of overall protocol security.",
     "scopeNote": "according to the analyzed scope",
-    "score": 82,
+    "score": 40,
     "scoreStatus": "computed"
   },
   "scope": {

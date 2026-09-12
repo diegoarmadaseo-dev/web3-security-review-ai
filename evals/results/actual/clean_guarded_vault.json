@@ -19,7 +19,7 @@
     },
     {
       "category": "SC05",
-      "status": "NOT_DETECTED"
+      "status": "DETECTED"
     },
     {
       "category": "SC06",
@@ -44,14 +44,43 @@
   ],
   "checklistVersion": "2026.1",
   "compilerVersion": "0.8.20",
-  "findings": [],
+  "findings": [
+    {
+      "category": "SC05",
+      "confidence": "high",
+      "description": "rescueToken validates that `to` is non-zero but never validates `token`. If `token` is the zero address, an EOA, or any address with no deployed contract code (e.g. a typo'd address or a self-destructed contract), the low-level call `token.call(...)` will trivially return `(true, \"\")` per EVM semantics for calls to addresses without code. Because the success check `ok && (data.length == 0 || abi.decode(data, (bool)))` treats empty returndata as success (needed to support non-standard ERC-20s like USDT), such a call passes every check without reverting even though no tokens were actually moved. The owner would observe a successful transaction and could be misled into believing a rescue occurred when nothing happened. Since the function is onlyOwner-gated, this is not exploitable by a third party - it is an operator-error / input-validation gap, not a fund-draining vulnerability.",
+      "evidence": [
+        "    function rescueToken(address token, address to, uint256 amount) external onlyOwner {",
+        "        require(to != address(0), \"GuardedVault: zero address\");",
+        "        (bool ok, bytes memory data) = token.call(",
+        "            abi.encodeWithSignature(\"transfer(address,uint256)\", to, amount)",
+        "        );"
+      ],
+      "id": "F-70c20898",
+      "locations": [
+        {
+          "contract": "GuardedVault",
+          "file": "contract_beta.sol",
+          "function": "rescueToken",
+          "lineEnd": 44,
+          "lineStart": 39
+        }
+      ],
+      "mergedCount": 1,
+      "patch": null,
+      "recommendation": "Validate `token` before the call, e.g. `require(token != address(0) && token.code.length > 0, \"GuardedVault: invalid token\");`, or replace the manual low-level call with OpenZeppelin's `SafeERC20.safeTransfer`, which performs this validation internally and reverts on non-contract targets.",
+      "severity": "LOW",
+      "signature": "rescuetoken-missing-address-validation",
+      "stableKey": "sha256:70c20898ea092a6df9e604c392572887a323996f63e030f66309e790895c0c05",
+      "status": "confirmed"
+    }
+  ],
   "generatedBy": "ai",
-  "inputHash": "sha256:22ccd1ec84c50e85195183c6673566568c7dc79a4e1e78293d6fa0ed7216116f",
+  "inputHash": "sha256:b0f9ab7b980ec76e40ab5d224e28b7942205901d0c5a7b6aa17c1b105961a383",
   "language": "en",
   "limitations": [
     "Off-chain logic, deployment configuration and key management were not assessed.",
-    "Operational security, infrastructure and tokenomics outside the analyzed code were not assessed.",
-    "Deployed contract state and third-party systems were not assessed."
+    "Operational security, infrastructure and tokenomics outside the analyzed code were not assessed."
   ],
   "mode": "quick",
   "riskIndicator": {
@@ -59,7 +88,7 @@
     "explanation": "This indicator reflects findings detected within the analyzed scope. It is not a measure of overall protocol security.",
     "lowBandNote": "A LOW automated risk indicator does not mean that deployment is safe.",
     "scopeNote": "according to the analyzed scope",
-    "score": 100,
+    "score": 97,
     "scoreStatus": "computed"
   },
   "scope": {

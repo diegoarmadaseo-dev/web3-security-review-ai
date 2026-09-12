@@ -2,63 +2,81 @@
   "analysisEngineVersion": "1.0.0",
   "architectureNotes": [
     {
-      "description": "Alcancia no importa ni hereda de ningun otro contrato y no depende de oraculos, tokens externos ni de otros contratos del protocolo, por lo que no hay superficie de confianza entre contratos que evaluar en este caso.",
-      "title": "Alcance limitado a un unico contrato autonomo"
+      "description": "El orden de operaciones en retirar() (verificar saldo, descontar, luego enviar fondos) sigue correctamente el patrón checks-effects-interactions, lo que evita la reentrada clásica sin necesidad de un guard adicional del tipo nonReentrant.",
+      "title": "Patrón checks-effects-interactions aplicado correctamente"
+    },
+    {
+      "description": "La pausa administrativa (establecerPausa) solo afecta a depositar(); retirar() no lleva el modificador noPausado, por lo que los usuarios conservan siempre la capacidad de recuperar su saldo aunque el contrato esté en pausa. Es un diseño que limita deliberadamente el alcance del control del propietario.",
+      "title": "La pausa administrativa no bloquea los retiros"
+    },
+    {
+      "description": "El propietario se asigna de forma immutable en el constructor y no existe función para transferirlo. Esto elimina el riesgo de una transferencia de propiedad accidental o maliciosa, aunque también implica que esa dirección no podrá rotarse si alguna vez fuera necesario.",
+      "title": "Propietario fijo sin mecanismo de transferencia"
     }
   ],
   "categoryCoverage": [
     {
       "category": "SC01",
+      "note": "establecerPausa() está restringida al propietario mediante el modificador soloPropietario. retirar() coincide léxicamente con un nombre de función administrativa (\"retirar\"), pero solo opera sobre saldos[msg.sender], el saldo propio de quien llama, nunca sobre fondos de terceros; corresponde al patrón de falso positivo de función de autoservicio, no a una función administrativa desprotegida. El propietario se fija de forma immutable en el constructor y no existe función de transferencia de propiedad.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC02",
+      "note": "No hay bucles, no se usa block.timestamp con efecto económico, y no existen patrones de transferFrom ni approve en el contrato.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC03",
+      "note": "El contrato no interactúa con oráculos de precio ni ejecuta operaciones de intercambio (swap); esta categoría no tiene superficie aplicable en este código.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC04",
+      "note": "No se identificaron llamadas a APIs de préstamos flash (flash loans) ni de oráculos.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC05",
+      "note": "Ninguna función externa recibe parámetros de tipo address, y no hay direcciones hardcodeadas en el código.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC06",
+      "note": "El preprocesamiento marcó la llamada de bajo nivel de retirar() (línea 38) por su naturaleza (.call con valor). Al revisar el contexto: el valor de retorno se verifica explícitamente con require(exito, ...) inmediatamente después, y el destino es siempre msg.sender (targetIsParameter: false), no una dirección arbitraria. Coincide con el patrón de falso positivo documentado para esta familia y no se reporta como hallazgo.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC07",
+      "note": "No existen operaciones de división seguida de multiplicación en el contrato.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC08",
+      "note": "La única llamada externa del contrato (retirar(), línea 38) ocurre después de descontar saldos[msg.sender], es decir, el estado ya fue actualizado antes de la interacción externa (patrón checks-effects-interactions aplicado correctamente). Una reentrada solo volvería a leer un saldo ya reducido, sin poder repetir el efecto; no se considera una vulnerabilidad de reentrancia.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC09",
+      "note": "El pragma está fijado a una versión exacta (0.8.20), sin notación flotante, con verificación aritmética nativa del compilador. No se usan bloques unchecked ni aritmética heredada de versiones previas a 0.8.0.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC10",
+      "note": "No se detectaron patrones de proxy, delegatecall, funciones de actualización (upgrade) ni inicializadores; el contrato usa un constructor estándar no reutilizable.",
       "status": "NOT_DETECTED"
     }
   ],
   "checklistVersion": "2026.1",
   "compilerVersion": "0.8.20",
-  "executiveSummary": "Esta revision no encontro hallazgos de seguridad dentro del alcance analizado. El contrato aplica correctamente el control de acceso para la funcion de pausa, actualiza el estado antes de enviar fondos en retirar() y limita cada retiro al saldo propio de quien lo solicita.",
+  "executiveSummary": "Este contrato funciona como una alcancia digital: cada persona solo puede depositar y retirar su propio dinero, nunca el de otra persona. Quien administra el contrato únicamente puede pausar temporalmente la entrada de depósitos nuevos, pero no puede tocar los fondos ya guardados ni impedir que la gente retire lo suyo, ni siquiera estando en pausa. El análisis automatizado, asistido por IA, no encontró problemas de seguridad dentro de lo revisado. Al tratarse de un contrato muy simple, sin conexiones a otros sistemas ni lógica financiera compleja, el nivel de riesgo evaluado es bajo dentro de este alcance preliminar, aunque se recomienda complementar este análisis con una revisión manual antes de manejar fondos reales.",
   "findings": [],
   "generatedBy": "ai",
-  "inputHash": "sha256:73f2c1018903d088eecf2cbfeacfa99dd3f67cb4f4a479d02175fb03f14d9b0b",
+  "inputHash": "sha256:518dc5301ddd3724c45746ab91de21ea0d03ae3275c45508a7115e468ace7bc2",
   "language": "es",
   "limitations": [
-    "No se evaluo la logica fuera de la cadena, la configuracion de despliegue ni la gestion de claves.",
-    "No se evaluaron la seguridad operativa, la infraestructura ni la tokenomica fuera del codigo analizado.",
-    "No se evaluo el estado del contrato ya desplegado ni sistemas de terceros."
+    "Off-chain logic, deployment configuration and key management were not assessed.",
+    "Operational security, infrastructure and tokenomics outside the analyzed code were not assessed.",
+    "Deployed contract state and third-party systems were not assessed."
   ],
   "mode": "pro",
   "riskIndicator": {

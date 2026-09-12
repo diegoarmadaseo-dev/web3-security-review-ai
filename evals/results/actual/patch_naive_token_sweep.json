@@ -3,42 +3,52 @@
   "categoryCoverage": [
     {
       "category": "SC01",
+      "note": "The only state-changing function is correctly gated by an owner-only modifier; no tx.origin-based auth, selfdestruct, unprotected initializer, or upgrade function is present. The contract has no ownership-transfer function at all, so the single-step-transfer risk pattern does not apply either.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC02",
+      "note": "No timestamp-dependent logic, loops, msg.value usage, transferFrom, or approve calls are present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC03",
+      "note": "No swap calls, slippage parameters, or price/rate reads are present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC04",
+      "note": "No oracle reads or flash-loan-related identifiers are present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC05",
+      "note": "The token parameter is not compared to address(0), but a strict-return-type interface call to a non-contract address reverts on its own under current Solidity semantics, so the missing check has no exploitable effect here; no hardcoded address literals are present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC06",
+      "note": "See finding on the unchecked, non-defensive transfer() call in sweep().",
       "status": "DETECTED"
     },
     {
       "category": "SC07",
+      "note": "The contract performs no arithmetic.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC08",
+      "note": "The external call in sweep() is not followed by any state write, and a reentrant call back into sweep() would fail the onlyOwner check, so no reentrancy path exists.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC09",
+      "note": "Pragma is pinned to an exact, current version (0.8.20) with built-in overflow/underflow checks; no unchecked blocks are present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC10",
+      "note": "No delegatecall, assembly, proxy indicators, initializer pattern, or upgrade function are present.",
       "status": "NOT_DETECTED"
     }
   ],
@@ -48,36 +58,44 @@
     {
       "category": "SC06",
       "confidence": "high",
-      "description": "sweep() calls transfer() without checking its returned bool. Because this contract accepts donations of arbitrary community-supplied tokens, this includes tokens that signal failure by returning false, or that (like older non-compliant ERC20s such as USDT) return no data at all.",
+      "description": "sweep moves the contract's balance of an arbitrary donated token to owner by calling transfer through the IToken interface, which declares a bool return value, and the call site never inspects that return value. Because the interface commits to a strict bool return, Solidity ABI-decodes whatever the call returns against that type. For a token that returns no data at all on transfer (the best-known real-world example is USDT on Ethereum mainnet, and this is exactly the kind of non-standard behavior the function's own NatSpec comment says it must tolerate), there is nothing to decode and the call - and the whole sweep transaction - reverts, so donations in that token can never be swept out through this function. For a token that instead signals failure by returning false without reverting, the discarded return value means sweep finishes normally even though no tokens moved, giving no on-chain signal that anything went wrong. In both cases the practical effect is the same: donated tokens of the affected type stay stuck in the contract, because sweep is the only way to move tokens out and there is no fallback rescue mechanism.",
       "evidence": [
+        "function transfer(address to, uint256 amount) external returns (bool);",
+        "///         ones that do not strictly follow the standard's return-value rules.",
         "function sweep(address token, uint256 amount) external onlyOwner {",
-        "    IToken(token).transfer(owner, amount);",
-        "}"
+        "IToken(token).transfer(owner, amount);"
       ],
-      "id": "F-d48a26b9",
+      "id": "F-617e19e8",
       "locations": [
         {
+          "contract": "IToken",
+          "file": "contract_n.sol",
+          "function": "transfer",
+          "lineEnd": 5,
+          "lineStart": 5
+        },
+        {
           "contract": "DonationSweeper",
-          "file": "patch_naive_token_sweep.sol",
+          "file": "contract_n.sol",
           "function": "sweep",
           "lineEnd": 24,
-          "lineStart": 22
+          "lineStart": 24
         }
       ],
       "mergedCount": 1,
       "patch": {
-        "diff": "--- a/patch_naive_token_sweep.sol\n+++ b/patch_naive_token_sweep.sol\n@@ -21,3 +21,7 @@\n     function sweep(address token, uint256 amount) external onlyOwner {\n-        IToken(token).transfer(owner, amount);\n+        (bool ok, bytes memory data) = token.call(\n+            abi.encodeWithSignature(\"transfer(address,uint256)\", owner, amount)\n+        );\n+        require(ok && (data.length == 0 || abi.decode(data, (bool))), \"transfer failed\");\n     }\n",
+        "diff": "--- a/contract_n.sol\n+++ b/contract_n.sol\n@@ -21,6 +21,11 @@\n     ///         for every ERC20-shaped token the community might donate, including\n     ///         ones that do not strictly follow the standard's return-value rules.\n     function sweep(address token, uint256 amount) external onlyOwner {\n-        IToken(token).transfer(owner, amount);\n+        (bool success, bytes memory data) = token.call(\n+            abi.encodeWithSelector(IToken.transfer.selector, owner, amount)\n+        );\n+        // Empty returndata (non-standard tokens, e.g. USDT) counts as success;\n+        // if data IS returned, it must decode to `true`.\n+        require(success && (data.length == 0 || abi.decode(data, (bool))), \"transfer failed\");\n     }\n }",
         "format": "unified-diff"
       },
-      "recommendation": "Verify the call succeeded and, if data was returned, that it decodes to true - without assuming every token follows the standard's return-value convention, since this sweeper must keep working for tokens that do not.",
+      "recommendation": "Replace the direct interface call with a defensive transfer pattern that tolerates both a missing return value and a false return value - for example OpenZeppelin's SafeERC20.safeTransfer, or an equivalent manual low-level call that requires the call itself to succeed and, only when return data is actually present, requires it to decode to true. This satisfies the documented goal of working with every ERC20-shaped token, standard or not, and turns a real transfer failure into an explicit revert instead of a silent no-op.",
       "severity": "HIGH",
-      "signature": "unchecked-ierc20-transfer-return",
-      "stableKey": "sha256:d48a26b921ac0b9571f828e1dc77aecf12f53f6cce54621382f7bb629f89e87a",
-      "status": "suspected"
+      "signature": "unchecked-nonstandard-erc20-transfer",
+      "stableKey": "sha256:617e19e805b833d2b6b453413e53af4899f2b95e910499304647ebeebd2f6a21",
+      "status": "confirmed"
     }
   ],
   "generatedBy": "ai",
-  "inputHash": "sha256:997ebd011f016a244be5e6f4bccdecda080fa4140ee16dfce805bc9e075efb2a",
+  "inputHash": "sha256:7042e54c1aeb6b8a84ee7cd9856023c9a59480816df82bab6048e5728891bc31",
   "language": "en",
   "limitations": [
     "Off-chain logic, deployment configuration and key management were not assessed.",

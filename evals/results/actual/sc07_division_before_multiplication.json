@@ -3,42 +3,52 @@
   "categoryCoverage": [
     {
       "category": "SC01",
-      "status": "NOT_DETECTED"
+      "note": "deposit() credits shares for any caller-chosen amount with no payment or access restriction (see finding). The mechanically-flagged admin-function-unprotected signal on claimReward was reviewed and dismissed as a false positive: claimReward only ever reads, zeroes, and pays out the caller's own recorded shares, matching this family's documented self-service exception.",
+      "status": "DETECTED"
     },
     {
       "category": "SC02",
-      "status": "NOT_DETECTED"
+      "note": "receive() accepts ETH without crediting totalRewards, permanently stranding directly-sent funds (see finding). No msg-value-in-loop, timestamp-dependence, arbitrary-from-transfer, unlimited-approval, or slippage sub-patterns are present.",
+      "status": "DETECTED"
     },
     {
       "category": "SC03",
+      "note": "No price oracle, swap, or deadline/front-running-sensitive logic is present in this file.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC04",
+      "note": "No oracle reads or flash-loan interfaces are present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC05",
+      "note": "No attacker-supplied address parameters requiring a zero-address check, and no hardcoded address literals.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC06",
+      "note": "No external contract calls, low-level calls, unchecked token transfers, or assembly. The only value transfer is a native-ETH .transfer() to msg.sender, covered separately under EXTRA-dos-gas.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC07",
+      "note": "Division-before-multiplication in calculateReward truncates rewards to zero for virtually all callers, and claimReward never decrements totalShares or totalRewards after paying out (see findings).",
       "status": "DETECTED"
     },
     {
       "category": "SC08",
+      "note": "claimReward follows checks-effects-interactions (state zeroed before the external transfer) and uses .transfer(), the checklist's documented reentrancy-safe pattern; no guard is needed.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC09",
+      "note": "Pragma is pinned to an exact version (0.8.20, not floating) with built-in checked arithmetic; no unchecked blocks are present.",
       "status": "NOT_DETECTED"
     },
     {
       "category": "SC10",
+      "note": "No delegatecall, selfdestruct, assembly, proxy pattern, upgrade function, or initializer pattern is present.",
       "status": "NOT_DETECTED"
     }
   ],
@@ -46,35 +56,160 @@
   "compilerVersion": "0.8.20",
   "findings": [
     {
-      "category": "SC07",
+      "category": "SC01",
       "confidence": "high",
-      "description": "calculateReward divides shares[account] by totalShares before multiplying by totalRewards. Integer division truncates the intermediate result to 0 whenever shares[account] < totalShares (the common case for any holder that is not the single largest one), so almost every account receives zero reward regardless of their actual share.",
+      "description": "deposit(uint256 shareAmount) lets any address increase shares[msg.sender] and totalShares by an arbitrary, caller-chosen amount, with no msg.value requirement, no token transferFrom, and no access restriction whatsoever - the function takes no real value from the caller in exchange for the accounting entry it creates. Because a new deposit adds the same amount to both the numerator and denominator at once, a single call cannot by itself push one account's shares above totalShares, so this does not by itself bypass the division-truncation bug above. However, it is still an independent, critical flaw: the entire 'shares' ledger backing every reward calculation is unbacked by any real asset. If the division-order bug were fixed in isolation - the natural, minimal-looking fix - any address could then call deposit() with a large shareAmount to claim a large, disproportionate fraction of the real ETH funded by the operator, directly at the expense of legitimate depositors. The two issues must be remediated together.",
       "evidence": [
-        "function calculateReward(address account) public view returns (uint256) {",
-        "    return (shares[account] / totalShares) * totalRewards;",
-        "}"
+        "function deposit(uint256 shareAmount) external {",
+        "shares[msg.sender] += shareAmount;",
+        "totalShares += shareAmount;"
       ],
-      "id": "F-de498dc5",
+      "id": "F-1d36523b",
       "locations": [
         {
           "contract": "RewardPool",
-          "file": "sc07_division_before_multiplication.sol",
-          "function": "calculateReward",
-          "lineEnd": 31,
-          "lineStart": 29
+          "file": "contract_i.sol",
+          "function": "deposit",
+          "lineEnd": 22,
+          "lineStart": 19
         }
       ],
       "mergedCount": 1,
       "patch": null,
-      "recommendation": "Multiply before dividing: (shares[account] * totalRewards) / totalShares, using a fixed-point scaling factor if additional precision is needed.",
+      "recommendation": "Require deposit() to actually take value corresponding to shareAmount before crediting shares - e.g. require(msg.value == shareAmount) for an ETH-backed pool, or a checked transfer/transferFrom of a designated staking token for a token-backed pool - or, if shares are meant to be assigned by a trusted process, restrict the function to onlyOperator (or a dedicated, reviewed controller) and remove public self-service minting entirely.",
+      "severity": "CRITICAL",
+      "signature": "unbacked-share-minting-via-deposit",
+      "stableKey": "sha256:1d36523b95f20f8779d0a8e907864d1ff16efcbc18ffd68ee647ac94c70139c3",
+      "status": "confirmed"
+    },
+    {
+      "category": "SC07",
+      "confidence": "high",
+      "description": "calculateReward computes (shares[account] / totalShares) * totalRewards, dividing before multiplying. Because both operands are unsigned integers and Solidity integer division truncates toward zero, this expression evaluates to exactly 0 for every account whose shares are strictly less than totalShares - i.e. for every depositor except one that happens to own 100% of all recorded shares. In the pool's normal, intended use case of multiple depositors sharing a reward pot, claimReward() will therefore pay out 0 to essentially everyone regardless of how much they actually hold, while the ETH funded through fundRewards (and any ETH received directly) stays locked in the contract with no operator withdrawal or sweep function to recover it.",
+      "evidence": [
+        "function calculateReward(address account) public view returns (uint256) {",
+        "return (shares[account] / totalShares) * totalRewards;",
+        "uint256 reward = calculateReward(msg.sender);"
+      ],
+      "id": "F-bed45900",
+      "locations": [
+        {
+          "contract": "RewardPool",
+          "file": "contract_i.sol",
+          "function": "calculateReward",
+          "lineEnd": 31,
+          "lineStart": 29
+        },
+        {
+          "contract": "RewardPool",
+          "file": "contract_i.sol",
+          "function": "claimReward",
+          "lineEnd": 37,
+          "lineStart": 33
+        }
+      ],
+      "mergedCount": 1,
+      "patch": {
+        "diff": "--- a/contract_i.sol\n+++ b/contract_i.sol\n@@ -29,3 +29,4 @@\n     function calculateReward(address account) public view returns (uint256) {\n-        return (shares[account] / totalShares) * totalRewards;\n+        if (totalShares == 0) return 0;\n+        return (shares[account] * totalRewards) / totalShares;\n     }",
+        "format": "unified-diff"
+      },
+      "recommendation": "Multiply before dividing: return (shares[account] * totalRewards) / totalShares. Explicitly guard the totalShares == 0 case (return 0) so the view function does not revert with a division-by-zero panic before any deposits exist. For production use, consider a standard accumulator ('reward per share') pattern that handles repeated funding rounds and partial claims correctly over time.",
+      "severity": "CRITICAL",
+      "signature": "division-before-multiplication-zeroes-rewards",
+      "stableKey": "sha256:bed45900ef9be016a892b584be844cbf5572a865d02741853187b745c7bd8d69",
+      "status": "confirmed"
+    },
+    {
+      "category": "SC07",
+      "confidence": "high",
+      "description": "claimReward() sets shares[msg.sender] = 0 after computing the caller's reward, but never reduces totalShares by the amount just zeroed out, and never reduces totalRewards by the amount paid out. This breaks the invariant that totalShares should equal the sum of all currently-outstanding individual shares: after even one claim, totalShares is permanently overstated relative to what remains claimable. This compounds the division-truncation bug above, but is a distinct defect in its own right - in a correctly-scaled reward formula, a permanently inflated totalShares understates every remaining holder's true proportional entitlement, and a stale (non-decreasing) totalRewards no longer reflects how much ETH the contract can actually still pay out, which can cause later claimants' payouts to fail once the real balance runs low.",
+      "evidence": [
+        "function claimReward() external {",
+        "shares[msg.sender] = 0;",
+        "payable(msg.sender).transfer(reward);"
+      ],
+      "id": "F-12d4fea0",
+      "locations": [
+        {
+          "contract": "RewardPool",
+          "file": "contract_i.sol",
+          "function": "claimReward",
+          "lineEnd": 37,
+          "lineStart": 33
+        }
+      ],
+      "mergedCount": 1,
+      "patch": {
+        "diff": "--- a/contract_i.sol\n+++ b/contract_i.sol\n@@ -33,5 +33,7 @@\n     function claimReward() external {\n         uint256 reward = calculateReward(msg.sender);\n+        totalShares -= shares[msg.sender];\n         shares[msg.sender] = 0;\n+        totalRewards -= reward;\n         payable(msg.sender).transfer(reward);\n     }",
+        "format": "unified-diff"
+      },
+      "recommendation": "Decrement both totalShares (by shares[msg.sender]) and totalRewards (by the computed reward) as part of processing each claim, so the remaining pool and remaining shares stay in sync. For a more robust design, consider migrating to an accumulator-based ('accRewardPerShare') staking/reward pattern.",
       "severity": "HIGH",
-      "signature": "reward-division-before-multiplication",
-      "stableKey": "sha256:de498dc5dc033927a82218a14108c7aade36b449db9f5e89c20c2b3e89cd8742",
-      "status": "suspected"
+      "signature": "total-shares-not-decremented-on-claim",
+      "stableKey": "sha256:12d4fea0948ff38c43747126bb449282b20462ea6c72bedf762c7214dc6534a3",
+      "status": "confirmed"
+    },
+    {
+      "category": "EXTRA-dos-gas",
+      "confidence": "medium",
+      "description": "claimReward() pays out using payable(msg.sender).transfer(reward), which forwards a fixed 2300-gas stipend. Any depositor whose address is a smart contract needing more than 2300 gas in its receive/fallback function (e.g. a multisig wallet or a smart-contract wallet with any nontrivial logic) will have this call revert every time, which reverts the entire claimReward() transaction. That depositor's shares are never actually zeroed (the revert also undoes that write), so no funds are stolen, but that depositor has no way to ever successfully claim their portion of the pool through this contract as deployed.",
+      "evidence": [
+        "payable(msg.sender).transfer(reward);"
+      ],
+      "id": "F-e0d48674",
+      "locations": [
+        {
+          "contract": "RewardPool",
+          "file": "contract_i.sol",
+          "function": "claimReward",
+          "lineEnd": 36,
+          "lineStart": 36
+        }
+      ],
+      "mergedCount": 1,
+      "patch": {
+        "diff": "--- a/contract_i.sol\n+++ b/contract_i.sol\n@@ -33,5 +33,6 @@\n     function claimReward() external {\n         uint256 reward = calculateReward(msg.sender);\n         shares[msg.sender] = 0;\n-        payable(msg.sender).transfer(reward);\n+        (bool ok, ) = msg.sender.call{value: reward}(\"\");\n+        require(ok, \"ETH transfer failed\");\n     }",
+        "format": "unified-diff"
+      },
+      "recommendation": "Replace .transfer() with a low-level call plus an explicit success check, e.g. (bool ok, ) = msg.sender.call{value: reward}(\"\"); require(ok, \"transfer failed\");, which forwards all remaining gas and works for any recipient. Keep the existing checks-effects-interactions ordering (state already zeroed before the external call) when making this change, and apply it together with the totalShares/totalRewards accounting fix above.",
+      "severity": "MEDIUM",
+      "signature": "transfer-gas-stipend-blocks-contract-recipients",
+      "stableKey": "sha256:e0d48674b2b1e4e8542ae5cdf2fe5e144b3a5b7bad476468f5b967636666cda2",
+      "status": "confirmed"
+    },
+    {
+      "category": "SC02",
+      "confidence": "medium",
+      "description": "The empty receive() external payable {} accepts plain ETH transfers sent directly to the contract address without going through fundRewards(). Unlike fundRewards, this path never increments totalRewards, so ETH received this way is never reflected in calculateReward for any account and cannot be distributed through the normal claim flow. There is also no sweep or emergency-withdrawal function for the operator to recover it, so any ETH sent directly to the contract - by mistake, or by any sender that defaults to a plain transfer - becomes permanently stranded.",
+      "evidence": [
+        "receive() external payable {}",
+        "function fundRewards(uint256 amount) external payable onlyOperator {",
+        "totalRewards += amount;"
+      ],
+      "id": "F-b3b10fae",
+      "locations": [
+        {
+          "contract": "RewardPool",
+          "file": "contract_i.sol",
+          "function": "receive",
+          "lineEnd": 39,
+          "lineStart": 39
+        }
+      ],
+      "mergedCount": 1,
+      "patch": {
+        "diff": "--- a/contract_i.sol\n+++ b/contract_i.sol\n@@ -39,1 +39,3 @@\n-    receive() external payable {}\n+    receive() external payable {\n+        totalRewards += msg.value;\n+    }",
+        "format": "unified-diff"
+      },
+      "recommendation": "Either credit msg.value to totalRewards inside receive() so directly-sent ETH becomes claimable like any other funded reward, or remove the payable receive() (or make it revert) so that all funding is forced through the explicit, accounted-for fundRewards() path.",
+      "severity": "MEDIUM",
+      "signature": "receive-eth-unaccounted-in-total-rewards",
+      "stableKey": "sha256:b3b10fae3da9f51beebdb34b0f2218913f9d4bd37c3c9e026da031c7c85afd97",
+      "status": "confirmed"
     }
   ],
   "generatedBy": "ai",
-  "inputHash": "sha256:d3ada7467f5f04f79d89d746ba7c49b1c7e492aec12eb8e0fda24db4b3b15040",
+  "inputHash": "sha256:b3ffafa063d3b44c31748ad9cc280531e88d529f1ccfadb4a93c4b99f899d9d0",
   "language": "en",
   "limitations": [
     "Off-chain logic, deployment configuration and key management were not assessed.",
@@ -83,11 +218,10 @@
   ],
   "mode": "standard",
   "riskIndicator": {
-    "band": "LOW",
+    "band": "CRITICAL",
     "explanation": "This indicator reflects findings detected within the analyzed scope. It is not a measure of overall protocol security.",
-    "lowBandNote": "A LOW automated risk indicator does not mean that deployment is safe.",
     "scopeNote": "according to the analyzed scope",
-    "score": 85,
+    "score": 25,
     "scoreStatus": "computed"
   },
   "scope": {
