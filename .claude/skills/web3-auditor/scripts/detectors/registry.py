@@ -61,6 +61,15 @@ CHECK_METADATA: Dict[str, Dict[str, Any]] = {
     "flash-loan-surface.general": {"family": "flash-loan-surface", "categories": ["SC04"], "needsContext": True, "fpRisk": "high", "groupHint": None},
     "division-before-multiplication.general": {"family": "division-before-multiplication", "categories": ["SC07"], "needsContext": True, "fpRisk": "high", "groupHint": None},
     "hardcoded-address.general": {"family": "hardcoded-address", "categories": ["SC05", "EXTRA-config"], "needsContext": True, "fpRisk": "high", "groupHint": None},
+    # --- V2.1 detector-expansion, first block (docs/decisiones.md D-032) ---
+    "unprotected-callback-handler.general": {"family": "unprotected-callback-handler", "categories": ["SC01"], "needsContext": True, "fpRisk": "high", "groupHint": None},
+    "reentrancy-inconsistent-guarding.general": {"family": "reentrancy-inconsistent-guarding", "categories": ["SC08"], "needsContext": True, "fpRisk": "high", "groupHint": None},
+    "external-call-in-loop.general": {"family": "external-call-in-loop", "categories": ["EXTRA-dos-gas"], "needsContext": True, "fpRisk": "high", "groupHint": None},
+    "storage-gap-missing.general": {"family": "storage-gap-missing", "categories": ["SC10"], "needsContext": True, "fpRisk": "high", "groupHint": None},
+    "mismatched-array-length.general": {"family": "mismatched-array-length", "categories": ["SC05"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
+    "ecrecover-zero-address-unchecked.general": {"family": "ecrecover-zero-address-unchecked", "categories": ["SC05"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
+    "oracle-answer-unchecked.general": {"family": "oracle-answer-unchecked", "categories": ["SC03", "SC04"], "needsContext": True, "fpRisk": "high", "groupHint": None},
+    "gas-unbounded-storage-array-push.general": {"family": "gas-unbounded-storage-array-push", "categories": ["EXTRA-dos-gas"], "needsContext": True, "fpRisk": "high", "groupHint": None},
 }
 
 # Phase order matters (see module docstring). Do not alphabetize or reorder

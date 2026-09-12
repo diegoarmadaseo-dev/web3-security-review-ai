@@ -228,6 +228,15 @@ SIGNAL_FIXTURES = {
     "flash-loan-surface": 'contract A { function executeOperation(address a, uint b, uint c, address d, bytes calldata e) external returns (bool) { return true; } }',
     "division-before-multiplication": 'contract A { function f(uint a, uint b, uint c) external pure returns (uint) { return a / b * c; } }',
     "hardcoded-address": 'contract A { function f() external pure returns (address) { return 0x1111111111111111111111111111111111111111; } }',
+    # --- V2.1 detector-expansion, first block (docs/decisiones.md D-032) ---
+    "unprotected-callback-handler": 'contract A { function onFlashLoan(address initiator, address token, uint256 amount, uint256 fee, bytes calldata data) external returns (bytes32) { return keccak256("ok"); } }',
+    "reentrancy-inconsistent-guarding": 'contract A { mapping(address => uint) public balances; function withdraw(uint amt) external { (bool ok, ) = msg.sender.call{value: amt}(""); require(ok); balances[msg.sender] -= amt; } function safeWithdraw(uint amt) external nonReentrant { (bool ok, ) = msg.sender.call{value: amt}(""); require(ok); balances[msg.sender] -= amt; } modifier nonReentrant() { _; } }',
+    "external-call-in-loop": 'contract A { function payAll(address[] memory recipients) external payable { for (uint i = 0; i < 5; i++) { recipients[i].call{value: 1}(""); } } }',
+    "storage-gap-missing": 'contract A is Initializable { uint256 public x; }',
+    "mismatched-array-length": 'contract A { function batch(address[] calldata recipients, uint256[] calldata amounts) external { for (uint i = 0; i < recipients.length; i++) { payable(recipients[i]).transfer(amounts[i]); } } }',
+    "ecrecover-zero-address-unchecked": 'contract A { address public owner; function verify(bytes32 h, uint8 v, bytes32 r, bytes32 s) external view returns (bool) { address signer = ecrecover(h, v, r, s); return signer == owner; } }',
+    "oracle-answer-unchecked": 'contract A { IFeed feed; function price() external view returns (int256) { (, int256 answer, , , ) = feed.latestRoundData(); return answer; } }',
+    "gas-unbounded-storage-array-push": 'contract A { uint256[] public items; function add(uint256 x) external { items.push(x); } }',
 }
 
 
@@ -323,6 +332,76 @@ class SignalFamilyNegativeControlTests(unittest.TestCase):
         )
         signals = self._signals_for(source)
         self.assertFalse(signals_of({"signals": signals}, "hardcoded-address"))
+
+    # --- V2.1 detector-expansion, first block (docs/decisiones.md D-032) ---
+
+    def test_guarded_callback_handler_is_not_flagged(self):
+        source = (
+            'contract A { address public pool; function onFlashLoan(address initiator, address token,'
+            ' uint256 amount, uint256 fee, bytes calldata data) external returns (bytes32) {'
+            ' require(msg.sender == pool); return keccak256("ok"); } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "unprotected-callback-handler"))
+
+    def test_isolated_reentrancy_pattern_without_guarded_sibling_is_not_flagged_inconsistent(self):
+        source = (
+            'contract A { mapping(address => uint) public balances; function withdraw(uint amt) external {'
+            ' (bool ok, ) = msg.sender.call{value: amt}(""); require(ok); balances[msg.sender] -= amt; } }'
+        )
+        signals = self._signals_for(source)
+        self.assertTrue(signals_of({"signals": signals}, "reentrancy-pattern"))
+        self.assertFalse(signals_of({"signals": signals}, "reentrancy-inconsistent-guarding"))
+
+    def test_bounded_loop_without_external_call_is_not_flagged_call_in_loop(self):
+        source = 'contract A { function f() external pure returns (uint) { uint s; for (uint i = 0; i < 10; i++) { s += i; } return s; } }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "external-call-in-loop"))
+
+    def test_gap_variable_suppresses_storage_gap_missing(self):
+        source = 'contract A is Initializable { uint256[50] private __gap; }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "storage-gap-missing"))
+
+    def test_non_upgradeable_contract_is_not_flagged_storage_gap_missing(self):
+        source = 'contract A { uint256 public x; }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "storage-gap-missing"))
+
+    def test_array_length_check_suppresses_mismatched_array_length(self):
+        source = (
+            'contract A { function batch(address[] calldata recipients, uint256[] calldata amounts) external {'
+            ' require(recipients.length == amounts.length);'
+            ' for (uint i = 0; i < recipients.length; i++) { payable(recipients[i]).transfer(amounts[i]); } } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "mismatched-array-length"))
+
+    def test_zero_address_check_suppresses_ecrecover_signal(self):
+        source = (
+            'contract A { address public owner; function verify(bytes32 h, uint8 v, bytes32 r, bytes32 s)'
+            ' external view returns (bool) { address signer = ecrecover(h, v, r, s);'
+            ' require(signer != address(0)); return signer == owner; } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "ecrecover-zero-address-unchecked"))
+
+    def test_staleness_check_suppresses_oracle_answer_unchecked(self):
+        source = (
+            'contract A { IFeed feed; function price() external view returns (int256) {'
+            ' (, int256 answer, , uint256 updatedAt, ) = feed.latestRoundData();'
+            ' require(updatedAt > 0); return answer; } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "oracle-answer-unchecked"))
+
+    def test_length_cap_suppresses_gas_unbounded_storage_array_push(self):
+        source = (
+            'contract A { uint256[] public items; uint256 public constant MAX = 100;'
+            ' function add(uint256 x) external { require(items.length < MAX); items.push(x); } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "gas-unbounded-storage-array-push"))
 
 
 class HardenedContractTests(unittest.TestCase):

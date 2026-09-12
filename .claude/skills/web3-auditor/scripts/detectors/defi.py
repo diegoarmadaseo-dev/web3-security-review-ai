@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict
 
-from .context import collapse_ws, fn_at, locate_scope
+from .context import collapse_ws, fn_at, locate_scope, statement_at
 from text_utils import matching_paren, split_top_level
 
 ORACLE_METHOD_RE = re.compile(r"\.(latestRoundData|latestAnswer|getReserves|slot0|observe|consult|getPrice\w*|price|getAmountsOut|getAmountOut|getAmountsIn|quote\w*|getRate\w*|exchangeRate\w*|pricePerShare|getPricePerFullShare|convertToAssets|convertToShares|totalAssets)\s*\(")
@@ -16,6 +16,11 @@ FLASH_RE = re.compile(r"\b(flashLoan\w*|onFlashLoan|executeOperation|uniswapV2Ca
 SWAP_CALL_RE = re.compile(r"\b(swap\w*|exactInput\w*|exactOutput\w*|addLiquidity\w*|removeLiquidity\w*)\s*\(")
 MIN_AMOUNT_ZERO_RE = re.compile(r"\b(amountOutMin\w*|amountOutMinimum|minAmountOut|amountAMin|amountBMin|minReturn\w*|minOut\w*|minimumAmount\w*|sqrtPriceLimitX96)\s*:\s*0\b")
 SIGNATURE_RE = re.compile(r"\becrecover\s*\(|\.recover\s*\(|\.tryRecover\s*\(|\bECDSA\.|\bSignatureChecker\.|\bisValidSignature\s*\(")
+# --- V2.1 detector-expansion, first block (docs/decisiones.md D-032) ---
+ECRECOVER_RE = re.compile(r"\becrecover\s*\(")
+ECRECOVER_ASSIGN_RE = re.compile(r"([A-Za-z_$][\w$]*)\s*=\s*$")
+LATEST_ROUND_DATA_RE = re.compile(r"\.latestRoundData\s*\(\s*\)")
+ANSWER_VALIDATION_RE = re.compile(r"\banswer\b\s*[<>]=?\s*0\b|\b0\b\s*[<>]=?\s*\banswer\b|require\s*\([^;]*\banswer\b[^;]*\)|\bupdatedAt\b|\bansweredInRound\b|\broundId\b|\bstale\b|\bheartbeat\b|\bmaxAge\b|\bMAX_DELAY\b")
 
 
 def detect_oracle_usage(ctx: Dict[str, Any]) -> None:
@@ -107,10 +112,59 @@ def detect_signature_replay_surface(ctx: Dict[str, Any]) -> None:
         })
 
 
+def detect_ecrecover_zero_address_unchecked(ctx: Dict[str, Any]) -> None:
+    """V2.1 detector-expansion, first block (docs/decisiones.md D-032).
+    `ecrecover` returns `address(0)` on a malformed signature instead of
+    reverting; using its result (directly, or via the variable it was
+    assigned to) without ever comparing it to `address(0)` is a distinct,
+    narrower defect than signature-replay-surface's broader nonce/chainId/
+    deadline inventory. Stays within one function body (statement_at +
+    a bounded tail scan to the enclosing function's end) - no file-wide scan."""
+    contract, span_start, body, masked = ctx["contract"], ctx["span_start"], ctx["body"], ctx["masked"]
+    for match in ECRECOVER_RE.finditer(body):
+        offset = span_start + match.start()
+        stmt, stmt_start = statement_at(masked, offset, span_start, ctx["span_end"])
+        if re.search(r"address\s*\(\s*0x?0*\s*\)", stmt):
+            continue
+        prefix = collapse_ws(masked[stmt_start:offset])
+        assign = ECRECOVER_ASSIGN_RE.search(re.sub(r"^address\s+", "", prefix))
+        fn = fn_at(ctx, offset)
+        checked_later = False
+        if assign and fn and fn["_bodyEnd"] is not None:
+            varname = assign.group(1)
+            tail = masked[offset:fn["_bodyEnd"]]
+            checked_later = bool(re.search(r"\b" + re.escape(varname) + r"\b\s*[!=]=\s*address\s*\(\s*0x?0*\s*\)|address\s*\(\s*0x?0*\s*\)\s*[!=]=\s*\b" + re.escape(varname) + r"\b", tail))
+        if checked_later:
+            continue
+        scope = locate_scope(contract, offset)
+        ctx["collector"].add("ecrecover-zero-address-unchecked.general", offset, ctx["cname"], scope, {"assignedTo": assign.group(1) if assign else None})
+
+
+def detect_oracle_answer_unchecked(ctx: Dict[str, Any]) -> None:
+    """V2.1 detector-expansion, first block (docs/decisiones.md D-032).
+    Narrows oracle-usage's informational `stalenessCheckInFunction` flag into
+    its own gated signal specifically for Chainlink's `latestRoundData()`:
+    fires only when the enclosing function shows neither a staleness/round
+    check nor an `answer` sanity check. Independent regex against the
+    already-extracted function body, same bounded-cost pattern as the
+    module's other detectors - does not modify detect_oracle_usage."""
+    contract, span_start, body = ctx["contract"], ctx["span_start"], ctx["body"]
+    for match in LATEST_ROUND_DATA_RE.finditer(body):
+        offset = span_start + match.start()
+        fn = fn_at(ctx, offset)
+        fbody = fn.get("_body", "") if fn else body
+        if ANSWER_VALIDATION_RE.search(fbody):
+            continue
+        scope = locate_scope(contract, offset)
+        ctx["collector"].add("oracle-answer-unchecked.general", offset, ctx["cname"], scope, {"method": "latestRoundData"})
+
+
 CHECKS = [
     ("oracle-usage.general", detect_oracle_usage),
     ("flash-loan-surface.general", detect_flash_loan_surface),
     ("slippage-unprotected.general", detect_slippage_unprotected),
     ("unlimited-approval.general", detect_unlimited_approval),
     ("signature-replay-surface.general", detect_signature_replay_surface),
+    ("ecrecover-zero-address-unchecked.general", detect_ecrecover_zero_address_unchecked),
+    ("oracle-answer-unchecked.general", detect_oracle_answer_unchecked),
 ]

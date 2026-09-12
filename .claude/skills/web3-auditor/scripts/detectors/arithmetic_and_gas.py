@@ -159,6 +159,56 @@ def detect_msg_value_in_loop(ctx: Dict[str, Any]) -> None:
         ctx["collector"].add("msg-value-in-loop.general", mv_offset, ctx["cname"], locate_scope(contract, mv_offset), {"loopLine": ctx["line_index"].line_of(loop["start"])})
 
 
+def detect_external_call_in_loop(ctx: Dict[str, Any]) -> None:
+    """V2.1 detector-expansion, first block (docs/decisiones.md D-032).
+    Distinct root cause from unbounded-loop: even a loop with a small, fixed
+    bound is a gas-griefing/DoS surface if one iteration's external call can
+    revert (a malicious or just broken recipient blocks the whole batch) -
+    the loop's bound doesn't matter, only whether a call sits inside it.
+    Reuses `_analyze_loops` (already computed for unbounded-loop/
+    msg-value-in-loop, recomputed here per the module's documented
+    independent-detectors tradeoff) rather than adding a new scan."""
+    contract = ctx["contract"]
+    for r in _analyze_loops(ctx):
+        if not r["externalInLoop"]:
+            continue
+        loop = r["loop"]
+        scope = locate_scope(contract, loop["start"])
+        ctx["collector"].add("external-call-in-loop.general", loop["start"], ctx["cname"], scope, {
+            "loopKind": loop["kind"],
+            "arrays": r["arrays"],
+            "noCondition": r["noCondition"],
+            "lineEnd": ctx["line_index"].line_of(loop["bodyEnd"]),
+        })
+
+
+def detect_gas_unbounded_storage_array_push(ctx: Dict[str, Any]) -> None:
+    """V2.1 detector-expansion, first block (docs/decisiones.md D-032).
+    A storage array that only ever grows (public/external `.push()`, no
+    visible upper-bound check) is a potential future gas-DoS on whatever
+    later iterates it - a signal about unbounded *growth over many
+    transactions*, distinct from unbounded-loop's single-call iteration
+    concern. Potential signal only: many such arrays are bounded by an
+    orthogonal business rule (e.g. a whitelist capped elsewhere) this
+    heuristic cannot see - hence fpRisk high."""
+    contract, span_start, body = ctx["contract"], ctx["span_start"], ctx["body"]
+    state_types = ctx["state_types"]
+    array_names = [n for n in ctx["state_names"] if "[" in (state_types.get(n) or "")]
+    for name in array_names:
+        pattern = re.compile(r"\b" + re.escape(name) + r"\s*\.\s*push\s*\(")
+        for match in pattern.finditer(body):
+            offset = span_start + match.start()
+            fn = fn_at(ctx, offset)
+            if not fn or fn["visibility"] not in ("public", "external"):
+                continue
+            fbody = fn.get("_body", "")
+            has_cap = bool(re.search(r"\b" + re.escape(name) + r"\s*\.\s*length\b\s*[<>]=?|require\s*\([^;]*\b" + re.escape(name) + r"\.length\b[^;]*\)", fbody))
+            if has_cap:
+                continue
+            scope = locate_scope(contract, offset)
+            ctx["collector"].add("gas-unbounded-storage-array-push.general", offset, ctx["cname"], scope, {"array": name, "function": scope.get("function")})
+
+
 CHECKS = [
     ("hardcoded-address.general", detect_hardcoded_address),
     ("unchecked-block.general", detect_unchecked_block),
@@ -167,4 +217,6 @@ CHECKS = [
     ("division-before-multiplication.general", detect_division_before_multiplication),
     ("unbounded-loop.general", detect_unbounded_loop),
     ("msg-value-in-loop.general", detect_msg_value_in_loop),
+    ("external-call-in-loop.general", detect_external_call_in_loop),
+    ("gas-unbounded-storage-array-push.general", detect_gas_unbounded_storage_array_push),
 ]
