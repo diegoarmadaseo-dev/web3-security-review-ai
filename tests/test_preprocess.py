@@ -861,6 +861,37 @@ class SignalFamilyNegativeControlTests(unittest.TestCase):
         signals = self._signals_for(source)
         self.assertFalse(signals_of({"signals": signals}, "role-granted-to-self-contract"))
 
+    # --- D-042 bugfix: upgradeable-contract-has-selfdestruct duplicate-signal fix ---
+
+    def test_unguarded_selfdestruct_in_upgradeable_contract_fires_exactly_once(self):
+        source = 'contract A is UUPSUpgradeable { function kill() external { selfdestruct(payable(msg.sender)); } }'
+        signals = self._signals_for(source)
+        hits = [s for s in signals if s["family"] == "upgradeable-contract-has-selfdestruct"]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["details"]["baseSignalFamily"], "selfdestruct-unprotected")
+
+    def test_two_distinct_selfdestruct_sites_in_upgradeable_contract_fire_twice(self):
+        source = (
+            "contract A is UUPSUpgradeable {\n"
+            "    function killA() external { selfdestruct(payable(msg.sender)); }\n"
+            "    function killB() external { selfdestruct(payable(msg.sender)); }\n"
+            "}"
+        )
+        signals = self._signals_for(source)
+        hits = [s for s in signals if s["family"] == "upgradeable-contract-has-selfdestruct"]
+        self.assertEqual(len(hits), 2)
+        self.assertEqual(len({h["line"] for h in hits}), 2)
+
+    def test_guarded_selfdestruct_in_upgradeable_contract_fires_once_as_plain_selfdestruct(self):
+        source = (
+            'contract A is UUPSUpgradeable { address owner; modifier onlyOwner() { require(msg.sender == owner); _; }'
+            ' function kill() external onlyOwner { selfdestruct(payable(msg.sender)); } }'
+        )
+        signals = self._signals_for(source)
+        hits = [s for s in signals if s["family"] == "upgradeable-contract-has-selfdestruct"]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["details"]["baseSignalFamily"], "selfdestruct")
+
     def test_disabled_initializers_suppresses_implementation_not_disabled(self):
         source = 'contract A is Initializable { constructor() { _disableInitializers(); } function initialize() public initializer {} }'
         signals = self._signals_for(source)

@@ -835,13 +835,35 @@ def detect_upgradeable_contract_has_selfdestruct(ctx: Dict[str, Any]) -> None:
     that already carries a selfdestruct.general or
     selfdestruct-unprotected.general signal (both reused verbatim, no new
     scan) - worth a second look in quick/standard mode too, where
-    systemGraph is never computed."""
+    systemGraph is never computed.
+
+    Bugfix (docs/decisiones.md D-042): an UNGUARDED selfdestruct site
+    carries BOTH signals at once - selfdestruct-unprotected.general is
+    itself a narrowing of selfdestruct.general's own `guarded` detail (see
+    calls_and_transfers.py's detect_selfdestruct_unprotected), emitted at
+    the same line as a SEPARATE signal, by design, so the original
+    `for hit in hits` loop emitted one upgradeable-contract-has-selfdestruct
+    signal per CONTRIBUTING base family rather than per physical site,
+    double-firing on exactly the unguarded case this check most wants to
+    surface. Fixed by grouping hits by line (the shared anchor both base
+    families use for the same site) and keeping at most one per line -
+    the more specific selfdestruct-unprotected is kept over the plain
+    selfdestruct when both are present, so a genuinely unguarded site is
+    still reported as such; a guarded site (which only ever has the plain
+    selfdestruct signal) is unaffected and still fires once. Two textually
+    distinct selfdestruct sites - different lines - are never collapsed,
+    since each keeps its own dict entry."""
     contract, cname = ctx["contract"], ctx["cname"]
     if cname is None or not any(PROXY_BASE_RE.search(base) for base in contract["bases"]):
         return
     hits = [s for s in ctx["collector"].signals if s["family"] in ("selfdestruct", "selfdestruct-unprotected") and s["contract"] == cname]
+    by_line: Dict[int, Dict[str, Any]] = {}
     for hit in hits:
-        offset = ctx["line_index"].offset_of_line(hit["line"])
+        if hit["line"] not in by_line or hit["family"] == "selfdestruct-unprotected":
+            by_line[hit["line"]] = hit
+    for line in sorted(by_line):
+        hit = by_line[line]
+        offset = ctx["line_index"].offset_of_line(line)
         scope = {"function": hit.get("function"), "modifier": hit.get("modifier"), "kind": None}
         ctx["collector"].add("upgradeable-contract-has-selfdestruct.general", offset, cname, scope, {"baseSignalFamily": hit["family"]})
 
