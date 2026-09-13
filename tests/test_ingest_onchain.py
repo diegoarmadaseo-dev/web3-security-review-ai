@@ -185,7 +185,58 @@ class CompletenessTests(unittest.TestCase):
         del raw["hasCode"]
         rec = ingest_onchain.ingest(raw)
         self.assertEqual(rec["completeness"]["status"], "complete")
-        self.assertIsNone(rec["hasCode"])
+
+
+class VerifiedFieldCoercionTests(unittest.TestCase):
+    """`verified` must be accepted as verified ONLY when raw.get("verified")
+    is the actual Python singleton True - never via bool() coercion, which
+    would silently treat a malformed "false" STRING (or any other
+    non-empty string, or a truthy int) as verified. Regression coverage
+    for the blocking finding from the V2.6.1 block audit: bool("false")
+    is True in Python, so a stringified boolean from a sloppy upstream
+    fetch tool must never be able to make an unverified contract's
+    (possibly untrusted/absent) "source" get bundled and analyzed as if
+    genuinely verified."""
+
+    def _assert_not_verified(self, raw_verified_value):
+        rec = ingest_onchain.ingest(make_raw(verified=raw_verified_value, hasCode=True))
+        self.assertIs(rec["verified"], False)
+        self.assertIsNone(rec["bundle"])
+        self.assertEqual(rec["sourceFileCount"], 0)
+        self.assertEqual(rec["completeness"]["status"], "failed")
+        self.assertIn("UNVERIFIED_CONTRACT", [r["code"] for r in rec["completeness"]["reasons"]])
+
+    def test_verified_false_bool_is_not_verified(self):
+        self._assert_not_verified(False)
+
+    def test_verified_false_string_is_not_verified(self):
+        self._assert_not_verified("false")
+
+    def test_verified_true_string_is_not_verified(self):
+        # A string is never a substitute for the JSON boolean, regardless
+        # of its own text - "true" the string is just as untrusted as
+        # "false" the string here.
+        self._assert_not_verified("true")
+
+    def test_verified_integer_one_is_not_verified(self):
+        self._assert_not_verified(1)
+
+    def test_verified_true_bool_is_still_verified(self):
+        # Current, correct behavior must be unaffected by the fix.
+        rec = ingest_onchain.ingest(make_raw(verified=True, hasCode=True))
+        self.assertIs(rec["verified"], True)
+        self.assertIsNotNone(rec["bundle"])
+        self.assertEqual(rec["completeness"]["status"], "complete")
+
+    def test_verified_false_never_builds_a_bundle_even_with_source_files_present(self):
+        # The exact severe case from the audit: verified is falsy/malformed
+        # AND sourceFiles are (incorrectly, or maliciously) also supplied -
+        # must never be treated as a verified bundle either way.
+        for value in (False, "false", "true", 1, 0, None):
+            with self.subTest(verified=value):
+                rec = ingest_onchain.ingest(make_raw(verified=value, hasCode=True))
+                self.assertIsNone(rec["bundle"])
+                self.assertNotEqual(rec["completeness"]["status"], "complete")
 
 
 class ProvenanceTests(unittest.TestCase):

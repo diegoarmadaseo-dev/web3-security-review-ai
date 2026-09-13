@@ -231,7 +231,12 @@ def ingest(raw: Dict[str, Any]) -> Dict[str, Any]:
     if network_error:
         reasons.append(_reason("UNRECOGNIZED_NETWORK", network_error))
 
-    verified = bool(raw.get("verified"))
+    # Identity check, never bool() coercion (same pattern hasCode already
+    # uses below): bool("false") is True in Python, so a malformed input
+    # that serializes the boolean as a string would otherwise be silently
+    # treated as verified - exactly the direction the hard rule (verified
+    # never implies trust it hasn't earned) must never fail in.
+    verified = raw.get("verified") is True
     has_code = raw.get("hasCode")
     provenance: Dict[str, str] = {"verified": "explorer"}
 
