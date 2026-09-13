@@ -265,6 +265,13 @@ SIGNAL_FIXTURES = {
     "multiple-upgradeable-bases": 'contract A is Initializable, UUPSUpgradeable { }',
     "governance-reference-detected": 'contract A is TimelockController { }',
     "access-control-admin-transfer-no-two-step": 'contract A { function rotateAdmin(address newAdmin, address oldAdmin) external { grantRole(DEFAULT_ADMIN_ROLE, newAdmin); revokeRole(DEFAULT_ADMIN_ROLE, oldAdmin); } }',
+    # --- V2.3, Access Control + Proxy/Upgradeability, third block (docs/decisiones.md D-041) ---
+    "diamond-cut-unprotected": 'contract A { function diamondCut(bytes calldata data) external { data; } }',
+    "auth-modifier-empty-guard": 'contract A { modifier onlyOwner() { _; } function f() external onlyOwner {} }',
+    "role-admin-reassigned-non-default": 'contract A { function reassign() external { _setRoleAdmin(MINTER_ROLE, OPERATOR_ROLE); } }',
+    "disable-initializers-outside-constructor-unprotected": 'contract A is Initializable { function lock() external { _disableInitializers(); } }',
+    "upgradeable-contract-has-selfdestruct": 'contract A is UUPSUpgradeable { function kill() external { selfdestruct(payable(msg.sender)); } }',
+    "role-granted-to-self-contract": 'contract A { function grantSelf() external { grantRole(DEFAULT_ADMIN_ROLE, address(this)); } }',
 }
 
 
@@ -788,6 +795,71 @@ class SignalFamilyNegativeControlTests(unittest.TestCase):
         source = 'contract A { function rotate(address newMinter) external { grantRole(MINTER_ROLE, newMinter); revokeRole(MINTER_ROLE, address(0)); } }'
         signals = self._signals_for(source)
         self.assertFalse(signals_of({"signals": signals}, "access-control-admin-transfer-no-two-step"))
+
+    # --- V2.3, Access Control + Proxy/Upgradeability, third block (docs/decisiones.md D-041) ---
+
+    def test_guarded_diamond_cut_is_not_flagged(self):
+        source = (
+            'contract A { address owner; modifier onlyOwner() { require(msg.sender == owner); _; }'
+            ' function diamondCut(bytes calldata data) external onlyOwner { data; } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "diamond-cut-unprotected"))
+
+    def test_auth_modifier_checking_msg_sender_is_not_flagged_empty_guard(self):
+        source = 'contract A { address owner; modifier onlyOwner() { require(msg.sender == owner); _; } function f() external onlyOwner {} }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "auth-modifier-empty-guard"))
+
+    def test_auth_modifier_delegating_to_internal_check_is_not_flagged_empty_guard(self):
+        # OZ v5's own Ownable pattern: `modifier onlyOwner() { _checkOwner(); _; }` -
+        # a function call is present, so this must not be treated as a no-op guard.
+        source = 'contract A { modifier onlyOwner() { _checkOwner(); _; } function _checkOwner() internal view {} function f() external onlyOwner {} }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "auth-modifier-empty-guard"))
+
+    def test_non_auth_named_modifier_is_never_flagged_empty_guard(self):
+        source = 'contract A { modifier whenNotPaused() { _; } function f() external whenNotPaused {} }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "auth-modifier-empty-guard"))
+
+    def test_role_admin_reassigned_to_default_admin_role_is_not_flagged(self):
+        source = 'contract A { function reassign() external { _setRoleAdmin(MINTER_ROLE, DEFAULT_ADMIN_ROLE); } }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "role-admin-reassigned-non-default"))
+
+    def test_role_admin_reassigned_to_zero_literal_is_not_flagged(self):
+        source = 'contract A { function reassign() external { setRoleAdmin(MINTER_ROLE, 0x00); } }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "role-admin-reassigned-non-default"))
+
+    def test_disable_initializers_in_constructor_is_not_flagged_outside_constructor(self):
+        source = 'contract A is Initializable { constructor() { _disableInitializers(); } }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "disable-initializers-outside-constructor-unprotected"))
+
+    def test_guarded_disable_initializers_outside_constructor_is_not_flagged(self):
+        source = (
+            'contract A is Initializable { address owner; modifier onlyOwner() { require(msg.sender == owner); _; }'
+            ' function lock() external onlyOwner { _disableInitializers(); } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "disable-initializers-outside-constructor-unprotected"))
+
+    def test_non_upgradeable_contract_with_selfdestruct_is_not_flagged(self):
+        source = 'contract A { function kill() external { selfdestruct(payable(msg.sender)); } }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "upgradeable-contract-has-selfdestruct"))
+
+    def test_role_granted_to_self_for_non_admin_role_is_not_flagged(self):
+        source = 'contract A { function grantSelf() external { grantRole(MINTER_ROLE, address(this)); } }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "role-granted-to-self-contract"))
+
+    def test_admin_role_granted_to_other_address_is_not_flagged_self_grant(self):
+        source = 'contract A { function grantOther(address a) external { grantRole(DEFAULT_ADMIN_ROLE, a); } }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "role-granted-to-self-contract"))
 
     def test_disabled_initializers_suppresses_implementation_not_disabled(self):
         source = 'contract A is Initializable { constructor() { _disableInitializers(); } function initialize() public initializer {} }'

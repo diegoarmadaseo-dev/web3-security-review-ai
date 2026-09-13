@@ -64,6 +64,14 @@ GOVERNANCE_REFERENCE_RE = re.compile(r"TimelockController|Governor|GnosisSafe|\b
 ADMIN_ROLE_GRANT_RE = re.compile(r"\bgrantRole\s*\(\s*([^,()]+?)\s*,")
 ADMIN_ROLE_REVOKE_RE_TEMPLATE = r"\b(?:revokeRole|renounceRole)\s*\(\s*{role}\s*,"
 
+# --- V2.3, Access Control + Proxy/Upgradeability, third block (docs/decisiones.md D-041) ---
+DIAMOND_CUT_NAME_RE = re.compile(r"^diamondCut$")
+AUTH_MODIFIER_NAME_RE = re.compile(r"^(only\w+|auth\w*)$", re.I)
+MODIFIER_HAS_ANY_CHECK_RE = re.compile(r"msg\.sender|tx\.origin|\w+\s*\(")
+SET_ROLE_ADMIN_RE = re.compile(r"\b_?setRoleAdmin\s*\(\s*([^,()]+?)\s*,\s*([^,()]+?)\s*\)")
+DEFAULT_ADMIN_ROLE_LITERAL_RE = re.compile(r"^(DEFAULT_ADMIN_ROLE|0x0+|bytes32\s*\(\s*0x?0*\s*\))$")
+ROLE_GRANT_TO_SELF_RE = re.compile(r"\b(?:_setupRole|_grantRole|grantRole)\s*\(\s*([^,()]+?)\s*,\s*(address\s*\(\s*this\s*\)|this)\s*\)")
+
 
 # --- scope-phase checks -----------------------------------------------------
 
@@ -113,9 +121,56 @@ def detect_admin_function_uses_tx_origin_check(ctx: Dict[str, Any]) -> None:
         ctx["collector"].add("admin-function-uses-tx-origin-check.general", offset, cname, scope, {})
 
 
+def detect_role_admin_reassigned_non_default(ctx: Dict[str, Any]) -> None:
+    """V2.3, Access Control + Proxy/Upgradeability, third block
+    (docs/decisiones.md D-041). `_setRoleAdmin(role, newAdminRole)`
+    reassigns which role is allowed to grant/revoke `role` - by default
+    every role (including DEFAULT_ADMIN_ROLE itself) is administered by
+    DEFAULT_ADMIN_ROLE. Reassigning that to anything else delegates
+    grant/revoke power away from the top-level admin role, raising the
+    stakes of whoever holds the new admin role - a structural fact worth
+    surfacing, not an automatic vulnerability (a deliberate multi-tier RBAC
+    hierarchy is a legitimate design), hence fpRisk medium. Skips the
+    common no-op spelling (reassigning to DEFAULT_ADMIN_ROLE itself, or an
+    equivalent zero-literal spelling) to avoid flagging what is really the
+    OZ default restated explicitly."""
+    contract, span_start, body = ctx["contract"], ctx["span_start"], ctx["body"]
+    for match in SET_ROLE_ADMIN_RE.finditer(body):
+        role_expr, new_admin_expr = match.group(1).strip(), match.group(2).strip()
+        if DEFAULT_ADMIN_ROLE_LITERAL_RE.match(new_admin_expr):
+            continue
+        offset = span_start + match.start()
+        scope = locate_scope(contract, offset)
+        ctx["collector"].add("role-admin-reassigned-non-default.general", offset, ctx["cname"], scope, {"role": role_expr, "newAdminRole": new_admin_expr})
+
+
+def detect_role_granted_to_self_contract(ctx: Dict[str, Any]) -> None:
+    """V2.3, Access Control + Proxy/Upgradeability, third block
+    (docs/decisiones.md D-041). A role-granting call whose account argument
+    is the contract's own address (`address(this)`/`this`) means the
+    CONTRACT is now a holder of that role - if it can also be told to make
+    arbitrary calls or delegatecalls elsewhere, this can become a
+    self-service privilege-escalation path a plain address-holder review
+    would miss. Restricted to ADMIN-named roles (same substring gate as
+    access-control-admin-transfer-no-two-step.general) to stay narrow -
+    routine operational roles (e.g. a contract registering itself as its
+    own MINTER_ROLE for an internal mint-and-distribute step) are common
+    and not the target here."""
+    contract, span_start, body = ctx["contract"], ctx["span_start"], ctx["body"]
+    for match in ROLE_GRANT_TO_SELF_RE.finditer(body):
+        role_expr = match.group(1).strip()
+        if not re.search(r"ADMIN", role_expr, re.I):
+            continue
+        offset = span_start + match.start()
+        scope = locate_scope(contract, offset)
+        ctx["collector"].add("role-granted-to-self-contract.general", offset, ctx["cname"], scope, {"role": role_expr})
+
+
 CHECKS = [
     ("hardcoded-role-holder.general", detect_hardcoded_role_holder),
     ("admin-function-uses-tx-origin-check.general", detect_admin_function_uses_tx_origin_check),
+    ("role-admin-reassigned-non-default.general", detect_role_admin_reassigned_non_default),
+    ("role-granted-to-self-contract.general", detect_role_granted_to_self_contract),
 ]
 
 
@@ -301,6 +356,48 @@ def detect_access_control_admin_transfer_no_two_step(fctx: Dict[str, Any]) -> No
     if not revoke_re.search(body):
         return
     fctx["collector"].add("access-control-admin-transfer-no-two-step.general", fn["_headStart"], cname, scope, {"role": role_expr})
+
+
+def detect_diamond_cut_unprotected(fctx: Dict[str, Any]) -> None:
+    """V2.3, Access Control + Proxy/Upgradeability, third block
+    (docs/decisiones.md D-041). EIP-2535 Diamond pattern: `diamondCut`
+    (add/replace/remove facets) controls the entire contract's logic - the
+    same blast radius as an UUPS/Transparent upgrade entry point, but not
+    covered by UPGRADE_FUNCTION_RE (a distinct, EIP-mandated exact name,
+    not related to that family's proxy-shaped names). Same structure as
+    detect_upgrade_function_unprotected: evaluate this function's own
+    already-computed `fn`/`access` directly. fpRisk low - this exact name
+    is essentially only ever used for the EIP-2535 entry point."""
+    fn, access, scope, cname = fctx["fn"], fctx["access"], fctx["scope"], fctx["cname"]
+    name = fn["name"] or ""
+    if not DIAMOND_CUT_NAME_RE.match(name):
+        return
+    if access["guarded"]:
+        return
+    fctx["collector"].add("diamond-cut-unprotected.general", fn["_headStart"], cname, scope, {"name": name})
+
+
+def detect_disable_initializers_outside_constructor_unprotected(fctx: Dict[str, Any]) -> None:
+    """V2.3, Access Control + Proxy/Upgradeability, third block
+    (docs/decisiones.md D-041). `_disableInitializers()` is meant to be
+    called once, at deployment, from the constructor - the standard
+    pattern implementation-not-disabled.general already checks for. A
+    public/external function OTHER than the constructor that also contains
+    this call and carries no guard lets anyone permanently lock the
+    contract out of ever being initialized/re-initialized (a griefing
+    surface on a not-yet-initialized proxy, or a DoS on a future
+    upgrade path that expects a fresh reinitializer to run). Restricted to
+    public/external functions (like admin-function-unprotected.general) so
+    an internal helper only reachable from an already-guarded caller
+    elsewhere in the same contract is not flagged in isolation."""
+    fn, access, scope, cname = fctx["fn"], fctx["access"], fctx["scope"], fctx["cname"]
+    if fn["kind"] == "constructor" or fn["visibility"] not in ("public", "external"):
+        return
+    if "_disableInitializers" not in fn.get("_body", ""):
+        return
+    if access["guarded"]:
+        return
+    fctx["collector"].add("disable-initializers-outside-constructor-unprotected.general", fn["_headStart"], cname, scope, {"name": fn["name"] or fn["kind"], "visibility": fn["visibility"]})
 
 
 # --- contract-phase checks --------------------------------------------------
@@ -695,6 +792,60 @@ def detect_governance_reference(ctx: Dict[str, Any]) -> None:
     ctx["collector"].add("governance-reference-detected.general", contract["_start"], cname, {"function": None, "modifier": None, "kind": None}, {"references": sorted(matches)})
 
 
+def detect_auth_modifier_empty_guard(ctx: Dict[str, Any]) -> None:
+    """V2.3, Access Control + Proxy/Upgradeability, third block
+    (docs/decisiones.md D-041). An access-control-named modifier
+    (`only*`/`auth*`) whose body contains neither `msg.sender`/`tx.origin`
+    NOR any function call at all before its `_;` placeholder is a no-op
+    guard - it compiles and runs but enforces nothing. Deliberately
+    excludes OpenZeppelin v5's own delegation pattern
+    (`modifier onlyOwner() { _checkOwner(); _; }`), which contains a
+    function call and therefore does not match "no function call at all" -
+    this is what keeps fpRisk low despite the very common `only*` naming
+    convention. Reuses the same `contract["modifiers"]` `_start`/`_end`
+    span slicing external-call-in-modifier.general already relies on;
+    isolates the actual body (after the first `{`) so the modifier's own
+    name+params (e.g. `onlyOwner(` itself) can never self-match the
+    function-call shape being searched for."""
+    contract, cname, masked = ctx["contract"], ctx["cname"], ctx["masked"]
+    if cname is None:
+        return
+    for mod in contract["modifiers"]:
+        if not AUTH_MODIFIER_NAME_RE.match(mod["name"]):
+            continue
+        span = masked[mod["_start"]:mod["_end"]]
+        brace_idx = span.find("{")
+        if brace_idx == -1:
+            continue
+        body = span[brace_idx + 1:]
+        if MODIFIER_HAS_ANY_CHECK_RE.search(body):
+            continue
+        ctx["collector"].add("auth-modifier-empty-guard.general", mod["_start"], cname, {"function": None, "modifier": mod["name"], "kind": None}, {"modifier": mod["name"]})
+
+
+def detect_upgradeable_contract_has_selfdestruct(ctx: Dict[str, Any]) -> None:
+    """V2.3, Access Control + Proxy/Upgradeability, third block
+    (docs/decisiones.md D-041). Single-file, all-modes complement to
+    preprocess.py's cross-contract, pro-only
+    implementation-selfdestruct-reachable.general: that one needs a
+    systemGraph-resolved proxy pairing to confirm a real proxy delegates to
+    this exact contract; this one fires on the cheaper, always-available
+    structural fact alone - an upgradeable-indicated contract (same
+    PROXY_BASE_RE gate as storage-gap-missing/implementation-not-disabled)
+    that already carries a selfdestruct.general or
+    selfdestruct-unprotected.general signal (both reused verbatim, no new
+    scan) - worth a second look in quick/standard mode too, where
+    systemGraph is never computed."""
+    contract, cname = ctx["contract"], ctx["cname"]
+    if cname is None or not any(PROXY_BASE_RE.search(base) for base in contract["bases"]):
+        return
+    hits = [s for s in ctx["collector"].signals if s["family"] in ("selfdestruct", "selfdestruct-unprotected") and s["contract"] == cname]
+    for hit in hits:
+        offset = ctx["line_index"].offset_of_line(hit["line"])
+        scope = {"function": hit.get("function"), "modifier": hit.get("modifier"), "kind": None}
+        ctx["collector"].add("upgradeable-contract-has-selfdestruct.general", offset, cname, scope, {"baseSignalFamily": hit["family"]})
+
+
 FUNCTION_CHECKS = [
     ("initializer-unprotected.general", detect_initializer_unprotected),
     ("zero-address-unchecked.general", detect_zero_address_unchecked),
@@ -705,6 +856,8 @@ FUNCTION_CHECKS = [
     ("mismatched-array-length.general", detect_mismatched_array_length),
     ("upgrade-function-unprotected.general", detect_upgrade_function_unprotected),
     ("access-control-admin-transfer-no-two-step.general", detect_access_control_admin_transfer_no_two_step),
+    ("diamond-cut-unprotected.general", detect_diamond_cut_unprotected),
+    ("disable-initializers-outside-constructor-unprotected.general", detect_disable_initializers_outside_constructor_unprotected),
 ]
 
 CONTRACT_CHECKS = [
@@ -722,4 +875,6 @@ CONTRACT_CHECKS = [
     ("constructor-sets-state-in-upgradeable.general", detect_constructor_sets_state_in_upgradeable),
     ("multiple-upgradeable-bases.general", detect_multiple_upgradeable_bases),
     ("governance-reference-detected.general", detect_governance_reference),
+    ("auth-modifier-empty-guard.general", detect_auth_modifier_empty_guard),
+    ("upgradeable-contract-has-selfdestruct.general", detect_upgradeable_contract_has_selfdestruct),
 ]

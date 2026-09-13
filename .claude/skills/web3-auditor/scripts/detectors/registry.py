@@ -105,6 +105,13 @@ CHECK_METADATA: Dict[str, Dict[str, Any]] = {
     # Cross-contract, pro-only (need systemGraph) - see CROSS_CONTRACT_CHECKS below.
     "shared-implementation-fan-out.general": {"family": "shared-implementation-fan-out", "categories": ["SC10"], "needsContext": True, "fpRisk": "low", "groupHint": None},
     "implementation-selfdestruct-reachable.general": {"family": "implementation-selfdestruct-reachable", "categories": ["SC10", "SC06"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
+    # --- V2.3, Access Control + Proxy/Upgradeability, third block (docs/decisiones.md D-041) ---
+    "diamond-cut-unprotected.general": {"family": "diamond-cut-unprotected", "categories": ["SC10", "SC01"], "needsContext": True, "fpRisk": "low", "groupHint": None},
+    "auth-modifier-empty-guard.general": {"family": "auth-modifier-empty-guard", "categories": ["SC01"], "needsContext": True, "fpRisk": "low", "groupHint": None},
+    "role-admin-reassigned-non-default.general": {"family": "role-admin-reassigned-non-default", "categories": ["SC01"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
+    "disable-initializers-outside-constructor-unprotected.general": {"family": "disable-initializers-outside-constructor-unprotected", "categories": ["SC10"], "needsContext": True, "fpRisk": "low", "groupHint": None},
+    "upgradeable-contract-has-selfdestruct.general": {"family": "upgradeable-contract-has-selfdestruct", "categories": ["SC10", "SC01"], "needsContext": True, "fpRisk": "low", "groupHint": None},
+    "role-granted-to-self-contract.general": {"family": "role-granted-to-self-contract", "categories": ["SC01"], "needsContext": True, "fpRisk": "low", "groupHint": None},
 }
 
 # checkIds computed cross-contract, outside the per-file phase lists below (need
