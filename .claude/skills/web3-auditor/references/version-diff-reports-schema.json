@@ -1,0 +1,66 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "web3-security-review-ai/version-diff-reports-schema.json",
+  "title": "Version Comparison / Security Diff - 'reports' mode output",
+  "description": "Reference shape for scripts/diff_reports.py's `reports` mode: a findings-level diff between two ALREADY-PRODUCED, post-analysis report JSONs (see report-schema.json) that the user/workflow has explicitly declared to be V1 (baseline) and V2 (current) of the same system - diff_reports.py never infers that relationship itself. Like report-schema.json, this document is the authoritative human/AI-facing reference; it is not executed by a JSON Schema library at runtime (scripts/diff_reports.py is a hand-written, standard-library-only script; see docs/decisiones.md D-054). newFindings/resolvedFindings items are full finding objects using report-schema.json's own #/definitions/finding shape (id/stableKey/category/severity/confidence/status/locations/evidence/description/recommendation/patch/signature) - not redefined here to avoid two copies drifting apart.",
+  "type": "object",
+  "required": ["diffVersion", "mode", "v1Meta", "v2Meta", "sameInput", "newFindings", "resolvedFindings", "modifiedFindings", "categoryCoverageDelta", "note"],
+  "additionalProperties": false,
+  "properties": {
+    "diffVersion": { "type": "string", "description": "Version of this script's diff logic/output shape." },
+    "mode": { "const": "reports" },
+    "v1Meta": { "$ref": "#/definitions/runMeta" },
+    "v2Meta": { "$ref": "#/definitions/runMeta" },
+    "sameInput": { "type": "boolean", "description": "True only when both sides carry the same non-null inputHash - a cheap, exact signal that the analyzed source did not change at all between the two runs. False does not by itself mean anything changed in a way that matters; it only means the two inputHash values differ or are unavailable." },
+    "note": { "type": "string", "description": "Fixed English sentence (never authored per-diff): new/resolved/modified describe STRUCTURAL differences between two runs, never security conclusions by themselves. See rule R-D1." },
+    "newFindings": { "type": "array", "description": "V2 findings with no matching V1 finding, by neither stableKey nor the secondary key (rule R-D2).", "items": { "type": "object" } },
+    "resolvedFindings": { "type": "array", "description": "V1 findings with no matching V2 finding. Does NOT by itself mean the underlying issue was fixed - it may have moved, been refactored around, or simply not been re-surfaced this run (see 'note').", "items": { "type": "object" } },
+    "modifiedFindings": {
+      "type": "array",
+      "description": "Pairs matched across V1/V2 whose structural fields differ. Sorted by (stableKeyV1, stableKeyV2).",
+      "items": {
+        "type": "object",
+        "required": ["matchedBy", "stableKeyV1", "stableKeyV2", "changedFields", "v1", "v2"],
+        "additionalProperties": false,
+        "properties": {
+          "matchedBy": { "enum": ["stableKey", "secondary"], "description": "'stableKey': category+primary-location+signature all identical (score.py's own compute_stable_key, recomputed here - never trusted from the input). 'secondary': category+file+contract+function identical but signature differs (rule R-D2) - the only case where a pair is matched despite score.py's own stableKey disagreeing." },
+          "stableKeyV1": { "type": "string" },
+          "stableKeyV2": { "type": "string" },
+          "changedFields": { "type": "array", "items": { "enum": ["severity", "confidence", "status", "locations", "signature"] }, "description": "Which structural fields differ. 'signature' is always present for matchedBy='secondary' (by construction: it is the only stableKey input left free to differ once category+location match) and never present for matchedBy='stableKey' (by construction: an identical stableKey requires an identical signature)." },
+          "v1": { "type": "object", "description": "The full V1 finding object, report-schema.json #/definitions/finding shape." },
+          "v2": { "type": "object", "description": "The full V2 finding object, report-schema.json #/definitions/finding shape." }
+        }
+      }
+    },
+    "categoryCoverageDelta": {
+      "type": "array",
+      "description": "Only categories whose categoryCoverage[].status actually changed between V1 and V2.",
+      "items": {
+        "type": "object",
+        "required": ["category", "from", "to"],
+        "additionalProperties": false,
+        "properties": {
+          "category": { "enum": ["SC01", "SC02", "SC03", "SC04", "SC05", "SC06", "SC07", "SC08", "SC09", "SC10"] },
+          "from": { "enum": ["DETECTED", "NOT_DETECTED", "NOT_ASSESSED", null] },
+          "to": { "enum": ["DETECTED", "NOT_DETECTED", "NOT_ASSESSED", null] }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "runMeta": {
+      "type": "object",
+      "required": ["inputHash", "mode"],
+      "additionalProperties": false,
+      "properties": {
+        "inputHash": { "type": ["string", "null"], "description": "Carried over verbatim from the input report's own inputHash." },
+        "mode": { "type": ["string", "null"], "enum": ["quick", "standard", "pro", null], "description": "Carried over verbatim from the input report's own mode. V1 and V2 analyzed in different modes is not itself an error, but makes some fields (e.g. categoryCoverage entries gated by mode-specific features) less directly comparable." }
+      }
+    }
+  },
+  "businessRules": [
+    "R-D1: new/resolved/modified are structural facts about two runs' output, never a security conclusion on their own - confirming a real fix, a real regression, or a relocated (not fixed) issue requires reviewing the underlying source (SKILL.md Step 6), same principle as riskIndicator.explanation in report-schema.json.",
+    "R-D2: a V1/V2 finding pair is matched either by an exact stableKey (score.py's own category+primary-location+signature hash, recomputed here and never trusted from the input) or, failing that, by a secondary key of category+file+contract+function - but ONLY when exactly one unmatched finding on each side shares that secondary key. A secondary key shared by zero, two or more findings on either side is never paired - diff_reports.py never guesses a finding correspondence.",
+    "R-D3: this script never modifies score.py, validate_report.py, preprocess.py or the detectors registry, and never re-derives its own copy of stableKey's hash - identity always comes from score.py's compute_stable_key, imported as-is."
+  ]
+}

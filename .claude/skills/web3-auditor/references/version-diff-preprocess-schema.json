@@ -1,0 +1,151 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "web3-security-review-ai/version-diff-preprocess-schema.json",
+  "title": "Version Comparison / Security Diff - 'preprocess' mode output",
+  "description": "Reference shape for scripts/diff_reports.py's `preprocess` mode: a purely structural diff between two raw preprocess.py JSON outputs (Step 3 only - no AI-authored findings involved at all), for a V1/V2 pair the user/workflow has explicitly declared - diff_reports.py never infers that relationship itself. Like report-schema.json, this document is the authoritative human/AI-facing reference; it is not executed by a JSON Schema library at runtime (see docs/decisiones.md D-054).",
+  "type": "object",
+  "required": ["diffVersion", "mode", "v1Meta", "v2Meta", "sameInput", "contractsAdded", "contractsRemoved", "contractsMatched", "functionSurfaceDelta", "systemGraphDelta", "note", "modifierScopeNote", "renameNote"],
+  "additionalProperties": false,
+  "properties": {
+    "diffVersion": { "type": "string" },
+    "mode": { "const": "preprocess" },
+    "v1Meta": { "$ref": "version-diff-reports-schema.json#/definitions/runMeta" },
+    "v2Meta": { "$ref": "version-diff-reports-schema.json#/definitions/runMeta" },
+    "sameInput": { "type": "boolean", "description": "True only when both sides carry the same non-null inputHash." },
+    "note": { "type": "string", "description": "Fixed English sentence: structural facts, never a security conclusion by themselves (rule R-D1)." },
+    "modifierScopeNote": { "type": "string", "description": "Fixed English sentence: modifier/permission changes here cover only NAMED modifiers on a function's own declaration - inline body-level checks (a bare require(...) with no modifier) are not present in preprocess.py's public JSON and are invisible to this diff (rule R-D4)." },
+    "renameNote": { "type": "string", "description": "Fixed English sentence: contract identity is file+name; a rename/move is always one removal plus one addition, never inferred (rule R-D5)." },
+    "contractsAdded": { "type": "array", "items": { "type": "string" }, "description": "Contract `key` (systemGraph's own \"file#Name\") values present only in V2." },
+    "contractsRemoved": { "type": "array", "items": { "type": "string" }, "description": "Contract `key` values present only in V1." },
+    "contractsMatched": { "type": "array", "items": { "type": "string" }, "description": "Contract `key` values present on both sides - the only contracts functionSurfaceDelta reports on." },
+    "functionSurfaceDelta": {
+      "type": "object",
+      "description": "Keyed by matched contract `key`. Only matched contracts are reported - an added/removed contract's own functions are implicitly all-added/all-removed and are not individually enumerated a second time.",
+      "additionalProperties": { "$ref": "#/definitions/contractSurfaceDelta" }
+    },
+    "systemGraphDelta": { "$ref": "#/definitions/systemGraphDelta" }
+  },
+  "definitions": {
+    "functionIdentity": {
+      "type": "string",
+      "description": "\"kind:name(canonicalType1,canonicalType2,...)\" - a local, independent re-derivation of preprocess.py's own selector-clash canonical signature, generalized to every visibility (so internal/private functions, which have no ABI selector, still get a stable identity - rule R-D... see decisiones.md D-054 decision 4). Never present when any parameter type cannot be canonicalized with confidence (a struct/enum/contract type) - such a function is unresolved instead (see unresolvedFunctionsV1/V2), never guessed."
+    },
+    "contractSurfaceDelta": {
+      "type": "object",
+      "required": ["functionsAdded", "functionsRemoved", "functionsChanged", "unresolvedFunctionsV1", "unresolvedFunctionsV2", "stateVariablesAdded", "stateVariablesRemoved", "stateVariablesChanged"],
+      "additionalProperties": false,
+      "properties": {
+        "functionsAdded": { "type": "array", "items": { "$ref": "#/definitions/functionIdentity" } },
+        "functionsRemoved": { "type": "array", "items": { "$ref": "#/definitions/functionIdentity" } },
+        "functionsChanged": {
+          "type": "array",
+          "description": "Functions matched by identity on both sides whose visibility, mutability, virtual, override, or applied-modifier-name set differs.",
+          "items": {
+            "type": "object",
+            "required": ["identity", "changes"],
+            "additionalProperties": false,
+            "properties": {
+              "identity": { "$ref": "#/definitions/functionIdentity" },
+              "changes": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "visibility": { "$ref": "#/definitions/fromTo" },
+                  "mutability": { "$ref": "#/definitions/fromTo" },
+                  "virtual": { "$ref": "#/definitions/fromTo" },
+                  "override": { "$ref": "#/definitions/fromTo" },
+                  "modifiersAdded": { "type": "array", "items": { "type": "string" } },
+                  "modifiersRemoved": { "type": "array", "items": { "type": "string" } }
+                }
+              }
+            }
+          }
+        },
+        "unresolvedFunctionsV1": { "type": "array", "items": { "$ref": "#/definitions/unresolvedFunction" } },
+        "unresolvedFunctionsV2": { "type": "array", "items": { "$ref": "#/definitions/unresolvedFunction" } },
+        "stateVariablesAdded": { "type": "array", "items": { "type": "string" } },
+        "stateVariablesRemoved": { "type": "array", "items": { "type": "string" } },
+        "stateVariablesChanged": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "changes"],
+            "additionalProperties": false,
+            "properties": {
+              "name": { "type": "string" },
+              "changes": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "type": { "$ref": "#/definitions/fromTo" },
+                  "visibility": { "$ref": "#/definitions/fromTo" },
+                  "constant": { "$ref": "#/definitions/fromTo" },
+                  "immutable": { "$ref": "#/definitions/fromTo" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "unresolvedFunction": {
+      "type": "object",
+      "required": ["name", "kind", "lineStart", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": ["string", "null"] },
+        "kind": { "type": ["string", "null"] },
+        "lineStart": { "type": ["integer", "null"] },
+        "reason": { "type": "string" }
+      }
+    },
+    "fromTo": {
+      "type": "object",
+      "required": ["from", "to"],
+      "additionalProperties": false,
+      "properties": { "from": {}, "to": {} }
+    },
+    "systemGraphDelta": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["status", "message"],
+          "additionalProperties": false,
+          "properties": { "status": { "const": "not_computed" }, "message": { "type": "string" } }
+        },
+        {
+          "type": "object",
+          "required": ["status", "nodesAdded", "nodesRemoved", "edgesAdded", "edgesRemoved", "proxiesChanged"],
+          "additionalProperties": false,
+          "properties": {
+            "status": { "const": "computed" },
+            "nodesAdded": { "type": "array", "items": { "type": "string" } },
+            "nodesRemoved": { "type": "array", "items": { "type": "string" } },
+            "edgesAdded": { "type": "array", "items": { "type": "object" }, "description": "Full systemGraph edge objects ({kind, from, to, function?, method?}), present in V2's graph but not V1's, by exact (kind, from, to, function, method) identity - never a fuzzy match." },
+            "edgesRemoved": { "type": "array", "items": { "type": "object" } },
+            "proxiesChanged": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["proxy", "from", "to"],
+                "additionalProperties": false,
+                "properties": {
+                  "proxy": { "type": "string" },
+                  "from": { "type": "object", "required": ["implementation", "status"], "properties": { "implementation": { "type": ["string", "null"] }, "status": { "type": "string" } } },
+                  "to": { "type": "object", "required": ["implementation", "status"], "properties": { "implementation": { "type": ["string", "null"] }, "status": { "type": "string" } } }
+                }
+              }
+            }
+          }
+        }
+      ],
+      "description": "'not_computed' whenever EITHER side's own systemGraph.status is not 'computed' (i.e. either run was not 'pro' mode / config/modes.json allowSystemGraph - the SAME existing gate, reused as-is, never duplicated - rule R-D6)."
+    }
+  },
+  "businessRules": [
+    "R-D1: structural facts, never a security conclusion by themselves (see version-diff-reports-schema.json R-D1).",
+    "R-D4: modifier/permission changes here are limited to NAMED modifiers (fn.modifiers) because that is all preprocess.py's public JSON (to_public, which strips every underscore-prefixed field including the raw function body) retains; inline require()-shaped guards are not visible to this mode.",
+    "R-D5: contract identity is exactly systemGraph's own node key (file#name). A rename or file move is reported as one entry in contractsRemoved plus one in contractsAdded - never a single 'renamed' entry - matching the same 'never invent a relationship the data does not state' principle applied to the V1/V2 pairing itself.",
+    "R-D6: systemGraphDelta reuses systemGraph.status exactly as preprocess.py already computed it; this script adds no new mode-gating logic and no new config/modes.json flag."
+  ]
+}
