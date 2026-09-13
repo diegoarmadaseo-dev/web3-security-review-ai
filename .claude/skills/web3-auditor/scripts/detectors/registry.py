@@ -87,7 +87,24 @@ CHECK_METADATA: Dict[str, Dict[str, Any]] = {
     "signature-domain-separator-missing.general": {"family": "signature-domain-separator-missing", "categories": ["EXTRA-replay-permit"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
     "chained-division-precision-loss.general": {"family": "chained-division-precision-loss", "categories": ["SC07"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
     "low-level-call-return-data-unbounded-decode.general": {"family": "low-level-call-return-data-unbounded-decode", "categories": ["SC06"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
+    # --- V2.3, Access Control + Proxy/Upgradeability, first block (docs/decisiones.md D-038) ---
+    "eip1967-slot-specific.general": {"family": "eip1967-slot-specific", "categories": ["SC10"], "needsContext": True, "fpRisk": "low", "groupHint": None},
+    "naive-proxy-storage-collision.general": {"family": "naive-proxy-storage-collision", "categories": ["SC10"], "needsContext": True, "fpRisk": "high", "groupHint": None},
+    "initializer-reinitializer-inconsistency.general": {"family": "initializer-reinitializer-inconsistency", "categories": ["SC10", "SC01"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
+    # Cross-contract (needs systemGraph's resolved proxy pairing); emitted directly by
+    # preprocess.py's compute_selector_clash_signals(), not via any phase list below -
+    # see CROSS_CONTRACT_CHECKS and _verify_registry().
+    "selector-clash.proxy-implementation.general": {"family": "selector-clash", "categories": ["SC10", "SC01"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
 }
+
+# checkIds computed cross-contract, outside the per-file phase lists below (currently
+# only the proxy/implementation selector-clash check, which needs systemGraph's resolved
+# proxy pairing - see preprocess.py's compute_selector_clash_signals()). Exempted from
+# _verify_registry()'s "must appear in a phase list" requirement, but still required to
+# have CHECK_METADATA, so a typo here still fails loudly.
+CROSS_CONTRACT_CHECKS: List[str] = [
+    "selector-clash.proxy-implementation.general",
+]
 
 # Phase order matters (see module docstring). Do not alphabetize or reorder
 # without re-running the before/after preprocess.py regression diff.
@@ -113,6 +130,7 @@ def _verify_registry() -> None:
     resolve. Run at import time (cheap, ~32 entries) so a typo fails loudly
     at startup instead of silently dropping a check's metadata at runtime."""
     all_check_ids = {cid for cid, _fn in FILE_CHECKS + SCOPE_CHECKS + FUNCTION_CHECKS + CONTRACT_CHECKS}
+    all_check_ids |= set(CROSS_CONTRACT_CHECKS)
     missing = all_check_ids - set(CHECK_METADATA)
     if missing:
         raise RuntimeError("detectors.registry: check(s) with no CHECK_METADATA entry: %s" % sorted(missing))

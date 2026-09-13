@@ -29,6 +29,7 @@ if SCRIPT_DIR not in sys.path:
 
 from text_utils import LineIndex, collapse_ws, matching_paren, split_top_level, truncate, version_tuple, VERSION_RE, ELEMENTARY_TYPES  # noqa: E402
 import detectors.orchestrator as _detectors_orchestrator  # noqa: E402
+import detectors.registry as _detectors_registry  # noqa: E402
 
 PREPROCESS_VERSION = "1.0.0"
 SIGNAL_REGISTRY_VERSION = "2026.1"
@@ -1605,6 +1606,124 @@ def compute_system_graph(
 
 
 # ---------------------------------------------------------------------------
+# Cross-contract signals (V2.3, docs/decisiones.md D-038): checks that need
+# more than one contract's own data, so they cannot live in the per-file
+# detectors/ registry. Currently just the proxy/implementation selector
+# clash, computed from systemGraph's already-resolved proxy pairing (never
+# re-derives or extends it - "unresolved" proxies are simply skipped, no
+# guessed pairing) plus contracts_out's already-parsed function lists. Still
+# emits into the same signals[] list, in the same shape SignalCollector.add()
+# produces (family/checkId/categories/needsContext/fpRisk/file/line/column/
+# contract/function/modifier/snippet/details) - signal, not finding, same as
+# every other check.
+# ---------------------------------------------------------------------------
+
+_SELECTOR_ALIASES = {"uint": "uint256", "int": "int256", "fixed": "fixed128x18", "ufixed": "ufixed128x18"}
+_ARRAY_SUFFIX_RE = re.compile(r"^(.*?)((?:\s*\[\s*\d*\s*\])+)$")
+
+
+def _canonical_param_type(raw_type: Optional[str]) -> Optional[str]:
+    """Best-effort canonical ABI type name for one parameter, or None if it
+    cannot be canonicalized with confidence (a struct, enum, contract/
+    interface type, or anything else ELEMENTARY_TYPES does not recognize) -
+    callers must treat None as "skip this function", never guess. Handles
+    only what's needed to compare two elementary-typed signatures for
+    equality: array-suffix preserved as-is, `payable`/whitespace stripped,
+    uint/int/fixed/ufixed aliases expanded to their canonical width."""
+    text = (raw_type or "").strip()
+    if not text:
+        return None
+    match = _ARRAY_SUFFIX_RE.match(text)
+    base, suffix = (match.group(1).strip(), re.sub(r"\s+", "", match.group(2))) if match else (text, "")
+    base = re.sub(r"\bpayable\b", "", base)
+    base = re.sub(r"\s+", "", base)
+    base = _SELECTOR_ALIASES.get(base, base)
+    if not ELEMENTARY_TYPES.match(base):
+        return None
+    return base + suffix
+
+
+def _canonical_signature(fn: Dict[str, Any]) -> Optional[str]:
+    parts = []
+    for param in fn.get("params", []):
+        canonical = _canonical_param_type(param.get("type"))
+        if canonical is None:
+            return None
+        parts.append(canonical)
+    return "%s(%s)" % (fn["name"], ",".join(parts))
+
+
+def _external_function_signatures(contract: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Explicit external/public functions, keyed by best-effort canonical
+    signature, PLUS the implicit getter Solidity auto-generates for every
+    `public` state variable (name() for a simple elementary-typed one - the
+    only shape kept; `public` mappings/arrays generate a getter that takes
+    the key/index as an argument, which this does not attempt to derive, so
+    those are skipped rather than guessed). Both are collapsed into one
+    small, uniform {"name", "lineStart", "signatureText"} shape so callers
+    don't need to know which kind matched."""
+    signatures: Dict[str, Dict[str, Any]] = {}
+    for fn in contract.get("functions", []):
+        if fn.get("kind") != "function" or not fn.get("name") or fn.get("visibility") not in ("public", "external"):
+            continue
+        signature = _canonical_signature(fn)
+        if signature is not None:
+            signatures.setdefault(signature, {"name": fn["name"], "lineStart": fn.get("lineStart"), "signatureText": fn.get("signatureText", "")})
+    for var in contract.get("stateVariables", []):
+        if var.get("visibility") != "public" or var.get("userType") is not None:
+            continue
+        raw_type = (var.get("type") or "").strip()
+        if raw_type.startswith("mapping") or raw_type.endswith("]"):
+            continue
+        if _canonical_param_type(raw_type) is None:
+            continue
+        signatures.setdefault("%s()" % var["name"], {"name": var["name"], "lineStart": var.get("line"), "signatureText": "%s public %s" % (raw_type, var["name"])})
+    return signatures
+
+
+def compute_selector_clash_signals(contracts_out: List[Dict[str, Any]], system_graph: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if system_graph.get("status") != "computed":
+        return []
+    meta = _detectors_registry.CHECK_METADATA["selector-clash.proxy-implementation.general"]
+    contracts_by_key = {c["key"]: c for c in contracts_out if c.get("key")}
+    signals: List[Dict[str, Any]] = []
+    for entry in system_graph.get("proxies", []):
+        if entry.get("status") != "resolved" or not entry.get("implementation"):
+            continue
+        proxy = contracts_by_key.get(entry["proxy"])
+        impl = contracts_by_key.get(entry["implementation"])
+        if not proxy or not impl:
+            continue
+        impl_signatures = _external_function_signatures(impl)
+        for signature, proxy_fn in _external_function_signatures(proxy).items():
+            impl_fn = impl_signatures.get(signature)
+            if impl_fn is None:
+                continue
+            signals.append({
+                "family": meta["family"],
+                "checkId": "selector-clash.proxy-implementation.general",
+                "categories": list(meta["categories"]),
+                "needsContext": meta["needsContext"],
+                "fpRisk": meta["fpRisk"],
+                "file": proxy["file"],
+                "line": proxy_fn.get("lineStart"),
+                "column": 0,
+                "contract": proxy["name"],
+                "function": proxy_fn.get("name"),
+                "modifier": None,
+                "snippet": proxy_fn.get("signatureText", ""),
+                "details": {
+                    "signature": signature,
+                    "proxyKey": proxy["key"],
+                    "implementationKey": impl["key"],
+                    "implementationLine": impl_fn.get("lineStart"),
+                },
+            })
+    signals.sort(key=lambda s: (s["file"], s["line"] or 0, s["contract"] or "", s["function"] or ""))
+    return signals
+
+
+# ---------------------------------------------------------------------------
 # Artifact assembly
 # ---------------------------------------------------------------------------
 
@@ -1716,6 +1835,10 @@ def build_artifact(
     priority_ranking = compute_priority_ranking(processed, signals_by_file)
     completeness = compute_completeness(processed, import_records, base_records, mode, limits, priority_ranking)
     system_graph = compute_system_graph(contracts_out, all_calls, all_signals, allow_system_graph)
+    cross_contract_signals = compute_selector_clash_signals(contracts_out, system_graph)
+    if cross_contract_signals:
+        all_signals.extend(cross_contract_signals)
+        all_signals.sort(key=lambda s: (s["file"], s["line"], s["column"], s["family"]))
 
     totals = {
         "sourceFiles": sum(1 for e in processed if e["kind"] == "source"),

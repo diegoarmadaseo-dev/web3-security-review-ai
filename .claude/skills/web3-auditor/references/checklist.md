@@ -97,14 +97,23 @@ strong corroborating evidence exists.
 | `signature-domain-separator-missing` | EXTRA-replay-permit | yes | medium | A contract using `ecrecover`/ECDSA-shaped signature verification with no EIP-712 domain-separator construction anywhere in the contract, including its inherited base list. | The contract inherits an EIP712/Permit-shaped base (e.g. OpenZeppelin's `ERC20Permit`) - the standard way to get a domain separator, checked directly against `bases` since that text never appears in the contract's own body. |
 | `chained-division-precision-loss` | SC07 | yes | medium | Two divisions in the same statement with no multiplication between them (`a / b / c`), a distinct root cause from `division-before-multiplication`. | A multiplication appears between the two divisions (`a / b * c / d`, an already-scaled pattern) - excluded by construction. |
 | `low-level-call-return-data-unbounded-decode` | SC06 | yes | medium | A `(bool ok, bytes memory data) = target.call(...)` result passed into `abi.decode(data, ...)` with no `data.length`/`returndatasize()` guard anywhere in the function - a return-bomb/gas-griefing surface. | A `.length` or `returndatasize()` check appears anywhere in the function, even if not textually adjacent to the decode call. |
+| `eip1967-slot-specific` | SC10 | yes | low | A narrowing of `proxy-pattern`'s own generic "storage-slot-constant" indicator: which specific EIP-1967/EIP-1822 slot (implementation, admin, beacon, or proxiable) was actually found. | None expected - a pure fact about which known slot literal is present, same reasoning as `proxy-pattern` itself. |
+| `naive-proxy-storage-collision` | SC10 | yes | high | A contract that delegatecalls from its fallback but shows none of the known EIP-1967/EIP-1822 slots, and declares at least one non-constant, non-immutable state variable - its own storage could collide with the delegated-to contract's. | A namespaced-storage scheme this heuristic does not recognize (e.g. a custom ERC-7201-style layout) that is in fact collision-free. |
+| `initializer-reinitializer-inconsistency` | SC10, SC01 | yes | medium | Two or more initializer-shaped functions in the same contract (the primary `initialize`-named one, plus any function carrying a `reinitializer` modifier) where at least one is guarded and at least one is not. | All candidates share the same protection status - already fully covered by `initializer-unprotected` on its own, so this family stays quiet rather than duplicate it. |
+| `selector-clash` (`selector-clash.proxy-implementation.general`) | SC10, SC01 | yes | medium | Cross-contract, `pro` mode only: a proxy's own public/external function (explicit, or Solidity's implicit getter for a simple `public` state variable) whose best-effort canonical signature exactly matches one on its `systemGraph`-resolved implementation - the classic Transparent Proxy selector-shadowing risk. Approximated by signature equality, not a real Keccak-256 4-byte hash (no non-stdlib crypto dependency), and only compares explicit functions/simple public-variable getters. | Either side has a parameter this heuristic cannot confidently canonicalize (a struct, enum, or other non-elementary type) - skipped rather than guessed; or the proxy's pairing itself is `unresolved` in `systemGraph.proxies[]` - never flagged on a guessed implementation. |
 
 The eight families from `unprotected-callback-handler` through `gas-unbounded-storage-array-push` are the
 first detector-expansion block added under the V2.1 registry architecture (`scripts/detectors/`); see
 `docs/decisiones.md` D-032. The six families from `hardcoded-role-holder` through `unsafe-downcast` are the
 second block (D-033). The nine families from `selfdestruct-unprotected` through
-`low-level-call-return-data-unbounded-decode` are the third block (D-035). Each reuses context already built
-for an existing check (loop analysis, access-control info, call offsets, state-variable inventory, modifier
-`_start`/`_end` offsets, prior signals in the same pass) rather than adding a new source-text scan.
+`low-level-call-return-data-unbounded-decode` are the third block (D-035). The four families from
+`eip1967-slot-specific` through `selector-clash` are V2.3's first block (D-038) - the first three reuse
+context already built for an existing check (loop analysis, access-control info, call offsets,
+state-variable inventory, modifier `_start`/`_end` offsets, prior signals in the same pass) rather than
+adding a new source-text scan; `selector-clash` is the first *cross-contract* check, computed directly by
+`scripts/preprocess.py` itself (not the per-file `scripts/detectors/` registry) from `systemGraph`'s
+already-resolved proxy pairing, and is the first family gated to `pro` mode only (it needs `systemGraph`,
+which is itself `pro`-only - see Step 6 of `SKILL.md`).
 
 ### EIP-1967-style storage slots
 

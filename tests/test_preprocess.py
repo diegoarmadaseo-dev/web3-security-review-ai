@@ -254,6 +254,10 @@ SIGNAL_FIXTURES = {
     "signature-domain-separator-missing": 'contract A { function verify(bytes32 h, uint8 v, bytes32 r, bytes32 s) external pure returns (address) { return ecrecover(h, v, r, s); } }',
     "chained-division-precision-loss": 'contract A { function f(uint a, uint b, uint c) external pure returns (uint) { return a / b / c; } }',
     "low-level-call-return-data-unbounded-decode": 'contract A { function f(address target, bytes calldata data) external returns (uint256) { (bool ok, bytes memory ret) = target.call(data); require(ok); return abi.decode(ret, (uint256)); } }',
+    # --- V2.3, Access Control + Proxy/Upgradeability, first block (docs/decisiones.md D-038) ---
+    "eip1967-slot-specific": 'contract A { bytes32 internal constant SLOT = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc; }',
+    "naive-proxy-storage-collision": 'contract A { address internal implementation; fallback() external payable { (bool ok, ) = implementation.delegatecall(msg.data); require(ok); } }',
+    "initializer-reinitializer-inconsistency": 'contract A { bool private _ready; modifier onlyOnce() { require(!_ready); _; _ready = true; } function initialize() public onlyOnce {} function initialize(address admin) public { _ready = true; } }',
 }
 
 
@@ -648,6 +652,49 @@ class SignalFamilyNegativeControlTests(unittest.TestCase):
         signals = self._signals_for(source)
         self.assertFalse(signals_of({"signals": signals}, "low-level-call-return-data-unbounded-decode"))
 
+    # --- V2.3, Access Control + Proxy/Upgradeability, first block (docs/decisiones.md D-038) ---
+
+    def test_no_known_slot_is_not_flagged_eip1967_slot_specific(self):
+        source = 'contract A { uint256 public x; }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "eip1967-slot-specific"))
+
+    def test_eip1967_slot_present_suppresses_naive_proxy_storage_collision(self):
+        source = (
+            'contract A { bytes32 internal constant SLOT ='
+            ' 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;'
+            ' address internal implementation;'
+            ' fallback() external payable { (bool ok, ) = implementation.delegatecall(msg.data); require(ok); } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "naive-proxy-storage-collision"))
+
+    def test_only_constant_state_is_not_flagged_naive_proxy_storage_collision(self):
+        source = (
+            'contract A { address internal immutable implementation;'
+            ' fallback() external payable { (bool ok, ) = implementation.delegatecall(msg.data); require(ok); } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "naive-proxy-storage-collision"))
+
+    def test_no_fallback_delegatecall_is_not_flagged_naive_proxy_storage_collision(self):
+        source = 'contract A { address internal implementation; uint256 public x; }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "naive-proxy-storage-collision"))
+
+    def test_both_initializers_guarded_is_not_flagged_inconsistency(self):
+        source = (
+            'contract A { bool private _ready; modifier onlyOnce() { require(!_ready); _; _ready = true; }'
+            ' function initialize() public onlyOnce {} function initialize(address admin) public onlyOnce {} }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "initializer-reinitializer-inconsistency"))
+
+    def test_single_initializer_candidate_is_not_flagged_inconsistency(self):
+        source = 'contract A { bool private _ready; function initialize() public { _ready = true; } }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "initializer-reinitializer-inconsistency"))
+
     def test_disabled_initializers_suppresses_implementation_not_disabled(self):
         source = 'contract A is Initializable { constructor() { _disableInitializers(); } function initialize() public initializer {} }'
         signals = self._signals_for(source)
@@ -845,6 +892,94 @@ class SystemGraphTests(unittest.TestCase):
             self.assertIsNotNone(proxy_entry)
             self.assertEqual(proxy_entry["status"], "unresolved")
             self.assertIn("delegatecall", proxy_entry["reason"])
+
+
+class SelectorClashTests(unittest.TestCase):
+    """V2.3, first block (docs/decisiones.md D-038): the only cross-contract
+    check, computed directly by preprocess.py (not the per-file detectors/
+    registry) from systemGraph's already-resolved proxy pairing. Needs a
+    real multi-file bundle in 'pro' mode, so it cannot use the single-file
+    SIGNAL_FIXTURES helper the other three D-038 checks use."""
+
+    def test_implicit_public_getter_clash_is_flagged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "Impl.sol", (
+                "pragma solidity 0.8.20;\n"
+                "contract Marketplace { address public admin; function setPrice(uint256 id, uint256 price) external {} }\n"
+            ))
+            write(tmp, "Proxy.sol", (
+                'pragma solidity 0.8.20;\nimport "./Impl.sol";\n'
+                "contract MyProxy {\n"
+                "    Marketplace internal implementation;\n"
+                "    function admin() external view returns (address) { return address(0); }\n"
+                "    fallback() external payable { (bool ok, ) = implementation.delegatecall(msg.data); require(ok); }\n"
+                "}\n"
+            ))
+            artifact = run_paths([tmp], mode="pro")
+            hits = [s for s in artifact["signals"] if s["family"] == "selector-clash"]
+            self.assertEqual(len(hits), 1)
+            self.assertEqual(hits[0]["details"]["signature"], "admin()")
+            self.assertEqual(hits[0]["contract"], "MyProxy")
+
+    def test_non_pro_mode_never_computes_selector_clash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "Impl.sol", "pragma solidity 0.8.20;\ncontract Marketplace { address public admin; }\n")
+            write(tmp, "Proxy.sol", (
+                'pragma solidity 0.8.20;\nimport "./Impl.sol";\n'
+                "contract MyProxy {\n"
+                "    Marketplace internal implementation;\n"
+                "    function admin() external view returns (address) { return address(0); }\n"
+                "    fallback() external payable { (bool ok, ) = implementation.delegatecall(msg.data); require(ok); }\n"
+                "}\n"
+            ))
+            artifact = run_paths([tmp], mode="standard")
+            self.assertFalse([s for s in artifact["signals"] if s["family"] == "selector-clash"])
+
+    def test_no_overlapping_signatures_is_not_flagged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "Impl2.sol", "pragma solidity 0.8.20;\ncontract LogicV1 { function setPrice(uint256 id, uint256 price) external {} }\n")
+            write(tmp, "Proxy2.sol", (
+                'pragma solidity 0.8.20;\nimport "./Impl2.sol";\n'
+                "contract MyProxy2 {\n"
+                "    LogicV1 internal implementation;\n"
+                "    function proxyOnlyFunction() external pure returns (uint256) { return 1; }\n"
+                "    fallback() external payable { (bool ok, ) = implementation.delegatecall(msg.data); require(ok); }\n"
+                "}\n"
+            ))
+            artifact = run_paths([tmp], mode="pro")
+            self.assertFalse([s for s in artifact["signals"] if s["family"] == "selector-clash"])
+
+    def test_struct_parameter_is_conservatively_not_flagged(self):
+        # A struct-typed parameter cannot be confidently canonicalized to an
+        # ABI type by this heuristic - must be skipped, never guessed at,
+        # even though the name and arity match on both sides.
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "Impl3.sol", "pragma solidity 0.8.20;\ncontract LogicV2 { struct Order { uint256 id; } function place(Order memory o) external {} }\n")
+            write(tmp, "Proxy3.sol", (
+                'pragma solidity 0.8.20;\nimport "./Impl3.sol";\n'
+                "contract MyProxy3 {\n"
+                "    LogicV2 internal implementation;\n"
+                "    struct Order { uint256 id; }\n"
+                "    function place(Order memory o) external {}\n"
+                "    fallback() external payable { (bool ok, ) = implementation.delegatecall(msg.data); require(ok); }\n"
+                "}\n"
+            ))
+            artifact = run_paths([tmp], mode="pro")
+            self.assertFalse([s for s in artifact["signals"] if s["family"] == "selector-clash"])
+
+    def test_unresolved_proxy_pairing_is_not_flagged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "Proxy4.sol", (
+                "pragma solidity 0.8.20;\n"
+                "contract MyProxy4 {\n"
+                "    address internal implementation;\n"
+                "    function admin() external view returns (address) { return address(0); }\n"
+                "    fallback() external payable { (bool ok, ) = implementation.delegatecall(msg.data); require(ok); }\n"
+                "}\n"
+            ))
+            artifact = run_paths([tmp], mode="pro")
+            self.assertEqual(artifact["systemGraph"]["proxies"][0]["status"], "unresolved")
+            self.assertFalse([s for s in artifact["signals"] if s["family"] == "selector-clash"])
 
 
 class MultilingualTests(unittest.TestCase):

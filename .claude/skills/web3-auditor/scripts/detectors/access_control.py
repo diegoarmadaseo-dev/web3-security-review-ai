@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict
 
-from .context import INTERNAL_STATE_CALL_RE, REENTRANCY_GUARD_RE, find_state_writes, locate_scope
+from .context import INTERNAL_STATE_CALL_RE, REENTRANCY_GUARD_RE, find_state_writes, function_access_info, locate_scope
 from text_utils import matching_paren
 
 ADMIN_NAME_RE = re.compile(r"^(set|update|change|configure|withdraw|sweep|rescue|drain|emergency|pause|unpause|mint|burn|upgrade|migrate|whitelist|blacklist|add|remove|grant|revoke|kill|destroy|transferOwnership|renounce|register|unregister|enable|disable|toggle|reset|claim(All|Fees)?)", re.I)
@@ -46,6 +46,18 @@ GAP_VAR_RE = re.compile(r"^_{0,2}(storage)?gap\d*$", re.I)
 ROLE_GRANT_RE = re.compile(r"\b(_setupRole|_grantRole|grantRole)\s*\(")
 HARDCODED_ADDRESS_IN_ROLE_RE = re.compile(r"\b0x[0-9a-fA-F]{40}\b")
 EXTERNAL_CALL_IN_MODIFIER_RE = re.compile(r"\.(call|send|staticcall|callcode|delegatecall)\s*(\{[^}]*\})?\s*\(")
+
+# --- V2.3, Access Control + Proxy/Upgradeability, first block (docs/decisiones.md D-038) ---
+# Same 4 hex values as KNOWN_PUBLIC_SLOTS above, verbatim, mapped to which EIP-1967/EIP-1822
+# slot each one is - a fresh, independent constant rather than restructuring
+# KNOWN_PUBLIC_SLOTS itself (which detect_proxy_pattern already relies on as a plain set).
+EIP1967_SLOT_KIND = {
+    "360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc": "implementation",
+    "b53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103": "admin",
+    "a3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50": "beacon",
+    "c5f16f0fcc639fa48a6947836d9850f504798523bf8c9a3a87d5876cf622bcf7": "eip1822-proxiable",
+}
+REINITIALIZER_MODIFIER_RE = re.compile(r"^reinitializer$")
 
 
 # --- scope-phase checks -----------------------------------------------------
@@ -414,6 +426,95 @@ def detect_reentrancy_guard_not_first_modifier(ctx: Dict[str, Any]) -> None:
         ctx["collector"].add("reentrancy-guard-not-first-modifier.general", fn["_headStart"], cname, scope, {"guard": mods[guard_idx]["name"], "earlierModifiers": earlier_risky})
 
 
+def detect_eip1967_slot_specific(ctx: Dict[str, Any]) -> None:
+    """V2.3, Access Control + Proxy/Upgradeability, first block
+    (docs/decisiones.md D-038). proxy-pattern.general already checks the
+    same 4 known slot values but collapses them into one generic
+    "storage-slot-constant" indicator regardless of which slot matched.
+    This narrows that into a specific fact per slot found (implementation/
+    admin/beacon/eip1822-proxiable) - a pure fact, not a defect, so fpRisk
+    is low, same as proxy-pattern itself. Does not modify proxy-pattern."""
+    contract, cname = ctx["contract"], ctx["cname"]
+    if cname is None:
+        return
+    contract_original = ctx["original"][contract["_start"]:contract["_bodyEnd"]].lower()
+    for slot, kind in sorted(EIP1967_SLOT_KIND.items()):
+        if slot in contract_original:
+            ctx["collector"].add("eip1967-slot-specific.general", contract["_start"], cname, {"function": None, "modifier": None, "kind": None}, {"slotKind": kind})
+
+
+def detect_naive_proxy_storage_collision(ctx: Dict[str, Any]) -> None:
+    """V2.3, Access Control + Proxy/Upgradeability, first block
+    (docs/decisiones.md D-038). A contract that delegatecalls from its
+    fallback (reusing the delegatecall.general signal already emitted
+    earlier in this same scope-phase pass - see the module docstring on
+    ordering) but shows none of the known EIP-1967/EIP-1822 slots is using
+    "naive" storage: its own state variables sit at the same slots (0, 1,
+    2, ...) the implementation's variables would use when delegatecalled
+    into, risking a collision. Only fires when the contract also declares
+    at least one non-constant, non-immutable state variable (constants/
+    immutables consume no storage slot, so cannot collide). Potential
+    signal only, not an automatic vulnerability - a namespaced-storage
+    pattern this heuristic does not recognize could still be collision-free
+    - hence fpRisk high, same caveat class as storage-gap-missing."""
+    contract, cname = ctx["contract"], ctx["cname"]
+    if cname is None:
+        return
+    delegate_hits = [
+        s for s in ctx["collector"].signals
+        if s["family"] == "delegatecall" and s["contract"] == cname and s["details"].get("inFallback")
+    ]
+    if not delegate_hits:
+        return
+    contract_original = ctx["original"][contract["_start"]:contract["_bodyEnd"]].lower()
+    if any(slot in contract_original for slot in EIP1967_SLOT_KIND):
+        return
+    storage_vars = [v["name"] for v in contract["stateVariables"] if not v.get("constant") and not v.get("immutable")]
+    if not storage_vars:
+        return
+    ctx["collector"].add("naive-proxy-storage-collision.general", contract["_start"], cname, {"function": None, "modifier": None, "kind": None}, {"stateVariables": storage_vars})
+
+
+def _is_initializer_guarded(fn: Dict[str, Any]) -> bool:
+    guarded_by_modifier = any(INITIALIZER_GUARD_RE.match(m["name"]) for m in fn["modifiers"])
+    guarded_by_body = bool(INITIALIZED_BODY_RE.search(fn.get("_body", ""))) or function_access_info(fn)["guarded"]
+    return guarded_by_modifier or guarded_by_body
+
+
+def detect_initializer_reinitializer_inconsistency(ctx: Dict[str, Any]) -> None:
+    """V2.3, Access Control + Proxy/Upgradeability, first block
+    (docs/decisiones.md D-038). Complements initializer-unprotected.general
+    (which flags a single unguarded initializer standalone) by comparing
+    protection ACROSS every initializer-shaped function in the same
+    contract: the primary initializer (INITIALIZER_NAME_RE, same as
+    initializer-unprotected) plus any function carrying a `reinitializer`
+    modifier (a later, versioned re-initialization entry point - the
+    modifier's own presence is not, by itself, proof of protection, since a
+    guard could still be missing from an unrelated function that also
+    matches). Fires only when at least one candidate is guarded and at
+    least one is not - a plain, uniformly-unprotected set is already fully
+    covered by initializer-unprotected.general on its own."""
+    contract, cname = ctx["contract"], ctx["cname"]
+    if cname is None:
+        return
+    candidates = []
+    for fn in contract["functions"]:
+        name = fn["name"] or ""
+        is_primary = bool(INITIALIZER_NAME_RE.match(name)) and fn["visibility"] in ("public", "external") and fn.get("stateChanging")
+        has_reinit_modifier = any(REINITIALIZER_MODIFIER_RE.match(m["name"]) for m in fn["modifiers"])
+        if is_primary or has_reinit_modifier:
+            candidates.append((fn, _is_initializer_guarded(fn)))
+    if len(candidates) < 2:
+        return
+    guarded_names = sorted(fn["name"] for fn, guarded in candidates if guarded)
+    unguarded_names = sorted(fn["name"] for fn, guarded in candidates if not guarded)
+    if not guarded_names or not unguarded_names:
+        return
+    unguarded_fn = next(fn for fn, guarded in candidates if not guarded)
+    scope = {"function": unguarded_fn["name"], "modifier": None, "kind": unguarded_fn["kind"]}
+    ctx["collector"].add("initializer-reinitializer-inconsistency.general", unguarded_fn["_headStart"], cname, scope, {"guarded": guarded_names, "unguarded": unguarded_names})
+
+
 FUNCTION_CHECKS = [
     ("initializer-unprotected.general", detect_initializer_unprotected),
     ("zero-address-unchecked.general", detect_zero_address_unchecked),
@@ -433,4 +534,7 @@ CONTRACT_CHECKS = [
     ("implementation-not-disabled.general", detect_implementation_not_disabled),
     ("external-call-in-modifier.general", detect_external_call_in_modifier),
     ("reentrancy-guard-not-first-modifier.general", detect_reentrancy_guard_not_first_modifier),
+    ("eip1967-slot-specific.general", detect_eip1967_slot_specific),
+    ("naive-proxy-storage-collision.general", detect_naive_proxy_storage_collision),
+    ("initializer-reinitializer-inconsistency.general", detect_initializer_reinitializer_inconsistency),
 ]
