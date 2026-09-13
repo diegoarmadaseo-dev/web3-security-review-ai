@@ -128,6 +128,9 @@ CHECK_METADATA: Dict[str, Dict[str, Any]] = {
     "state-pair-write-mismatch.general": {"family": "state-pair-write-mismatch", "categories": ["SC02"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
     "state-write-operator-inconsistency.general": {"family": "state-write-operator-inconsistency", "categories": ["SC02"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
     "array-pop-during-forward-iteration.general": {"family": "array-pop-during-forward-iteration", "categories": ["SC02"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
+    # --- V2.4, Business Logic / Invariants, third block (docs/decisiones.md D-053) ---
+    "array-push-during-forward-iteration.general": {"family": "array-push-during-forward-iteration", "categories": ["SC02"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
+    "state-write-guard-mechanism-inconsistency.general": {"family": "state-write-guard-mechanism-inconsistency", "categories": ["SC01"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
 }
 
 # checkIds computed cross-contract, outside the per-file phase lists below (need

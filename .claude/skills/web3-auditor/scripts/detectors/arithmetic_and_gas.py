@@ -358,6 +358,56 @@ def detect_array_pop_during_forward_iteration(ctx: Dict[str, Any]) -> None:
         ctx["collector"].add("array-pop-during-forward-iteration.general", loop["start"], cname, scope, {"array": array_name, "counter": counter, "loopLine": ctx["line_index"].line_of(loop["start"])})
 
 
+def detect_array_push_during_forward_iteration(ctx: Dict[str, Any]) -> None:
+    """V2.4, Business Logic / Invariants, third block (docs/decisiones.md
+    D-053). The growth-side sibling of array-pop-during-forward-iteration:
+    a `for` loop with a plain forward `i++`/`++i` increment clause,
+    iterating up to `arr.length`, whose body calls `arr.push(...)` on that
+    SAME array (checked directly against the loop's own `.length`
+    condition, never guessed). Solidity re-reads `arr.length` on every
+    loop-condition check rather than snapshotting it once, so pushing
+    inside such a loop can make it iterate far more times than the
+    caller/author expected - unbounded in the worst case, or simply
+    processing elements the loop was never meant to see. The one
+    established safe idiom - snapshotting the bound into a local before
+    the loop (`uint256 len = arr.length; for (uint i = 0; i < len; i++)`)
+    - is never flagged, not through any special-casing but because its
+    condition text is `i < len`, which LOOP_LENGTH_VAR_RE simply does not
+    match at all (no `.length` reference in the condition to anchor on).
+    No counter-compensation check is needed here (unlike the pop sibling)
+    since nothing about the loop counter can make blind growth of the
+    bound itself safe. Reuses loop_spans() and the same
+    already-collapsed loop header text every other loop check in this
+    module already uses - no new source-text scan. fpRisk medium: a
+    work-queue pattern that deliberately enqueues follow-up items while
+    draining the same queue is a real, if uncommon, legitimate design
+    this heuristic cannot distinguish from an unbounded-growth bug; a
+    `break`/`return` reachable before growth can occur more than once is,
+    like the pop sibling, a known, accepted limitation rather than a
+    detected suppressor."""
+    contract, cname = ctx["contract"], ctx["cname"]
+    if cname is None:
+        return
+    for loop in loop_spans(ctx["masked"], ctx["span_start"], ctx["span_end"], ctx["pairs"]):
+        if loop["kind"] != "for":
+            continue
+        parts = loop["header"].split(";")
+        if len(parts) != 3:
+            continue
+        _init, condition, increment = parts
+        if not FOR_INCREMENT_RE.match(increment):
+            continue
+        length_match = LOOP_LENGTH_VAR_RE.search(condition)
+        if not length_match:
+            continue
+        array_name = length_match.group(1)
+        body = ctx["masked"][loop["bodyStart"]:loop["bodyEnd"]]
+        if not re.search(r"\b" + re.escape(array_name) + r"\s*\.\s*push\s*\(", body):
+            continue
+        scope = locate_scope(contract, loop["start"])
+        ctx["collector"].add("array-push-during-forward-iteration.general", loop["start"], cname, scope, {"array": array_name, "loopLine": ctx["line_index"].line_of(loop["start"])})
+
+
 CHECKS = [
     ("hardcoded-address.general", detect_hardcoded_address),
     ("unchecked-block.general", detect_unchecked_block),
@@ -372,4 +422,5 @@ CHECKS = [
     ("chained-division-precision-loss.general", detect_chained_division_precision_loss),
     ("delegatecall-in-loop.general", detect_delegatecall_in_loop),
     ("array-pop-during-forward-iteration.general", detect_array_pop_during_forward_iteration),
+    ("array-push-during-forward-iteration.general", detect_array_push_during_forward_iteration),
 ]

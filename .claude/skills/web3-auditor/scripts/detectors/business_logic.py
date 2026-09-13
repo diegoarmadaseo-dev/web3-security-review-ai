@@ -180,6 +180,83 @@ def detect_state_write_guard_inconsistency(ctx: Dict[str, Any]) -> None:
         })
 
 
+def detect_state_write_guard_mechanism_inconsistency(ctx: Dict[str, Any]) -> None:
+    """V2.4, Business Logic / Invariants, third block (docs/decisiones.md
+    D-053). A finer-grained sibling of state-write-guard-inconsistency.general:
+    instead of comparing guarded vs. completely unguarded, this compares
+    WHICH mechanism guards each writer of the same state variable. The
+    same variable written by 2+ functions where at least one relies on
+    tx.origin used in a condition (the already-emitted tx-origin.general
+    signal's own `inCondition` detail - reused verbatim, no new scan)
+    with no other guard at all, while at least one OTHER writer of the
+    SAME variable is genuinely guarded via msg.sender/hasRole/a modifier
+    (function_access_info's own `guarded`), is a real inconsistency:
+    tx.origin is spoofable by any intermediate contract relaying the
+    call, so the weaker mechanism undermines whatever protection the
+    stronger sibling provides for the exact same state. Unlike
+    admin-function-uses-tx-origin-check.general (access_control.py), this
+    never gates on a function-name heuristic - only on the structural
+    correlation with a sibling writer of the same variable.
+
+    Reuses the exact same per-(function, variable) find_state_writes scan
+    as state-write-guard-inconsistency.general - a fresh, independent
+    loop, never a call into that function or into
+    _written_vars_by_function below, so neither it nor
+    state-pair-write-mismatch.general/state-write-operator-inconsistency.general
+    are touched by this check in any way - plus D-047's self-scoped/
+    payable-funded exclusions (_excluded_write_lines), for the same
+    reason state-write-guard-inconsistency.general already applies them:
+    a self-scoped or payable-funded write's own guard mechanism is not
+    the concern those exclusions exist to sidestep. Constructors and
+    initializer-shaped functions are excluded, same reasoning as every
+    other check in this module.
+
+    Potential signal only, never an automatic vulnerability - fpRisk
+    medium: a deliberately tx.origin-gated legacy function reachable only
+    through an already-guarded proxy/relayer path is a real, if unusual,
+    design this heuristic cannot see."""
+    contract, cname = ctx["contract"], ctx["cname"]
+    if cname is None:
+        return
+    state_names = [v["name"] for v in contract["stateVariables"] if not v.get("constant") and not v.get("immutable")]
+    if not state_names:
+        return
+    tx_origin_condition_functions = {
+        s["function"] for s in ctx["collector"].signals
+        if s["family"] == "tx-origin" and s["contract"] == cname and s["details"].get("inCondition")
+    }
+    writers: Dict[str, List[Dict[str, Any]]] = {}
+    for fn in contract["functions"]:
+        if fn["_bodyStart"] is None or fn["_bodyEnd"] is None:
+            continue
+        if fn["kind"] == "constructor" or INITIALIZER_NAME_RE.match(fn["name"] or ""):
+            continue
+        access = function_access_info(fn)
+        uses_tx_origin = (fn["name"] or fn["kind"]) in tx_origin_condition_functions
+        if not (access["guarded"] or uses_tx_origin):
+            continue
+        for name in state_names:
+            writes, _internal_calls = find_state_writes(fn["_body"], fn["_bodyStart"] + 1, fn["_bodyStart"] + 1, [name], ctx["line_index"])
+            if not writes:
+                continue
+            if set(writes) <= _excluded_write_lines(fn, name, ctx["line_index"]):
+                continue
+            writers.setdefault(name, []).append({"fn": fn, "strong": access["guarded"], "weak": uses_tx_origin and not access["guarded"]})
+    for name in sorted(writers):
+        entries = writers[name]
+        strong_entries = [e for e in entries if e["strong"]]
+        weak_entries = [e for e in entries if e["weak"]]
+        if not strong_entries or not weak_entries:
+            continue
+        anchor_fn = weak_entries[0]["fn"]
+        scope = {"function": anchor_fn["name"] or anchor_fn["kind"], "modifier": None, "kind": anchor_fn["kind"]}
+        ctx["collector"].add("state-write-guard-mechanism-inconsistency.general", anchor_fn["_headStart"], cname, scope, {
+            "variable": name,
+            "strongWriters": sorted(e["fn"]["name"] or e["fn"]["kind"] for e in strong_entries),
+            "weakWriters": sorted(e["fn"]["name"] or e["fn"]["kind"] for e in weak_entries),
+        })
+
+
 def _written_vars_by_function(contract: Dict[str, Any], state_names: List[str], line_index: Any) -> Dict[int, Dict[str, Any]]:
     """Shared scan for D-048's two checks: per non-constructor,
     non-initializer function, which of `state_names` it genuinely writes.
@@ -428,6 +505,7 @@ def detect_state_write_operator_inconsistency(ctx: Dict[str, Any]) -> None:
 
 CONTRACT_CHECKS = [
     ("state-write-guard-inconsistency.general", detect_state_write_guard_inconsistency),
+    ("state-write-guard-mechanism-inconsistency.general", detect_state_write_guard_mechanism_inconsistency),
     ("state-pair-write-mismatch.general", detect_state_pair_write_mismatch),
     ("state-write-operator-inconsistency.general", detect_state_write_operator_inconsistency),
 ]

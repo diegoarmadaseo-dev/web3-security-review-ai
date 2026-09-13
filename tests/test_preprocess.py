@@ -304,6 +304,16 @@ SIGNAL_FIXTURES = {
         'contract A { uint256[] arr;'
         ' function clean() external { for (uint i = 0; i < arr.length; i++) { if (arr[i] == 0) { arr[i] = arr[arr.length-1]; arr.pop(); } } } }'
     ),
+    # --- V2.4, Business Logic / Invariants, third block (docs/decisiones.md D-053) ---
+    "array-push-during-forward-iteration": (
+        'contract A { uint256[] arr;'
+        ' function f(uint256 x) external { for (uint i = 0; i < arr.length; i++) { if (arr[i] == 0) { arr.push(x); } } } }'
+    ),
+    "state-write-guard-mechanism-inconsistency": (
+        'contract A { address owner; uint256 x;'
+        ' function setXWeak(uint256 v) external { require(tx.origin == owner); x = v; }'
+        ' function setXStrong(uint256 v) external { require(msg.sender == owner); x = v; } }'
+    ),
 }
 
 
@@ -1409,6 +1419,130 @@ class SignalFamilyNegativeControlTests(unittest.TestCase):
         hits = [s for s in signals if s["family"] == "state-write-operator-inconsistency"]
         self.assertTrue(hits)
         self.assertEqual(hits[0]["details"]["overwriteFunction"], "suspiciousReset")
+
+    # --- V2.4, Business Logic / Invariants, third block (docs/decisiones.md D-053) ---
+
+    def test_push_during_forward_iteration_is_flagged_array_push_during_forward_iteration(self):
+        source = (
+            'contract A { uint256[] arr;'
+            ' function f(uint256 x) external { for (uint i = 0; i < arr.length; i++) { if (arr[i] == 0) { arr.push(x); } } } }'
+        )
+        signals = self._signals_for(source)
+        hits = [s for s in signals if s["family"] == "array-push-during-forward-iteration"]
+        self.assertTrue(hits)
+        self.assertEqual(hits[0]["details"]["array"], "arr")
+
+    def test_cached_length_is_not_flagged_array_push_during_forward_iteration(self):
+        # The established safe idiom: the bound is snapshotted into a local
+        # before the loop, so the condition never references arr.length.
+        source = (
+            'contract A { uint256[] arr;'
+            ' function f(uint256 x) external { uint256 len = arr.length; for (uint i = 0; i < len; i++) { arr.push(x); } } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "array-push-during-forward-iteration"))
+
+    def test_push_on_different_array_is_not_flagged_array_push_during_forward_iteration(self):
+        source = (
+            'contract A { uint256[] arr; uint256[] other;'
+            ' function f(uint256 x) external { for (uint i = 0; i < arr.length; i++) { other.push(x); } } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "array-push-during-forward-iteration"))
+
+    def test_while_loop_is_not_flagged_array_push_during_forward_iteration(self):
+        source = (
+            'contract A { uint256[] arr;'
+            ' function f(uint256 x) external { uint i = 0; while (i < arr.length) { arr.push(x); i++; } } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "array-push-during-forward-iteration"))
+
+    def test_backward_iteration_is_not_flagged_array_push_during_forward_iteration(self):
+        source = (
+            'contract A { uint256[] arr;'
+            ' function f(uint256 x) external { for (uint i = arr.length; i > 0; i--) { arr.push(x); } } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "array-push-during-forward-iteration"))
+
+    def test_no_push_is_not_flagged_array_push_during_forward_iteration(self):
+        source = (
+            'contract A { uint256[] arr;'
+            ' function f() external view returns (uint256 s) { for (uint i = 0; i < arr.length; i++) { s += arr[i]; } } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "array-push-during-forward-iteration"))
+
+    def test_tx_origin_weak_writer_vs_msg_sender_strong_writer_is_flagged_state_write_guard_mechanism_inconsistency(self):
+        source = (
+            'contract A { address owner; uint256 x;'
+            ' function setXWeak(uint256 v) external { require(tx.origin == owner); x = v; }'
+            ' function setXStrong(uint256 v) external { require(msg.sender == owner); x = v; } }'
+        )
+        signals = self._signals_for(source)
+        hits = [s for s in signals if s["family"] == "state-write-guard-mechanism-inconsistency"]
+        self.assertTrue(hits)
+        self.assertEqual(hits[0]["details"]["variable"], "x")
+        self.assertEqual(hits[0]["details"]["weakWriters"], ["setXWeak"])
+        self.assertEqual(hits[0]["details"]["strongWriters"], ["setXStrong"])
+
+    def test_both_writers_msg_sender_guarded_is_not_flagged_state_write_guard_mechanism_inconsistency(self):
+        source = (
+            'contract A { address owner; uint256 x;'
+            ' function setX1(uint256 v) external { require(msg.sender == owner); x = v; }'
+            ' function setX2(uint256 v) external { require(msg.sender == owner); x = v; } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "state-write-guard-mechanism-inconsistency"))
+
+    def test_both_writers_tx_origin_guarded_is_not_flagged_state_write_guard_mechanism_inconsistency(self):
+        # No strong (msg.sender/hasRole) sibling at all, so there is nothing
+        # for the weaker mechanism to undermine.
+        source = (
+            'contract A { address owner; uint256 x;'
+            ' function setX1(uint256 v) external { require(tx.origin == owner); x = v; }'
+            ' function setX2(uint256 v) external { require(tx.origin == owner); x = v; } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "state-write-guard-mechanism-inconsistency"))
+
+    def test_tx_origin_writer_vs_unguarded_sibling_is_not_flagged_state_write_guard_mechanism_inconsistency(self):
+        # A completely unguarded sibling is state-write-guard-inconsistency's
+        # job, not this check's - this check only correlates a weak
+        # (tx.origin) mechanism against a genuinely strong one.
+        source = (
+            'contract A { address owner; uint256 x;'
+            ' function setXWeak(uint256 v) external { require(tx.origin == owner); x = v; }'
+            ' function setXOpen(uint256 v) external { x = v; } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "state-write-guard-mechanism-inconsistency"))
+
+    def test_constructor_tx_origin_is_excluded_from_state_write_guard_mechanism_inconsistency(self):
+        source = (
+            'contract A { address owner; uint256 x;'
+            ' constructor() { if (tx.origin == msg.sender) { x = 1; } }'
+            ' function setX(uint256 v) external { require(msg.sender == owner); x = v; } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "state-write-guard-mechanism-inconsistency"))
+
+    def test_single_writer_is_not_flagged_state_write_guard_mechanism_inconsistency(self):
+        source = 'contract A { address owner; uint256 x; function setX(uint256 v) external { require(tx.origin == owner); x = v; } }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "state-write-guard-mechanism-inconsistency"))
+
+    def test_tx_origin_outside_condition_is_not_flagged_state_write_guard_mechanism_inconsistency(self):
+        # tx.origin only appears in an event emission, never in a condition -
+        # reuses tx-origin.general's own inCondition detail verbatim.
+        source = (
+            'contract A { address owner; uint256 x; event Called(address who);'
+            ' function setXLogged(uint256 v) external { emit Called(tx.origin); x = v; }'
+            ' function setXStrong(uint256 v) external { require(msg.sender == owner); x = v; } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "state-write-guard-mechanism-inconsistency"))
 
     def test_disabled_initializers_suppresses_implementation_not_disabled(self):
         source = 'contract A is Initializable { constructor() { _disableInitializers(); } function initialize() public initializer {} }'
