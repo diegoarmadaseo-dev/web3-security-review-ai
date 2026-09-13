@@ -682,6 +682,42 @@ class SignalFamilyNegativeControlTests(unittest.TestCase):
         signals = self._signals_for(source)
         self.assertFalse(signals_of({"signals": signals}, "naive-proxy-storage-collision"))
 
+    def test_delegatecall_in_fallback_is_flagged_naive_proxy_storage_collision(self):
+        # D-039: regression check - the broadening away from inFallback-only
+        # must not stop catching the original, most common shape.
+        source = (
+            'contract A { address internal implementation;'
+            ' fallback() external payable { (bool ok, ) = implementation.delegatecall(msg.data); require(ok); } }'
+        )
+        signals = self._signals_for(source)
+        self.assertTrue(signals_of({"signals": signals}, "naive-proxy-storage-collision"))
+
+    def test_delegatecall_in_named_function_is_flagged_naive_proxy_storage_collision(self):
+        # D-039: a named-function-based forwarder carries the identical
+        # storage-collision risk as a fallback-based one - found missing
+        # during the block-1 audit, inconsistent with compute_system_graph's
+        # own fallback-or-any-site proxy-pairing heuristic.
+        source = (
+            'contract A { address internal implementation;'
+            ' function forward(bytes calldata d) external { (bool ok, ) = implementation.delegatecall(d); require(ok); } }'
+        )
+        signals = self._signals_for(source)
+        self.assertTrue(signals_of({"signals": signals}, "naive-proxy-storage-collision"))
+
+    def test_delegatecall_in_named_function_with_eip1967_slot_is_not_flagged(self):
+        # The "protected/irrelevant" case: a named-function delegatecall
+        # site in a contract that DOES show a known EIP-1967 slot is not
+        # naive storage - must stay suppressed even with the broadened
+        # delegatecall-site matching.
+        source = (
+            'contract A { bytes32 internal constant SLOT ='
+            ' 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;'
+            ' address internal implementation;'
+            ' function forward(bytes calldata d) external { (bool ok, ) = implementation.delegatecall(d); require(ok); } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "naive-proxy-storage-collision"))
+
     def test_both_initializers_guarded_is_not_flagged_inconsistency(self):
         source = (
             'contract A { bool private _ready; modifier onlyOnce() { require(!_ready); _; _ready = true; }'

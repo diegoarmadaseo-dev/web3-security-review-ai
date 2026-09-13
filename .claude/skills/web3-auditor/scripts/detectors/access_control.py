@@ -445,25 +445,33 @@ def detect_eip1967_slot_specific(ctx: Dict[str, Any]) -> None:
 
 def detect_naive_proxy_storage_collision(ctx: Dict[str, Any]) -> None:
     """V2.3, Access Control + Proxy/Upgradeability, first block
-    (docs/decisiones.md D-038). A contract that delegatecalls from its
-    fallback (reusing the delegatecall.general signal already emitted
-    earlier in this same scope-phase pass - see the module docstring on
-    ordering) but shows none of the known EIP-1967/EIP-1822 slots is using
-    "naive" storage: its own state variables sit at the same slots (0, 1,
-    2, ...) the implementation's variables would use when delegatecalled
-    into, risking a collision. Only fires when the contract also declares
-    at least one non-constant, non-immutable state variable (constants/
-    immutables consume no storage slot, so cannot collide). Potential
-    signal only, not an automatic vulnerability - a namespaced-storage
-    pattern this heuristic does not recognize could still be collision-free
-    - hence fpRisk high, same caveat class as storage-gap-missing."""
+    (docs/decisiones.md D-038; broadened in D-039). A contract that
+    delegatecalls anywhere in its body (reusing the delegatecall.general
+    signal already emitted earlier in this same scope-phase pass - see the
+    module docstring on ordering) but shows none of the known EIP-1967/
+    EIP-1822 slots is using "naive" storage: its own state variables sit at
+    the same slots (0, 1, 2, ...) the delegated-to contract's variables
+    would use, risking a collision. Only fires when the contract also
+    declares at least one non-constant, non-immutable state variable
+    (constants/immutables consume no storage slot, so cannot collide).
+    Potential signal only, not an automatic vulnerability - a
+    namespaced-storage pattern this heuristic does not recognize could
+    still be collision-free - hence fpRisk high, same caveat class as
+    storage-gap-missing.
+
+    D-039: not restricted to a delegatecall inside fallback() specifically
+    - a named-function-based forwarder (`function forward(bytes calldata d)
+    external { impl.delegatecall(d); }`) carries the identical
+    storage-collision risk and is a realistic, non-fallback proxy shape.
+    The original inFallback-only filter missed it, inconsistent with
+    compute_system_graph's own proxy-pairing heuristic (which already
+    falls back to any delegatecall site in the contract when none is in
+    fallback - see its module-level comment). See
+    test_delegatecall_in_named_function_is_flagged_naive_proxy_storage_collision."""
     contract, cname = ctx["contract"], ctx["cname"]
     if cname is None:
         return
-    delegate_hits = [
-        s for s in ctx["collector"].signals
-        if s["family"] == "delegatecall" and s["contract"] == cname and s["details"].get("inFallback")
-    ]
+    delegate_hits = [s for s in ctx["collector"].signals if s["family"] == "delegatecall" and s["contract"] == cname]
     if not delegate_hits:
         return
     contract_original = ctx["original"][contract["_start"]:contract["_bodyEnd"]].lower()
