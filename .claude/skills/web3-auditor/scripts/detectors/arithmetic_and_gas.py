@@ -27,6 +27,9 @@ NARROW_CAST_RE = re.compile(r"\b(u?int)(\d{1,3})\s*\(")
 LITERAL_ARG_RE = re.compile(r"^(\d+|0x[0-9a-fA-F]+)$")
 # --- V2.1 detector-expansion, third block (docs/decisiones.md D-035) ---
 CHAINED_DIVISION_RE = re.compile(r"[\w\)\]]\s*/(?![/=*])\s*[\w\(\[][^;{}*]*?/(?![/=*])\s*[\w\(\[]")
+# --- V2.4, Business Logic / Invariants, second block (docs/decisiones.md D-048) ---
+FOR_INCREMENT_RE = re.compile(r"^\s*(?:\+\+\s*(\w+)|(\w+)\s*\+\+)\s*$")
+LOOP_LENGTH_VAR_RE = re.compile(r"\b(\w+)\s*\.\s*length\b")
 
 
 def detect_hardcoded_address(ctx: Dict[str, Any]) -> None:
@@ -302,6 +305,59 @@ def detect_delegatecall_in_loop(ctx: Dict[str, Any]) -> None:
         ctx["collector"].add("delegatecall-in-loop.general", offset, cname, scope, {"loopLine": line_index.line_of(loop["start"])})
 
 
+def detect_array_pop_during_forward_iteration(ctx: Dict[str, Any]) -> None:
+    """V2.4, Business Logic / Invariants, second block (docs/decisiones.md
+    D-048). The classic "skip an element" bug: a `for` loop with a plain
+    forward `i++`/`++i` increment clause, iterating up to `arr.length`,
+    whose body calls `arr.pop()` (the same array named in the loop's own
+    `.length` condition - checked directly, never guessed) with no
+    compensating `i--`/`--i` anywhere in the body. Swap-and-pop removal
+    during forward iteration must decrement the index after a removal so
+    the element swapped into the current slot is still visited next
+    iteration; without that, it is silently skipped. Deliberately
+    restricted to exactly this shape: a `while` loop or a `for` loop
+    iterating BACKWARD (`i--`) is a well-known, correct idiom for the
+    exact same removal problem and is never flagged here (loop["kind"]
+    and FOR_INCREMENT_RE both gate on forward-only), nor is a `.pop()` on
+    any array other than the one this specific loop's own bound
+    references. Reuses loop_spans() - the same per-loop analysis
+    unbounded-loop/msg-value-in-loop/external-call-in-loop/
+    delegatecall-in-loop already use in this module - and the loop
+    header's own already-collapsed text; no new source-text scan beyond
+    what those checks already perform. fpRisk medium: a `break`
+    immediately after the `pop()` (loop never continues past the removal
+    on that branch, so nothing is actually skipped) is not detected as a
+    suppressor - a known, accepted limitation, not a defect - and a
+    `.pop()` reachable only via a code path that itself never removes
+    more than one element per call is indistinguishable here from one
+    that does."""
+    contract, cname = ctx["contract"], ctx["cname"]
+    if cname is None:
+        return
+    for loop in loop_spans(ctx["masked"], ctx["span_start"], ctx["span_end"], ctx["pairs"]):
+        if loop["kind"] != "for":
+            continue
+        parts = loop["header"].split(";")
+        if len(parts) != 3:
+            continue
+        _init, condition, increment = parts
+        inc_match = FOR_INCREMENT_RE.match(increment)
+        if not inc_match:
+            continue
+        counter = inc_match.group(1) or inc_match.group(2)
+        length_match = LOOP_LENGTH_VAR_RE.search(condition)
+        if not length_match:
+            continue
+        array_name = length_match.group(1)
+        body = ctx["masked"][loop["bodyStart"]:loop["bodyEnd"]]
+        if not re.search(r"\b" + re.escape(array_name) + r"\s*\.\s*pop\s*\(\s*\)", body):
+            continue
+        if re.search(r"--\s*" + re.escape(counter) + r"\b|\b" + re.escape(counter) + r"\s*--", body):
+            continue
+        scope = locate_scope(contract, loop["start"])
+        ctx["collector"].add("array-pop-during-forward-iteration.general", loop["start"], cname, scope, {"array": array_name, "counter": counter, "loopLine": ctx["line_index"].line_of(loop["start"])})
+
+
 CHECKS = [
     ("hardcoded-address.general", detect_hardcoded_address),
     ("unchecked-block.general", detect_unchecked_block),
@@ -315,4 +371,5 @@ CHECKS = [
     ("unsafe-downcast.general", detect_unsafe_downcast),
     ("chained-division-precision-loss.general", detect_chained_division_precision_loss),
     ("delegatecall-in-loop.general", detect_delegatecall_in_loop),
+    ("array-pop-during-forward-iteration.general", detect_array_pop_during_forward_iteration),
 ]

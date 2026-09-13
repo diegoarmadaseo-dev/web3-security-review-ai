@@ -124,6 +124,10 @@ CHECK_METADATA: Dict[str, Dict[str, Any]] = {
     "reinitializer-one-collides-with-initializer.general": {"family": "reinitializer-one-collides-with-initializer", "categories": ["SC10"], "needsContext": True, "fpRisk": "low", "groupHint": None},
     # --- V2.4, Business Logic / Invariants, first check (docs/decisiones.md D-046) ---
     "state-write-guard-inconsistency.general": {"family": "state-write-guard-inconsistency", "categories": ["SC02", "SC01"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
+    # --- V2.4, Business Logic / Invariants, second block (docs/decisiones.md D-048) ---
+    "state-pair-write-mismatch.general": {"family": "state-pair-write-mismatch", "categories": ["SC02"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
+    "state-write-operator-inconsistency.general": {"family": "state-write-operator-inconsistency", "categories": ["SC02"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
+    "array-pop-during-forward-iteration.general": {"family": "array-pop-during-forward-iteration", "categories": ["SC02"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
 }
 
 # checkIds computed cross-contract, outside the per-file phase lists below (need

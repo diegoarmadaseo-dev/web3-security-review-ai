@@ -287,6 +287,23 @@ SIGNAL_FIXTURES = {
         'contract A { address owner; uint256 x; function setXAdmin(uint256 v) external { require(msg.sender == owner); x = v; }'
         ' function setXAnyone(uint256 v) external { x = v; } }'
     ),
+    # --- V2.4, Business Logic / Invariants, second block (docs/decisiones.md D-048) ---
+    "state-pair-write-mismatch": (
+        'contract A { mapping(address=>uint256) balances; uint256 totalSupply;'
+        ' function mint(address to, uint256 amount) external { balances[to] += amount; totalSupply += amount; }'
+        ' function airdrop(address to, uint256 amount) external { balances[to] += amount; totalSupply += amount; }'
+        ' function correctBalance(address to, uint256 v) external { balances[to] = v; } }'
+    ),
+    "state-write-operator-inconsistency": (
+        'contract A { uint256 x;'
+        ' function inc(uint256 v) external { x += v; }'
+        ' function dec(uint256 v) external { x -= v; }'
+        ' function reset(uint256 v) external { x = v; } }'
+    ),
+    "array-pop-during-forward-iteration": (
+        'contract A { uint256[] arr;'
+        ' function clean() external { for (uint i = 0; i < arr.length; i++) { if (arr[i] == 0) { arr[i] = arr[arr.length-1]; arr.pop(); } } } }'
+    ),
 }
 
 
@@ -1166,6 +1183,96 @@ class SignalFamilyNegativeControlTests(unittest.TestCase):
         )
         signals = self._signals_for(source)
         self.assertTrue(signals_of({"signals": signals}, "state-write-guard-inconsistency"))
+
+    # --- V2.4, Business Logic / Invariants, second block (docs/decisiones.md D-048) ---
+
+    def test_single_establishing_function_does_not_flag_state_pair_write_mismatch(self):
+        # Only ONE function writes both balances and totalSupply together -
+        # the pattern needs 2+ functions to be "established" at all.
+        source = (
+            'contract A { mapping(address=>uint256) balances; uint256 totalSupply;'
+            ' function mint(address to, uint256 amount) external { balances[to] += amount; totalSupply += amount; }'
+            ' function correctBalance(address to, uint256 v) external { balances[to] = v; } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "state-pair-write-mismatch"))
+
+    def test_no_deviator_does_not_flag_state_pair_write_mismatch(self):
+        source = (
+            'contract A { mapping(address=>uint256) balances; uint256 totalSupply;'
+            ' function mint(address to, uint256 amount) external { balances[to] += amount; totalSupply += amount; }'
+            ' function airdrop(address to, uint256 amount) external { balances[to] += amount; totalSupply += amount; } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "state-pair-write-mismatch"))
+
+    def test_constructor_establishing_pair_alone_does_not_flag_state_pair_write_mismatch(self):
+        source = (
+            'contract A { mapping(address=>uint256) balances; uint256 totalSupply;'
+            ' constructor(address a, uint256 amt) { balances[a] += amt; totalSupply += amt; }'
+            ' function correctBalance(address to, uint256 v) external { balances[to] = v; } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "state-pair-write-mismatch"))
+
+    def test_disguised_relative_write_is_not_flagged_state_write_operator_inconsistency(self):
+        # `x = x + v` is a long-form increment, not a reset - must count
+        # as relative, same as `x += v`.
+        source = (
+            'contract A { uint256 x;'
+            ' function inc(uint256 v) external { x += v; }'
+            ' function incLongForm(uint256 v) external { x = x + v; } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "state-write-operator-inconsistency"))
+
+    def test_constructor_overwrite_is_excluded_from_state_write_operator_inconsistency(self):
+        source = (
+            'contract A { uint256 x;'
+            ' constructor(uint256 v) { x = v; }'
+            ' function inc(uint256 v) external { x += v; } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "state-write-operator-inconsistency"))
+
+    def test_all_overwriters_does_not_flag_state_write_operator_inconsistency(self):
+        # No relative-only writer at all - both writers overwrite, so
+        # there is no "established relative pattern" to break.
+        source = 'contract A { uint256 x; function setA(uint256 v) external { x = v; } function setB(uint256 v) external { x = v + 1; } }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "state-write-operator-inconsistency"))
+
+    def test_compensating_decrement_is_not_flagged_array_pop_during_forward_iteration(self):
+        source = (
+            'contract A { uint256[] arr;'
+            ' function clean() external { for (uint i = 0; i < arr.length; i++) { if (arr[i] == 0) { arr[i] = arr[arr.length-1]; arr.pop(); i--; } } } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "array-pop-during-forward-iteration"))
+
+    def test_backward_iteration_is_not_flagged_array_pop_during_forward_iteration(self):
+        source = (
+            'contract A { uint256[] arr;'
+            ' function clean() external { for (uint i = arr.length; i > 0; i--) { if (arr[i-1] == 0) { arr[i-1] = arr[arr.length-1]; arr.pop(); } } } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "array-pop-during-forward-iteration"))
+
+    def test_pop_on_different_array_is_not_flagged_array_pop_during_forward_iteration(self):
+        source = (
+            'contract A { uint256[] arr; uint256[] other;'
+            ' function clean() external { for (uint i = 0; i < arr.length; i++) { other.pop(); } } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "array-pop-during-forward-iteration"))
+
+    def test_while_loop_is_not_flagged_array_pop_during_forward_iteration(self):
+        source = (
+            'contract A { uint256[] arr;'
+            ' function clean() external { uint i = 0; while (i < arr.length) { arr.pop(); i++; } } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "array-pop-during-forward-iteration"))
 
     def test_disabled_initializers_suppresses_implementation_not_disabled(self):
         source = 'contract A is Initializable { constructor() { _disableInitializers(); } function initialize() public initializer {} }'

@@ -38,6 +38,11 @@ INITIALIZER_NAME_RE = re.compile(r"^(initialize|initialise|init|__\w+_init(?:_un
 SELF_SCOPED_WRITE_RE_TEMPLATE = r"\b{name}\b\s*\[\s*msg\.sender\s*\](?:\s*\[[^\]]*\])*\s*(=(?!=)|\+=|-=|\*=|/=|\|=|&=|\+\+|--)"
 PAYABLE_FUNDED_WRITE_RE_TEMPLATE = r"\b{name}\b\s*(=(?!=)|\+=)\s*[^;]*\bmsg\.value\b[^;]*;"
 
+# D-048: write-shape regexes reused by both state-pair-write-mismatch.general
+# and state-write-operator-inconsistency.general.
+RELATIVE_WRITE_RE_TEMPLATE = r"\b{name}\b\s*(?:\[[^\]]*\])*(?:\.\w+)*\s*(?:\+=|-=|\*=|/=|\|=|&=|\+\+|--)"
+ABSOLUTE_WRITE_RE_TEMPLATE = r"\b{name}\b\s*=(?!=)\s*([^;]*);"
+
 
 def _excluded_write_lines(fn: Dict[str, Any], name: str, line_index: Any) -> set:
     """Lines where `fn` writes `name` in one of the two structural shapes
@@ -155,6 +160,162 @@ def detect_state_write_guard_inconsistency(ctx: Dict[str, Any]) -> None:
         })
 
 
+def _written_vars_by_function(contract: Dict[str, Any], state_names: List[str], line_index: Any) -> Dict[int, Dict[str, Any]]:
+    """Shared scan for D-048's two checks: per non-constructor,
+    non-initializer function, which of `state_names` it genuinely writes
+    (D-047's self-scoped/payable-funded exclusions already applied, so a
+    self-service or self-funded write never counts as "this function
+    writes this variable" here either - same reasoning as
+    state-write-guard-inconsistency.general). Keyed by `id(fn)` since
+    function dicts aren't hashable by value and two functions can share a
+    name (overloads)."""
+    written_by: Dict[int, Dict[str, Any]] = {}
+    for fn in contract["functions"]:
+        if fn["_bodyStart"] is None or fn["_bodyEnd"] is None:
+            continue
+        if fn["kind"] == "constructor" or INITIALIZER_NAME_RE.match(fn["name"] or ""):
+            continue
+        written_vars = set()
+        for name in state_names:
+            writes, _internal_calls = find_state_writes(fn["_body"], fn["_bodyStart"] + 1, fn["_bodyStart"] + 1, [name], line_index)
+            if writes and not (set(writes) <= _excluded_write_lines(fn, name, line_index)):
+                written_vars.add(name)
+        if written_vars:
+            written_by[id(fn)] = {"fn": fn, "vars": written_vars}
+    return written_by
+
+
+def detect_state_pair_write_mismatch(ctx: Dict[str, Any]) -> None:
+    """V2.4, Business Logic / Invariants, second block (docs/decisiones.md
+    D-048). Purely structural co-occurrence signal: two state variables
+    are written together (both, in the same function) by 2+ functions -
+    establishing an apparent pattern that these two move as a pair (e.g.
+    `balances[to] += amount; totalSupply += amount;` in both a mint and
+    an airdrop function) - but a further function writes only ONE of the
+    two. Never asserts what the "correct" relationship between the two
+    variables actually is (no guess at mint/burn/supply semantics); it
+    only observes that an established co-occurrence, seen in 2+ places,
+    is broken in one more. Deliberately does NOT try to detect an
+    "opposite direction" violation (e.g. one increases while the
+    established pattern has both increase) - determining a consistent
+    "expected sign" per pair across functions that may use different
+    operators adds real complexity and its own FP surface for a signal
+    that is already only informational; out of scope for this first
+    version. Reuses the exact same per-(function, variable)
+    find_state_writes call and D-047 exclusions as
+    state-write-guard-inconsistency.general - a self-scoped or
+    payable-funded write never counts toward establishing OR breaking a
+    pair pattern either, for the same reasons. Constructors and
+    initializer-shaped functions are excluded entirely (see
+    _written_vars_by_function) - a constructor's one-time genesis writes
+    should not, by themselves as a single data point, define what
+    "normal" co-occurrence looks like for ongoing operational functions.
+    fpRisk medium: some functions legitimately touch only one side of an
+    otherwise-paired relationship on purpose (e.g. an explicit admin
+    correction tool), and a 2-function sample is a thin basis for
+    "established" - both are real, accepted limitations of a heuristic
+    that deliberately never asks what the variables mean."""
+    contract, cname = ctx["contract"], ctx["cname"]
+    if cname is None:
+        return
+    state_names = sorted(v["name"] for v in contract["stateVariables"] if not v.get("constant") and not v.get("immutable"))
+    if len(state_names) < 2:
+        return
+    written_by = _written_vars_by_function(contract, state_names, ctx["line_index"])
+    if len(written_by) < 2:
+        return
+    entries = list(written_by.values())
+    for i, a in enumerate(state_names):
+        for b in state_names[i + 1:]:
+            together = [e for e in entries if a in e["vars"] and b in e["vars"]]
+            if len(together) < 2:
+                continue
+            only_a = [e for e in entries if a in e["vars"] and b not in e["vars"]]
+            only_b = [e for e in entries if b in e["vars"] and a not in e["vars"]]
+            deviators = only_a + only_b
+            if not deviators:
+                continue
+            anchor_fn = deviators[0]["fn"]
+            scope = {"function": anchor_fn["name"] or anchor_fn["kind"], "modifier": None, "kind": anchor_fn["kind"]}
+            ctx["collector"].add("state-pair-write-mismatch.general", anchor_fn["_headStart"], cname, scope, {
+                "variables": [a, b],
+                "writtenTogether": sorted(e["fn"]["name"] or e["fn"]["kind"] for e in together),
+                "onlyFirst": sorted(e["fn"]["name"] or e["fn"]["kind"] for e in only_a),
+                "onlySecond": sorted(e["fn"]["name"] or e["fn"]["kind"] for e in only_b),
+            })
+
+
+def _write_operator_kinds(fn: Dict[str, Any], name: str) -> Dict[str, bool]:
+    """Whether `fn` writes `name` in a relative (self-referencing) shape
+    or a true absolute overwrite. `+=`/`-=`/`++`/`--`-shaped writes are
+    unambiguously relative from their own syntax. A bare `name = <rhs>`
+    is only counted as an overwrite when `<rhs>` never mentions `name` at
+    all - `x = x + amount` is a disguised increment (a common long-form
+    style) and must not be misread as a reset just because it uses `=`."""
+    body = fn["_body"]
+    has_relative = bool(re.search(RELATIVE_WRITE_RE_TEMPLATE.format(name=re.escape(name)), body))
+    has_absolute = False
+    for match in re.finditer(ABSOLUTE_WRITE_RE_TEMPLATE.format(name=re.escape(name)), body):
+        if re.search(r"\b" + re.escape(name) + r"\b", match.group(1)):
+            has_relative = True
+        else:
+            has_absolute = True
+    return {"relative": has_relative, "absolute": has_absolute}
+
+
+def detect_state_write_operator_inconsistency(ctx: Dict[str, Any]) -> None:
+    """V2.4, Business Logic / Invariants, second block (docs/decisiones.md
+    D-048). A state variable adjusted only relatively (`+=`/`-=`/`++`/
+    `--`, or the disguised-relative `x = x + amount` style - see
+    _write_operator_kinds) by every writer but one, where that one
+    function instead overwrites it outright (`x = <expr not mentioning
+    x>`) - informational regardless of that function's own guard status:
+    even a properly `onlyOwner`-gated reset can silently discard
+    accounting a purely-relative sibling set of functions assumed would
+    only ever be adjusted incrementally. Fires only when exactly one
+    writer overwrites and at least one other is relative-only, keeping
+    this to the narrow "one outlier among an established pattern" shape
+    rather than flagging any variable with a mix of styles. Constructors
+    and initializer-shaped functions are excluded (see
+    _written_vars_by_function) - a constructor's `x = INITIAL` is the
+    universal, expected way to set a variable's genesis value and would
+    otherwise make this fire on nearly every stateful contract. Reuses
+    the same D-047 self-scoped/payable-funded exclusions before even
+    asking which operator was used. fpRisk medium - a deliberate,
+    documented "reset" admin function is a legitimate design this
+    heuristic cannot distinguish from an accidental one."""
+    contract, cname = ctx["contract"], ctx["cname"]
+    if cname is None:
+        return
+    state_names = [v["name"] for v in contract["stateVariables"] if not v.get("constant") and not v.get("immutable")]
+    if not state_names:
+        return
+    written_by = _written_vars_by_function(contract, state_names, ctx["line_index"])
+    writers: Dict[str, List[Dict[str, Any]]] = {}
+    for entry in written_by.values():
+        fn = entry["fn"]
+        for name in entry["vars"]:
+            kinds = _write_operator_kinds(fn, name)
+            writers.setdefault(name, []).append({"fn": fn, "hasAbsolute": kinds["absolute"]})
+    for name in sorted(writers):
+        entries = writers[name]
+        if len(entries) < 2:
+            continue
+        relative_only = [e for e in entries if not e["hasAbsolute"]]
+        overwriters = [e for e in entries if e["hasAbsolute"]]
+        if len(relative_only) < 1 or len(overwriters) != 1:
+            continue
+        anchor_fn = overwriters[0]["fn"]
+        scope = {"function": anchor_fn["name"] or anchor_fn["kind"], "modifier": None, "kind": anchor_fn["kind"]}
+        ctx["collector"].add("state-write-operator-inconsistency.general", anchor_fn["_headStart"], cname, scope, {
+            "variable": name,
+            "relativeWriters": sorted(e["fn"]["name"] or e["fn"]["kind"] for e in relative_only),
+            "overwriteFunction": anchor_fn["name"] or anchor_fn["kind"],
+        })
+
+
 CONTRACT_CHECKS = [
     ("state-write-guard-inconsistency.general", detect_state_write_guard_inconsistency),
+    ("state-pair-write-mismatch.general", detect_state_pair_write_mismatch),
+    ("state-write-operator-inconsistency.general", detect_state_write_operator_inconsistency),
 ]
