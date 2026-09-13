@@ -1,5 +1,5 @@
 {
-  "description": "Single source of truth for review-mode limits and feature-gating. Loaded at runtime by scripts/preprocess.py (maxEffectiveLoc/maxSourceFiles), scripts/validate_report.py (allowPatch/allowGasSuggestions/allowExecutiveSummary/allowArchitectureChecks, rules R-06/R-09) and scripts/render_report.py (allowHtmlReport, rule R-06). Edit this file to change mode behavior; no script hardcodes a second copy of these values. A missing or malformed copy of this file makes every script that needs it fail explicitly - see scripts/preprocess.py's ModesConfigError.",
+  "description": "Single source of truth for review-mode limits and feature-gating. Loaded at runtime by scripts/preprocess.py (maxEffectiveLoc/maxSourceFiles, allowSystemGraph), scripts/validate_report.py (allowPatch/allowGasSuggestions/allowExecutiveSummary/allowArchitectureChecks, rules R-06/R-09) and scripts/render_report.py (allowHtmlReport, rule R-06). Edit this file to change mode behavior; no script hardcodes a second copy of these values. A missing or malformed copy of this file makes every script that needs it fail explicitly - see scripts/preprocess.py's ModesConfigError.",
   "defaultMode": "standard",
   "modes": {
     "quick": {
@@ -9,7 +9,8 @@
       "allowGasSuggestions": false,
       "allowHtmlReport": false,
       "allowArchitectureChecks": false,
-      "allowExecutiveSummary": false
+      "allowExecutiveSummary": false,
+      "allowSystemGraph": false
     },
     "standard": {
       "maxEffectiveLoc": 1500,
@@ -18,7 +19,8 @@
       "allowGasSuggestions": true,
       "allowHtmlReport": false,
       "allowArchitectureChecks": false,
-      "allowExecutiveSummary": false
+      "allowExecutiveSummary": false,
+      "allowSystemGraph": false
     },
     "pro": {
       "maxEffectiveLoc": 4000,
@@ -27,7 +29,8 @@
       "allowGasSuggestions": true,
       "allowHtmlReport": true,
       "allowArchitectureChecks": true,
-      "allowExecutiveSummary": true
+      "allowExecutiveSummary": true,
+      "allowSystemGraph": true
     }
   }
 }

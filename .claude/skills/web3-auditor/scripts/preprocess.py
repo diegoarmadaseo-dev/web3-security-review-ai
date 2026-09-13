@@ -1504,6 +1504,107 @@ def compute_completeness(
 
 
 # ---------------------------------------------------------------------------
+# System graph (V2.2, docs/decisiones.md D-037): a deterministic, "pro"-mode-
+# only view of relationships BETWEEN contracts in the bundle - inheritance,
+# resolved calls, and a conservative proxy-to-implementation pairing. This is
+# inventory/context, like contracts[]/calls[], never a signal or a finding:
+# no severity, confidence or status-as-vulnerability field anywhere here.
+# Built entirely from data this module already computes while parsing once
+# (basesResolved, calls[], the proxy-pattern/delegatecall signals, stateVariables'
+# userType) - no second scan of source text, no resolution of contracts outside
+# the bundle, no multi-hop/data-flow traversal. A name that resolves to zero or
+# more than one contract in the bundle is treated as unresolved/ambiguous and
+# silently excluded from edges (inherits/calls) or reported with an explicit
+# reason (proxies) - never a forced, guessed binding.
+# ---------------------------------------------------------------------------
+
+def resolve_feature_flags(mode: str, modes_config: Optional[Dict[str, Any]] = None) -> Dict[str, bool]:
+    config = modes_config if modes_config is not None else load_modes_config()
+    modes = config["modes"]
+    if mode not in modes:
+        raise ModesConfigError("mode %r is not defined in modes config (available: %s)" % (mode, sorted(modes.keys())))
+    return {"allowSystemGraph": bool(modes[mode].get("allowSystemGraph", False))}
+
+
+def _contract_name_index(contracts_out: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+    index: Dict[str, List[str]] = {}
+    for c in contracts_out:
+        if c.get("name") and c.get("key"):
+            index.setdefault(c["name"], []).append(c["key"])
+    return index
+
+
+def compute_system_graph(
+    contracts_out: List[Dict[str, Any]],
+    all_calls: List[Dict[str, Any]],
+    all_signals: List[Dict[str, Any]],
+    allow_system_graph: bool,
+) -> Dict[str, Any]:
+    if not allow_system_graph:
+        return {"status": "not_computed", "message": "Multi-contract system analysis (nodes/edges/proxies) is only computed in 'pro' mode.", "nodes": [], "edges": [], "proxies": []}
+
+    name_index = _contract_name_index(contracts_out)
+    key_by_file_name = {(c["file"], c["name"]): c["key"] for c in contracts_out if c.get("name") and c.get("key")}
+    state_vars_by_key = {c["key"]: {sv["name"]: sv for sv in c.get("stateVariables", [])} for c in contracts_out if c.get("key")}
+
+    nodes = [{"key": c["key"], "file": c["file"], "name": c["name"], "kind": c.get("kind")} for c in contracts_out if c.get("key")]
+
+    edges: List[Dict[str, Any]] = []
+    for c in contracts_out:
+        if not c.get("key"):
+            continue
+        for base in c.get("basesResolved", []):
+            candidates = name_index.get(base["name"], [])
+            if len(candidates) == 1:
+                edges.append({"kind": "inherits", "from": c["key"], "to": candidates[0]})
+
+    for call in all_calls:
+        from_key = key_by_file_name.get((call.get("file"), call.get("contract")))
+        callee_type = call.get("calleeType")
+        to_candidates = name_index.get(callee_type, []) if callee_type else []
+        if from_key and len(to_candidates) == 1:
+            edges.append({"kind": "calls", "from": from_key, "to": to_candidates[0], "function": call.get("function"), "line": call.get("line"), "method": call.get("method")})
+
+    proxy_signals = [s for s in all_signals if s["family"] == "proxy-pattern"]
+    delegatecall_signals = [s for s in all_signals if s["family"] == "delegatecall"]
+    proxies: List[Dict[str, Any]] = []
+    for ps in proxy_signals:
+        proxy_key = key_by_file_name.get((ps["file"], ps["contract"]))
+        if not proxy_key:
+            continue
+        site_candidates = [d for d in delegatecall_signals if d["file"] == ps["file"] and d["contract"] == ps["contract"]]
+        fallback_hits = [d for d in site_candidates if d["details"].get("inFallback")]
+        chosen = fallback_hits or site_candidates
+        entry: Dict[str, Any] = {"proxy": proxy_key, "implementation": None, "status": "unresolved", "reason": None}
+        if not chosen:
+            entry["reason"] = "no delegatecall site found in this contract"
+        else:
+            target = chosen[0]["details"].get("target")
+            sv = state_vars_by_key.get(proxy_key, {}).get(target) if target else None
+            user_type = sv.get("userType") if sv else None
+            impl_candidates = name_index.get(user_type, []) if user_type else []
+            if not target:
+                entry["reason"] = "delegatecall target is not a simple identifier (e.g. an inline expression or raw assembly slot)"
+            elif not sv:
+                entry["reason"] = "delegatecall target %r is not a state variable of this contract" % target
+            elif not user_type:
+                entry["reason"] = "state variable %r has no resolvable contract/interface type" % target
+            elif len(impl_candidates) != 1:
+                entry["reason"] = "type %r matches %d contracts in the bundle (need exactly 1 to bind)" % (user_type, len(impl_candidates))
+            else:
+                entry["implementation"] = impl_candidates[0]
+                entry["status"] = "resolved"
+                entry["reason"] = "delegatecall target %r has type %r, uniquely resolved in this bundle" % (target, user_type)
+                edges.append({"kind": "delegatesTo", "from": proxy_key, "to": impl_candidates[0]})
+        proxies.append(entry)
+
+    nodes.sort(key=lambda n: n["key"])
+    edges.sort(key=lambda e: (e["kind"], e["from"], e.get("to") or ""))
+    proxies.sort(key=lambda p: p["proxy"])
+    return {"status": "computed", "nodes": nodes, "edges": edges, "proxies": proxies}
+
+
+# ---------------------------------------------------------------------------
 # Artifact assembly
 # ---------------------------------------------------------------------------
 
@@ -1519,6 +1620,7 @@ def build_artifact(
     mode: str,
     limits: Dict[str, Optional[int]],
     include_timestamp: bool,
+    allow_system_graph: bool = False,
 ) -> Dict[str, Any]:
     declared_types = build_declared_types(processed)
     known_paths = known_source_paths(processed)
@@ -1574,6 +1676,8 @@ def build_artifact(
                 signals = detect_vyper_signals(entry)
             signals_by_file[path] = signals
             all_signals.extend(signals)
+            for call in calls:
+                call["file"] = path
             all_calls.extend(calls)
 
             file_imports_classified = [classify_import(imp["path"], path, known_paths) for imp in entry["structure"]["imports"]]
@@ -1601,7 +1705,7 @@ def build_artifact(
         files_out.append(file_record)
 
     all_signals.sort(key=lambda s: (s["file"], s["line"], s["column"], s["family"]))
-    all_calls.sort(key=lambda c: (c.get("contract") or "", c.get("function") or "", c["line"]))
+    all_calls.sort(key=lambda c: (c.get("file") or "", c.get("contract") or "", c.get("function") or "", c["line"]))
     all_comments.sort(key=lambda c: (c["file"], c["lineStart"]))
     all_injections.sort(key=lambda i: (i["file"], i["line"], i["pattern"]))
     all_secrets.sort(key=lambda s: (s["file"], s["line"]))
@@ -1611,6 +1715,7 @@ def build_artifact(
 
     priority_ranking = compute_priority_ranking(processed, signals_by_file)
     completeness = compute_completeness(processed, import_records, base_records, mode, limits, priority_ranking)
+    system_graph = compute_system_graph(contracts_out, all_calls, all_signals, allow_system_graph)
 
     totals = {
         "sourceFiles": sum(1 for e in processed if e["kind"] == "source"),
@@ -1641,6 +1746,7 @@ def build_artifact(
         "secrets": all_secrets,
         "completeness": completeness,
         "priorityRanking": priority_ranking,
+        "systemGraph": system_graph,
         "categories": CATEGORIES,
     }
     if include_timestamp:
@@ -1694,7 +1800,8 @@ def run(
         raise PreprocessError("no analyzable input found")
     processed = [process_entry(entry) for entry in entries]
     limits = resolve_limits(mode, max_loc, modes_config=modes_config)
-    return build_artifact(processed, mode=mode, limits=limits, include_timestamp=include_timestamp)
+    feature_flags = resolve_feature_flags(mode, modes_config=modes_config)
+    return build_artifact(processed, mode=mode, limits=limits, include_timestamp=include_timestamp, allow_system_graph=feature_flags["allowSystemGraph"])
 
 
 def build_arg_parser(modes_config: Dict[str, Any]) -> argparse.ArgumentParser:

@@ -735,6 +735,118 @@ class MultiContractTests(unittest.TestCase):
             self.assertEqual(artifact["completeness"]["status"], "partial")
 
 
+class SystemGraphTests(unittest.TestCase):
+    """V2.2 (docs/decisiones.md D-037): the deterministic, pro-only, 1-hop
+    inheritance/calls/proxy graph across contracts in the bundle. Built
+    entirely from data preprocess.py already computes (basesResolved,
+    calls[], the proxy-pattern/delegatecall signals, stateVariables'
+    userType) - no second scan, no data-flow, no contracts outside the
+    bundle, never a forced proxy-implementation binding."""
+
+    def test_quick_and_standard_modes_do_not_compute_system_graph(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "A.sol", "pragma solidity 0.8.20;\ncontract A {}\n")
+            for mode in ("quick", "standard"):
+                with self.subTest(mode=mode):
+                    artifact = run_paths([tmp], mode=mode)
+                    sg = artifact["systemGraph"]
+                    self.assertEqual(sg["status"], "not_computed")
+                    self.assertEqual(sg["nodes"], [])
+                    self.assertEqual(sg["edges"], [])
+                    self.assertEqual(sg["proxies"], [])
+                    self.assertTrue(sg.get("message"))
+
+    def test_pro_mode_computes_inheritance_and_call_edges(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "Base.sol", "pragma solidity 0.8.20;\ncontract Base { function ping() external pure returns (uint) { return 1; } }\n")
+            write(tmp, "Child.sol", (
+                'pragma solidity 0.8.20;\nimport "./Base.sol";\n'
+                "contract Registry { function ping() external pure returns (uint) { return 2; } }\n"
+                "contract Child is Base { Registry public registry; function callIt() external { registry.ping(); } }\n"
+            ))
+            artifact = run_paths([tmp], mode="pro")
+            sg = artifact["systemGraph"]
+            self.assertEqual(sg["status"], "computed")
+            node_keys = {n["key"] for n in sg["nodes"]}
+            self.assertEqual(node_keys, {"Base.sol#Base", "Child.sol#Child", "Child.sol#Registry"})
+            inherits = [e for e in sg["edges"] if e["kind"] == "inherits"]
+            calls = [e for e in sg["edges"] if e["kind"] == "calls"]
+            self.assertIn({"kind": "inherits", "from": "Child.sol#Child", "to": "Base.sol#Base"}, inherits)
+            self.assertTrue(any(e["from"] == "Child.sol#Child" and e["to"] == "Child.sol#Registry" for e in calls))
+
+    def test_ambiguous_same_name_contract_produces_no_inheritance_edge(self):
+        # Same fixture shape as test_same_contract_name_in_different_files_are_distinct:
+        # a name that resolves to more than one contract in the bundle must never
+        # produce a guessed edge.
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "A.sol", "pragma solidity 0.8.20;\ncontract Token {}\n")
+            write(tmp, "B.sol", "pragma solidity 0.8.20;\ncontract Token {}\n")
+            write(tmp, "C.sol", "pragma solidity 0.8.20;\ncontract Consumer is Token {}\n")
+            artifact = run_paths([tmp], mode="pro")
+            sg = artifact["systemGraph"]
+            self.assertFalse(any(e["kind"] == "inherits" for e in sg["edges"]))
+
+    def test_proxy_implementation_resolved_via_delegatecall_target_type(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "Impl.sol", "pragma solidity 0.8.20;\ncontract LogicV1 { uint public x; function setX(uint v) external { x = v; } }\n")
+            write(tmp, "Proxy.sol", (
+                'pragma solidity 0.8.20;\nimport "./Impl.sol";\n'
+                "contract MyProxy {\n"
+                "    LogicV1 internal implementation;\n"
+                "    fallback() external payable {\n"
+                "        (bool ok, ) = implementation.delegatecall(msg.data);\n"
+                "        require(ok);\n"
+                "    }\n"
+                "}\n"
+            ))
+            artifact = run_paths([tmp], mode="pro")
+            sg = artifact["systemGraph"]
+            proxy_entry = next(p for p in sg["proxies"] if p["proxy"] == "Proxy.sol#MyProxy")
+            self.assertEqual(proxy_entry["status"], "resolved")
+            self.assertEqual(proxy_entry["implementation"], "Impl.sol#LogicV1")
+            self.assertIn({"kind": "delegatesTo", "from": "Proxy.sol#MyProxy", "to": "Impl.sol#LogicV1"}, sg["edges"])
+
+    def test_proxy_implementation_unresolved_when_implementation_not_in_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "Proxy2.sol", (
+                "pragma solidity 0.8.20;\n"
+                "contract MyProxy2 {\n"
+                "    address internal implementation;\n"
+                "    fallback() external payable {\n"
+                "        (bool ok, ) = implementation.delegatecall(msg.data);\n"
+                "        require(ok);\n"
+                "    }\n"
+                "}\n"
+            ))
+            artifact = run_paths([tmp], mode="pro")
+            sg = artifact["systemGraph"]
+            proxy_entry = next(p for p in sg["proxies"] if p["proxy"] == "Proxy2.sol#MyProxy2")
+            self.assertEqual(proxy_entry["status"], "unresolved")
+            self.assertIsNone(proxy_entry["implementation"])
+            self.assertTrue(proxy_entry["reason"])
+            self.assertFalse(any(e["kind"] == "delegatesTo" for e in sg["edges"]))
+
+    def test_proxy_without_any_delegatecall_site_is_unresolved_not_dropped(self):
+        # A contract can match proxy-pattern's structural indicators (e.g. a
+        # known EIP-1967 storage-slot constant) without this heuristic finding
+        # any delegatecall site at all - must still be listed as unresolved,
+        # never silently omitted from proxies[].
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "Proxy3.sol", (
+                "pragma solidity 0.8.20;\n"
+                "contract MyProxy3 {\n"
+                "    bytes32 internal constant SLOT ="
+                " 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;\n"
+                "}\n"
+            ))
+            artifact = run_paths([tmp], mode="pro")
+            sg = artifact["systemGraph"]
+            proxy_entry = next((p for p in sg["proxies"] if p["proxy"] == "Proxy3.sol#MyProxy3"), None)
+            self.assertIsNotNone(proxy_entry)
+            self.assertEqual(proxy_entry["status"], "unresolved")
+            self.assertIn("delegatecall", proxy_entry["reason"])
+
+
 class MultilingualTests(unittest.TestCase):
     def test_italian_comment_does_not_hide_signal_and_is_captured(self):
         source = (
