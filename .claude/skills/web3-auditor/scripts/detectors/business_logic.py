@@ -50,11 +50,18 @@ PAYABLE_FUNDED_WRITE_RE_TEMPLATE = r"\b{name}\b\s*(=(?!=)|\+=)\s*[^;]*\bmsg\.val
 RELATIVE_WRITE_RE_TEMPLATE = r"\b{name}\b\s*(?:\[[^\]]*\])*(?:\.\w+)*\s*(?:\+=|-=|\*=|/=|\|=|&=|\+\+|--)"
 ABSOLUTE_WRITE_RE_TEMPLATE = r"\b{name}\b\s*(?:\[[^\]]*\])*(?:\.\w+)*\s*=(?!=)\s*([^;]*);"
 
-# D-050: structural signature of a deliberate "close out and clear" reset
-# (liquidation/sweep/claim), as opposed to a genuinely suspicious
-# arbitrary overwrite - see _has_closeout_signal.
+# D-050 (narrowed in D-051): structural signature of a deliberate
+# "read the old value, then clear it" reset, as opposed to a genuinely
+# suspicious arbitrary overwrite - see _has_closeout_signal. D-050
+# originally also accepted any value-transfer-shaped call anywhere in the
+# function as a second, independent signal; Diego rejected that as too
+# broad once it was shown to exclude a confirmed true positive
+# (RewardPool.claimReward's `shares[msg.sender] = 0`, excused only
+# because the SAME function happened to also transfer an unrelated
+# reward amount) - removed entirely, not narrowed, since any function-wide
+# signal not tied to the specific variable being reset can excuse an
+# unrelated write the same way.
 ZERO_LITERAL_RE = re.compile(r"^(0+|0x0+)$")
-VALUE_TRANSFER_RE = re.compile(r"\.\s*transfer\s*\(|\.\s*send\s*\(|\.\s*call\s*\{[^}]*\bvalue\b")
 
 
 def _excluded_write_lines(fn: Dict[str, Any], name: str, line_index: Any) -> set:
@@ -274,27 +281,34 @@ def detect_state_pair_write_mismatch(ctx: Dict[str, Any]) -> None:
 
 
 def _has_closeout_signal(body: str, name: str, match: Any) -> bool:
-    """D-050: structural evidence that an absolute `name = 0` overwrite is
-    a deliberate "close out this position and clear it" reset rather than
-    a blind, unexplained stomp - never inferred from the function's or
-    variable's name. Either of two independent, purely syntactic signals
-    is enough: (a) `name` is referenced somewhere else in the SAME
-    function body, outside this exact write's own span - the classic
+    """D-050, narrowed in D-051: structural evidence that an absolute
+    `name = 0` overwrite is a deliberate "read the old value, then clear
+    it" reset rather than a blind, unexplained stomp - never inferred
+    from the function's or variable's name, and never from anything other
+    than `name` itself. The only signal: `name` is referenced somewhere
+    else in the SAME function body, outside this exact write's own span -
+    the classic
     `uint256 seized = collateralDeposited[account]; collateralDeposited[account] = 0;`
-    read-then-clear idiom; or (b) the function contains a value-transfer-
-    shaped call anywhere (`.transfer(`/`.send(`/`.call{value...`) - a
-    liquidation/sweep that reads the OLD value of a *different* variable
-    (e.g. `borrowed[account] = 0;` in the same function that transfers
-    out `collateralDeposited`) still needs a closeout signal to exclude
-    it, and (a) alone would miss that case since `borrowed` itself is
-    never re-read in that function."""
-    other_refs = [
-        m for m in re.finditer(r"\b" + re.escape(name) + r"\b", body)
-        if not (match.start() <= m.start() < match.end())
-    ]
-    if other_refs:
-        return True
-    return bool(VALUE_TRANSFER_RE.search(body))
+    read-then-clear idiom.
+
+    D-050 originally also accepted a value-transfer-shaped call
+    (`.transfer(`/`.send(`/`.call{value...`) ANYWHERE in the function as
+    an alternative signal, specifically to also excuse
+    `borrowed[account] = 0;` in a liquidation function that transfers out
+    a *different* variable (`collateralDeposited`) without re-reading
+    `borrowed` itself. Diego rejected that: a signal not tied to the
+    specific variable being reset can excuse an unrelated write the same
+    way it excused that one - confirmed when it also hid a real bug
+    (RewardPool.claimReward's `shares[msg.sender] = 0`, with `totalShares`
+    never decremented anywhere in the contract - a genuine, permanent
+    state desync, not a false positive). Removing it means
+    `borrowed[account] = 0` goes back to firing too - an accepted,
+    deliberate tradeoff: never hide a real case to reduce a false
+    positive count."""
+    return any(
+        not (match.start() <= m.start() < match.end())
+        for m in re.finditer(r"\b" + re.escape(name) + r"\b", body)
+    )
 
 
 def _write_operator_kinds(fn: Dict[str, Any], name: str) -> Dict[str, bool]:
@@ -351,32 +365,35 @@ def detect_state_write_operator_inconsistency(ctx: Dict[str, Any]) -> None:
     exists to catch, not something to filter out before even asking which
     operator was used.
 
-    D-050 refinement: an initial version found 3/16 real evals/cases/*.sol
-    fixtures firing once D-049 stopped excluding self-scoped/payable-funded
-    writes - SpotPriceLending.liquidate (`collateralDeposited[account] = 0;
-    borrowed[account] = 0;` after seizing collateral, transferring the
-    seized amount out) and UpgradeableVaultLogic.sweepToOwner
-    (`totalDeposits = 0;` after transferring the swept total to the owner,
-    the same function already identified as legitimate in D-046), all
-    confirmed false positives - resetting a per-account balance to
-    literal zero as part of a legitimate close-out is exactly as common
-    and correct a pattern as D-046/D-047's self-scoped/payable-funded
-    ones, just a different shape. Fixed structurally (never by function/
-    variable name) via _write_operator_kinds' new `safeReset` category:
-    an overwrite to a literal zero WITH a closeout signal
-    (_has_closeout_signal - the variable read elsewhere in the same
-    function, or the function containing any value-transfer-shaped call)
-    is excluded from the writer's own classification entirely, the same
-    treatment constructors already get. A non-zero overwrite, or a zero
-    overwrite with no closeout evidence at all, is deliberately NOT
-    excluded - a genuinely unexpected operator change is never hidden
-    just because it happens to assign zero. fpRisk medium (reverted from
-    the D-049 high once the confirmed false positives were excluded
-    structurally) - residual risk is a deliberate, documented "reset"
-    admin function with no read/transfer nearby, or a genuinely
-    suspicious zero-write that happens to share a function with an
-    unrelated transfer, both of which this heuristic still cannot
-    perfectly distinguish."""
+    D-050/D-051 refinement: an initial version found 3/16 real
+    evals/cases/*.sol fixtures firing once D-049 stopped excluding
+    self-scoped/payable-funded writes - SpotPriceLending.liquidate
+    (`collateralDeposited[account] = 0; borrowed[account] = 0;` after
+    seizing collateral) and UpgradeableVaultLogic.sweepToOwner
+    (`totalDeposits = 0;`, the same function already identified as
+    legitimate in D-046). `collateralDeposited`/`totalDeposits` are
+    confirmed false positives - both are read (`uint256 seized =
+    collateralDeposited[account]`, `transfer(totalDeposits)`) before being
+    reset, the classic read-then-clear idiom. Fixed structurally (never
+    by function/variable name) via _write_operator_kinds' `safeReset`
+    category: an overwrite to a literal zero WITH that same-variable
+    closeout signal (_has_closeout_signal) is excluded from the writer's
+    own classification entirely, the same treatment constructors already
+    get. D-050 originally also excused ANY zero-reset in a function that
+    contained a value-transfer call anywhere, regardless of which
+    variable it related to; Diego rejected that once it was shown to also
+    hide a confirmed true positive (RewardPool.claimReward's
+    `shares[msg.sender] = 0`, with `totalShares` never decremented
+    anywhere in the contract - a real, permanent state desync). That
+    broader signal was removed entirely (D-051), so `borrowed[account] =
+    0` (never itself re-read in `liquidate`) goes back to firing too - an
+    accepted, deliberate tradeoff: never hide a real case to reduce a
+    false positive count. A non-zero overwrite, or a zero overwrite with
+    no same-variable closeout evidence at all, was already, and remains,
+    never excluded. fpRisk medium - residual risk is a deliberate,
+    documented "reset" admin function with no direct re-read of its own
+    variable nearby (like `borrowed`), which this narrower heuristic will
+    still flag rather than silently trust."""
     contract, cname = ctx["contract"], ctx["cname"]
     if cname is None:
         return

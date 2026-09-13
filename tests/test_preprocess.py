@@ -1342,10 +1342,14 @@ class SignalFamilyNegativeControlTests(unittest.TestCase):
         signals = self._signals_for(source)
         self.assertFalse(signals_of({"signals": signals}, "state-write-operator-inconsistency"))
 
-    def test_liquidation_reset_without_direct_reread_is_not_flagged_via_transfer_signal(self):
-        # Same liquidate() function: borrowed[account] = 0 is never itself
-        # re-read in this function, but the function's own value-transfer
-        # call is still evidence of a closeout - must not fire either.
+    def test_reset_without_direct_reread_still_flags_state_write_operator_inconsistency(self):
+        # D-051: the D-050 fallback ("any value-transfer call anywhere in
+        # the function excuses a zero-reset") was removed after it was
+        # shown to hide a confirmed true positive. Same liquidate()
+        # function as the collateralDeposited test above:
+        # borrowed[account] = 0 is never itself re-read in this function -
+        # an unrelated transfer of a DIFFERENT variable no longer excuses
+        # it, so it must fire, an accepted, deliberate tradeoff.
         source = (
             'contract A { mapping(address=>uint256) collateralDeposited; mapping(address=>uint256) borrowed;'
             ' function borrow(uint256 amt) external { borrowed[msg.sender] += amt; }'
@@ -1354,7 +1358,26 @@ class SignalFamilyNegativeControlTests(unittest.TestCase):
             ' payable(msg.sender).transfer(seized); } }'
         )
         signals = self._signals_for(source)
-        self.assertFalse(signals_of({"signals": signals}, "state-write-operator-inconsistency"))
+        hits = [s for s in signals if s["family"] == "state-write-operator-inconsistency"]
+        self.assertTrue(hits)
+        self.assertEqual(hits[0]["details"]["variable"], "borrowed")
+
+    def test_reward_pool_claim_reward_true_positive_still_flags_state_write_operator_inconsistency(self):
+        # The confirmed true positive that motivated D-051: shares is
+        # only ever read via a SEPARATE view function (calculateReward),
+        # never referenced directly inside claimReward's own body, so
+        # nothing excuses the reset - and nothing should. totalShares is
+        # never decremented anywhere, a genuine, permanent state desync.
+        source = (
+            'contract RewardPool { uint256 public totalShares; uint256 public totalRewards; mapping(address=>uint256) public shares;'
+            ' function deposit(uint256 shareAmount) external { shares[msg.sender] += shareAmount; totalShares += shareAmount; }'
+            ' function calculateReward(address account) public view returns (uint256) { return (shares[account] / totalShares) * totalRewards; }'
+            ' function claimReward() external { uint256 reward = calculateReward(msg.sender); shares[msg.sender] = 0; payable(msg.sender).transfer(reward); } }'
+        )
+        signals = self._signals_for(source)
+        hits = [s for s in signals if s["family"] == "state-write-operator-inconsistency"]
+        self.assertTrue(hits)
+        self.assertEqual(hits[0]["details"]["variable"], "shares")
 
     def test_sweep_reset_after_transfer_is_not_flagged_state_write_operator_inconsistency(self):
         # UpgradeableVaultLogic.sweepToOwner, verbatim shape: the real
