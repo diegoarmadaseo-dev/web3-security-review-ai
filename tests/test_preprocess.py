@@ -1115,6 +1115,58 @@ class SignalFamilyNegativeControlTests(unittest.TestCase):
         self.assertEqual(guarded_by_name["setXByInline"]["modifiers"], [])
         self.assertTrue(guarded_by_name["setXByInline"]["bodyGuards"])
 
+    # --- D-047 refinement: exclude the 2 real FPs found on the eval fixtures ---
+
+    def test_self_scoped_msg_sender_write_is_not_flagged_state_write_guard_inconsistency(self):
+        # CreditLedger.spendCredit, verbatim shape: credits[msg.sender] is
+        # self-service (the index IS the caller's own scope) next to an
+        # admin-only credits[to] writer - must not fire.
+        source = (
+            'contract CreditLedger { address public issuer; mapping(address => uint256) public credits;'
+            ' modifier onlyIssuer() { require(msg.sender == issuer, "not issuer"); _; }'
+            ' function issueCredit(address to, uint256 amount) external onlyIssuer { credits[to] += amount; }'
+            ' function spendCredit(uint256 amount) external { unchecked { credits[msg.sender] -= amount; } } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "state-write-guard-inconsistency"))
+
+    def test_payable_msg_value_write_is_not_flagged_state_write_guard_inconsistency(self):
+        # UpgradeableVaultLogic.deposit, verbatim shape: a payable inflow
+        # accumulating msg.value next to a guarded sweep - an ordinary
+        # pool/ledger design, must not fire.
+        source = (
+            'contract UpgradeableVaultLogic { address public owner; uint256 public totalDeposits;'
+            ' function deposit() external payable { totalDeposits += msg.value; }'
+            ' function sweepToOwner() external { require(msg.sender == owner, "not owner"); totalDeposits = 0; } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "state-write-guard-inconsistency"))
+
+    def test_mapping_indexed_by_parameter_still_flags_state_write_guard_inconsistency(self):
+        # Adversarial: a mapping write that LOOKS like the self-scoped
+        # shape but is indexed by an arbitrary parameter, not msg.sender -
+        # a genuine arbitrary-account bypass, must still fire.
+        source = (
+            'contract A { address owner; mapping(address=>uint256) balances;'
+            ' function creditTo(address to, uint256 amount) external { require(msg.sender == owner); balances[to] += amount; }'
+            ' function debitAny(address to, uint256 amount) external { balances[to] -= amount; } }'
+        )
+        signals = self._signals_for(source)
+        self.assertTrue(signals_of({"signals": signals}, "state-write-guard-inconsistency"))
+
+    def test_payable_function_write_unrelated_to_msg_value_still_flags_state_write_guard_inconsistency(self):
+        # Adversarial: a payable function that writes state, but the write
+        # itself has nothing to do with msg.value - the payable-funded
+        # exclusion must not over-apply to every write in a payable
+        # function.
+        source = (
+            'contract A { address owner; address public lastDepositor;'
+            ' function deposit() external payable { lastDepositor = msg.sender; }'
+            ' function resetDepositor() external { require(msg.sender == owner); lastDepositor = address(0); } }'
+        )
+        signals = self._signals_for(source)
+        self.assertTrue(signals_of({"signals": signals}, "state-write-guard-inconsistency"))
+
     def test_disabled_initializers_suppresses_implementation_not_disabled(self):
         source = 'contract A is Initializable { constructor() { _disableInitializers(); } function initialize() public initializer {} }'
         signals = self._signals_for(source)

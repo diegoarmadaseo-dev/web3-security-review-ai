@@ -30,6 +30,38 @@ from .context import find_state_writes, function_access_info
 # own address-literal regex).
 INITIALIZER_NAME_RE = re.compile(r"^(initialize|initialise|init|__\w+_init(?:_unchained)?|setUp|setup)$", re.I)
 
+# D-047: structural (never name-based) shapes of a write to `{name}` that
+# must never count as a relevant "unguarded" writer for
+# state-write-guard-inconsistency.general - see that function's own
+# docstring for why each one is safe regardless of what the function or
+# variable is called.
+SELF_SCOPED_WRITE_RE_TEMPLATE = r"\b{name}\b\s*\[\s*msg\.sender\s*\](?:\s*\[[^\]]*\])*\s*(=(?!=)|\+=|-=|\*=|/=|\|=|&=|\+\+|--)"
+PAYABLE_FUNDED_WRITE_RE_TEMPLATE = r"\b{name}\b\s*(=(?!=)|\+=)\s*[^;]*\bmsg\.value\b[^;]*;"
+
+
+def _excluded_write_lines(fn: Dict[str, Any], name: str, line_index: Any) -> set:
+    """Lines where `fn` writes `name` in one of the two structural shapes
+    D-047 excludes: indexed by msg.sender (the index IS the caller's own
+    economic scope - `credits[msg.sender] -= amount` can only ever affect
+    the caller's own slot, no matter who calls it or what it is named),
+    or - only in a function that is actually `payable` - accumulating
+    msg.value itself into `name` (`totalDeposits += msg.value` records
+    exactly what the caller chose to send, not an arbitrary mutation).
+    Both are matched directly against the write statement's own shape,
+    never against the function's or variable's name. Uses the same
+    body-relative offset convention find_state_writes itself uses
+    (offsets are relative to `fn["_bodyStart"] + 1`) so line numbers line
+    up with find_state_writes's own result for the same function."""
+    body = fn["_body"]
+    base_offset = fn["_bodyStart"] + 1
+    lines: set = set()
+    for match in re.finditer(SELF_SCOPED_WRITE_RE_TEMPLATE.format(name=re.escape(name)), body):
+        lines.add(line_index.line_of(base_offset + match.start()))
+    if fn.get("mutability") == "payable":
+        for match in re.finditer(PAYABLE_FUNDED_WRITE_RE_TEMPLATE.format(name=re.escape(name)), body):
+            lines.add(line_index.line_of(base_offset + match.start()))
+    return lines
+
 
 def detect_state_write_guard_inconsistency(ctx: Dict[str, Any]) -> None:
     """V2.4, Business Logic / Invariants, first check (docs/decisiones.md
@@ -65,24 +97,27 @@ def detect_state_write_guard_inconsistency(ctx: Dict[str, Any]) -> None:
     equivalent but differently-spelled checks this heuristic cannot prove
     equivalent, are both legitimate designs.
 
-    fpRisk high (revised from an initial medium estimate, based on
-    empirical evidence from the 16 real evals/cases/*.sol fixtures, not
-    just reasoning about it): the SAME two confirmed false positives
-    already documented for admin-function-unprotected.general apply
-    here too, since both checks rely on the same function_access_info
-    notion of "guarded". (1) A self-service function indexed by
-    msg.sender (e.g. `credits[msg.sender] -= amount`) needs no owner-style
-    guard - the mapping index IS the authorization - but this heuristic
-    has no notion of "guarded by its own indexing", so it looks
-    unguarded next to an admin-only `credits[to] += amount` writer.
-    (2) A deliberately permissionless inflow function (e.g.
-    `deposit() external payable { totalDeposits += msg.value; }`) paired
-    with an admin-gated outflow function on the same counter (e.g.
-    `sweepToOwner()`) is a completely ordinary pool/ledger pattern, not a
-    bypassed restriction - `deposit` was never supposed to be gated in
-    the first place. Both were observed directly on real fixtures
-    (CreditLedger.spendCredit, UpgradeableVaultLogic.deposit) during this
-    check's own verification, not merely anticipated."""
+    fpRisk medium (D-047 refinement): an initial version of this check
+    found 2/16 real evals/cases/*.sol fixtures firing, both confirmed
+    false positives of the same class already documented for
+    admin-function-unprotected.general - CreditLedger.spendCredit's
+    `credits[msg.sender] -= amount` (self-service indexed by msg.sender,
+    the index IS the authorization) and UpgradeableVaultLogic.deposit's
+    `deposit() external payable { totalDeposits += msg.value; }` (a
+    deliberately permissionless inflow paired with a guarded
+    `sweepToOwner()` outflow - an ordinary pool/ledger design, not a
+    bypassed restriction). Both are now excluded structurally by
+    _excluded_write_lines (matched against the write statement's own
+    shape - msg.sender indexing, or msg.value flowing into a payable
+    function's own state - never against the function's or variable's
+    name), not by special-casing the function names observed in those
+    two fixtures. A write to a variable is only ever counted as a
+    relevant writer (guarded or unguarded) here when at least one of its
+    write lines in that function falls outside both exclusion shapes;
+    residual uncertainty (e.g. two writers gated by genuinely equivalent
+    but differently-spelled checks this heuristic cannot prove
+    equivalent, or a real vulnerability this narrower detection now
+    misses) is why this stays medium rather than low."""
     contract, cname = ctx["contract"], ctx["cname"]
     if cname is None:
         return
@@ -99,6 +134,8 @@ def detect_state_write_guard_inconsistency(ctx: Dict[str, Any]) -> None:
         for name in state_names:
             writes, _internal_calls = find_state_writes(fn["_body"], fn["_bodyStart"] + 1, fn["_bodyStart"] + 1, [name], ctx["line_index"])
             if not writes:
+                continue
+            if set(writes) <= _excluded_write_lines(fn, name, ctx["line_index"]):
                 continue
             writers.setdefault(name, []).append({"fn": fn, "guarded": access["guarded"], "modifiers": access["modifiers"], "bodyGuards": access["bodyGuards"]})
     for name in sorted(writers):

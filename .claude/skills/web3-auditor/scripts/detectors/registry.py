@@ -123,7 +123,7 @@ CHECK_METADATA: Dict[str, Dict[str, Any]] = {
     "role-granted-to-tx-origin.general": {"family": "role-granted-to-tx-origin", "categories": ["SC01"], "needsContext": True, "fpRisk": "low", "groupHint": None},
     "reinitializer-one-collides-with-initializer.general": {"family": "reinitializer-one-collides-with-initializer", "categories": ["SC10"], "needsContext": True, "fpRisk": "low", "groupHint": None},
     # --- V2.4, Business Logic / Invariants, first check (docs/decisiones.md D-046) ---
-    "state-write-guard-inconsistency.general": {"family": "state-write-guard-inconsistency", "categories": ["SC02", "SC01"], "needsContext": True, "fpRisk": "high", "groupHint": None},
+    "state-write-guard-inconsistency.general": {"family": "state-write-guard-inconsistency", "categories": ["SC02", "SC01"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
 }
 
 # checkIds computed cross-contract, outside the per-file phase lists below (need
