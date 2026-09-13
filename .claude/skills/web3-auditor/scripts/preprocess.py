@@ -1723,6 +1723,96 @@ def compute_selector_clash_signals(contracts_out: List[Dict[str, Any]], system_g
     return signals
 
 
+def compute_shared_implementation_fan_out_signals(contracts_out: List[Dict[str, Any]], system_graph: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """V2.3, Access Control + Proxy/Upgradeability, second block
+    (docs/decisiones.md D-040). Cross-contract, pro-only, like
+    compute_selector_clash_signals above: purely counts systemGraph's
+    already-computed `delegatesTo` edges grouped by target, no new
+    resolution logic and no change to compute_system_graph itself. More
+    than one proxy sharing one implementation/beacon is not a defect by
+    itself - it is the entire point of the Beacon pattern - hence
+    informational, fpRisk low; it only raises the stakes of whatever else
+    is found on that one implementation."""
+    if system_graph.get("status") != "computed":
+        return []
+    meta = _detectors_registry.CHECK_METADATA["shared-implementation-fan-out.general"]
+    contracts_by_key = {c["key"]: c for c in contracts_out if c.get("key")}
+    fan_in: Dict[str, List[str]] = {}
+    for edge in system_graph.get("edges", []):
+        if edge.get("kind") != "delegatesTo":
+            continue
+        fan_in.setdefault(edge["to"], []).append(edge["from"])
+    signals: List[Dict[str, Any]] = []
+    for impl_key, proxy_keys in sorted(fan_in.items()):
+        if len(proxy_keys) < 2:
+            continue
+        impl = contracts_by_key.get(impl_key)
+        if not impl:
+            continue
+        signals.append({
+            "family": meta["family"],
+            "checkId": "shared-implementation-fan-out.general",
+            "categories": list(meta["categories"]),
+            "needsContext": meta["needsContext"],
+            "fpRisk": meta["fpRisk"],
+            "file": impl["file"],
+            "line": impl.get("lineStart") or 1,
+            "column": 0,
+            "contract": impl["name"],
+            "function": None,
+            "modifier": None,
+            "snippet": "",
+            "details": {"proxyCount": len(proxy_keys), "proxies": sorted(proxy_keys)},
+        })
+    return signals
+
+
+def compute_implementation_selfdestruct_signals(contracts_out: List[Dict[str, Any]], system_graph: Dict[str, Any], all_signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """V2.3, Access Control + Proxy/Upgradeability, second block
+    (docs/decisiones.md D-040). Cross-contract, pro-only, like
+    compute_selector_clash_signals above: for each systemGraph-resolved
+    proxy pairing, checks whether the implementation already has a
+    selfdestruct.general or selfdestruct-unprotected.general signal (both
+    reused verbatim, no new scan of the implementation's source) - the
+    infamous "implementation self-destructs, every proxy delegating to it
+    becomes an empty, permanently broken contract" class of bug. Emits one
+    signal per (proxy, matching base signal), anchored at the
+    implementation's own selfdestruct site."""
+    if system_graph.get("status") != "computed":
+        return []
+    meta = _detectors_registry.CHECK_METADATA["implementation-selfdestruct-reachable.general"]
+    contracts_by_key = {c["key"]: c for c in contracts_out if c.get("key")}
+    signals: List[Dict[str, Any]] = []
+    for entry in system_graph.get("proxies", []):
+        if entry.get("status") != "resolved" or not entry.get("implementation"):
+            continue
+        impl = contracts_by_key.get(entry["implementation"])
+        if not impl:
+            continue
+        selfdestruct_hits = [
+            s for s in all_signals
+            if s["family"] in ("selfdestruct", "selfdestruct-unprotected") and s["file"] == impl["file"] and s["contract"] == impl["name"]
+        ]
+        for hit in selfdestruct_hits:
+            signals.append({
+                "family": meta["family"],
+                "checkId": "implementation-selfdestruct-reachable.general",
+                "categories": list(meta["categories"]),
+                "needsContext": meta["needsContext"],
+                "fpRisk": meta["fpRisk"],
+                "file": impl["file"],
+                "line": hit["line"],
+                "column": 0,
+                "contract": impl["name"],
+                "function": hit.get("function"),
+                "modifier": None,
+                "snippet": hit.get("snippet", ""),
+                "details": {"proxyKey": entry["proxy"], "baseSignalFamily": hit["family"]},
+            })
+    signals.sort(key=lambda s: (s["file"], s["line"] or 0, s["details"]["proxyKey"]))
+    return signals
+
+
 # ---------------------------------------------------------------------------
 # Artifact assembly
 # ---------------------------------------------------------------------------
@@ -1835,7 +1925,11 @@ def build_artifact(
     priority_ranking = compute_priority_ranking(processed, signals_by_file)
     completeness = compute_completeness(processed, import_records, base_records, mode, limits, priority_ranking)
     system_graph = compute_system_graph(contracts_out, all_calls, all_signals, allow_system_graph)
-    cross_contract_signals = compute_selector_clash_signals(contracts_out, system_graph)
+    cross_contract_signals = (
+        compute_selector_clash_signals(contracts_out, system_graph)
+        + compute_shared_implementation_fan_out_signals(contracts_out, system_graph)
+        + compute_implementation_selfdestruct_signals(contracts_out, system_graph, all_signals)
+    )
     if cross_contract_signals:
         all_signals.extend(cross_contract_signals)
         all_signals.sort(key=lambda s: (s["file"], s["line"], s["column"], s["family"]))

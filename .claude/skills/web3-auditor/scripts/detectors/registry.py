@@ -95,15 +95,27 @@ CHECK_METADATA: Dict[str, Dict[str, Any]] = {
     # preprocess.py's compute_selector_clash_signals(), not via any phase list below -
     # see CROSS_CONTRACT_CHECKS and _verify_registry().
     "selector-clash.proxy-implementation.general": {"family": "selector-clash", "categories": ["SC10", "SC01"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
+    # --- V2.3, Access Control + Proxy/Upgradeability, second block (docs/decisiones.md D-040) ---
+    "admin-function-uses-tx-origin-check.general": {"family": "admin-function-uses-tx-origin-check", "categories": ["SC01"], "needsContext": True, "fpRisk": "low", "groupHint": None},
+    "reinitializer-version-not-increasing.general": {"family": "reinitializer-version-not-increasing", "categories": ["SC10"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
+    "constructor-sets-state-in-upgradeable.general": {"family": "constructor-sets-state-in-upgradeable", "categories": ["SC10"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
+    "multiple-upgradeable-bases.general": {"family": "multiple-upgradeable-bases", "categories": ["SC10"], "needsContext": True, "fpRisk": "low", "groupHint": None},
+    "governance-reference-detected.general": {"family": "governance-reference-detected", "categories": ["SC01"], "needsContext": True, "fpRisk": "low", "groupHint": None},
+    "access-control-admin-transfer-no-two-step.general": {"family": "access-control-admin-transfer-no-two-step", "categories": ["SC01", "EXTRA-ownership"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
+    # Cross-contract, pro-only (need systemGraph) - see CROSS_CONTRACT_CHECKS below.
+    "shared-implementation-fan-out.general": {"family": "shared-implementation-fan-out", "categories": ["SC10"], "needsContext": True, "fpRisk": "low", "groupHint": None},
+    "implementation-selfdestruct-reachable.general": {"family": "implementation-selfdestruct-reachable", "categories": ["SC10", "SC06"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
 }
 
-# checkIds computed cross-contract, outside the per-file phase lists below (currently
-# only the proxy/implementation selector-clash check, which needs systemGraph's resolved
-# proxy pairing - see preprocess.py's compute_selector_clash_signals()). Exempted from
-# _verify_registry()'s "must appear in a phase list" requirement, but still required to
-# have CHECK_METADATA, so a typo here still fails loudly.
+# checkIds computed cross-contract, outside the per-file phase lists below (need
+# systemGraph's resolved proxy pairing - see preprocess.py's compute_*_signals()
+# functions). Exempted from _verify_registry()'s "must appear in a phase list"
+# requirement, but still required to have CHECK_METADATA, so a typo here still fails
+# loudly.
 CROSS_CONTRACT_CHECKS: List[str] = [
     "selector-clash.proxy-implementation.general",
+    "shared-implementation-fan-out.general",
+    "implementation-selfdestruct-reachable.general",
 ]
 
 # Phase order matters (see module docstring). Do not alphabetize or reorder

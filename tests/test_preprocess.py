@@ -258,6 +258,13 @@ SIGNAL_FIXTURES = {
     "eip1967-slot-specific": 'contract A { bytes32 internal constant SLOT = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc; }',
     "naive-proxy-storage-collision": 'contract A { address internal implementation; fallback() external payable { (bool ok, ) = implementation.delegatecall(msg.data); require(ok); } }',
     "initializer-reinitializer-inconsistency": 'contract A { bool private _ready; modifier onlyOnce() { require(!_ready); _; _ready = true; } function initialize() public onlyOnce {} function initialize(address admin) public { _ready = true; } }',
+    # --- V2.3, Access Control + Proxy/Upgradeability, second block (docs/decisiones.md D-040) ---
+    "admin-function-uses-tx-origin-check": 'contract A { address owner; function withdraw(uint amt) external { require(tx.origin == owner); } }',
+    "reinitializer-version-not-increasing": 'contract A { function initV2() public reinitializer(2) {} function initV3() public reinitializer(2) {} }',
+    "constructor-sets-state-in-upgradeable": 'contract A is Initializable { uint256 public x; constructor(uint256 v) { x = v; } function initialize() public initializer {} }',
+    "multiple-upgradeable-bases": 'contract A is Initializable, UUPSUpgradeable { }',
+    "governance-reference-detected": 'contract A is TimelockController { }',
+    "access-control-admin-transfer-no-two-step": 'contract A { function rotateAdmin(address newAdmin, address oldAdmin) external { grantRole(DEFAULT_ADMIN_ROLE, newAdmin); revokeRole(DEFAULT_ADMIN_ROLE, oldAdmin); } }',
 }
 
 
@@ -731,6 +738,57 @@ class SignalFamilyNegativeControlTests(unittest.TestCase):
         signals = self._signals_for(source)
         self.assertFalse(signals_of({"signals": signals}, "initializer-reinitializer-inconsistency"))
 
+    # --- V2.3, Access Control + Proxy/Upgradeability, second block (docs/decisiones.md D-040) ---
+
+    def test_tx_origin_in_condition_on_non_admin_function_is_not_flagged(self):
+        source = 'contract A { function checkCaller() external view returns (bool) { return tx.origin == msg.sender; } }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "admin-function-uses-tx-origin-check"))
+
+    def test_increasing_reinitializer_versions_is_not_flagged(self):
+        source = 'contract A { function initV2() public reinitializer(2) {} function initV3() public reinitializer(3) {} }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "reinitializer-version-not-increasing"))
+
+    def test_constructor_with_no_state_write_is_not_flagged_upgradeable(self):
+        source = (
+            'contract A is Initializable { uint256 public x; constructor() { }'
+            ' function initialize(uint256 v) public initializer { x = v; } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "constructor-sets-state-in-upgradeable"))
+
+    def test_constructor_writing_only_immutable_is_not_flagged_upgradeable(self):
+        source = (
+            'contract A is Initializable { uint256 public immutable x; constructor(uint256 v) { x = v; }'
+            ' function initialize() public initializer {} }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "constructor-sets-state-in-upgradeable"))
+
+    def test_single_upgradeable_base_is_not_flagged_multiple_bases(self):
+        source = 'contract A is Initializable, Ownable { }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "multiple-upgradeable-bases"))
+
+    def test_no_governance_reference_is_not_flagged(self):
+        # D-040: this family must NEVER be read as "no governance found", so
+        # the negative control here only checks that plain, unrelated code
+        # does not spuriously match - not that absence itself means anything.
+        source = 'contract A { address public owner; }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "governance-reference-detected"))
+
+    def test_admin_role_granted_without_revoke_is_not_flagged_two_step(self):
+        source = 'contract A { function addAdmin(address newAdmin) external { grantRole(DEFAULT_ADMIN_ROLE, newAdmin); } }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "access-control-admin-transfer-no-two-step"))
+
+    def test_non_admin_role_transfer_is_not_flagged_two_step(self):
+        source = 'contract A { function rotate(address newMinter) external { grantRole(MINTER_ROLE, newMinter); revokeRole(MINTER_ROLE, address(0)); } }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "access-control-admin-transfer-no-two-step"))
+
     def test_disabled_initializers_suppresses_implementation_not_disabled(self):
         source = 'contract A is Initializable { constructor() { _disableInitializers(); } function initialize() public initializer {} }'
         signals = self._signals_for(source)
@@ -1016,6 +1074,76 @@ class SelectorClashTests(unittest.TestCase):
             artifact = run_paths([tmp], mode="pro")
             self.assertEqual(artifact["systemGraph"]["proxies"][0]["status"], "unresolved")
             self.assertFalse([s for s in artifact["signals"] if s["family"] == "selector-clash"])
+
+
+class CrossContractFanOutAndSelfdestructTests(unittest.TestCase):
+    """V2.3, second block (docs/decisiones.md D-040): the other two
+    cross-contract, pro-only checks, computed directly by preprocess.py from
+    systemGraph's already-resolved proxy pairing - same architecture as
+    SelectorClashTests above."""
+
+    def test_two_proxies_sharing_one_implementation_is_flagged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "Impl.sol", "pragma solidity 0.8.20;\ncontract LogicV1 { function noop() external {} }\n")
+            for name in ("ProxyA", "ProxyB"):
+                write(tmp, name + ".sol", (
+                    'pragma solidity 0.8.20;\nimport "./Impl.sol";\n'
+                    "contract %s { LogicV1 internal implementation;"
+                    " fallback() external payable { (bool ok, ) = implementation.delegatecall(msg.data); require(ok); } }\n" % name
+                ))
+            artifact = run_paths([tmp], mode="pro")
+            hits = [s for s in artifact["signals"] if s["family"] == "shared-implementation-fan-out"]
+            self.assertEqual(len(hits), 1)
+            self.assertEqual(hits[0]["details"]["proxyCount"], 2)
+
+    def test_single_proxy_is_not_flagged_fan_out(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "Impl2.sol", "pragma solidity 0.8.20;\ncontract LogicV2 { function noop() external {} }\n")
+            write(tmp, "ProxyC.sol", (
+                'pragma solidity 0.8.20;\nimport "./Impl2.sol";\n'
+                "contract ProxyC { LogicV2 internal implementation;"
+                " fallback() external payable { (bool ok, ) = implementation.delegatecall(msg.data); require(ok); } }\n"
+            ))
+            artifact = run_paths([tmp], mode="pro")
+            self.assertFalse([s for s in artifact["signals"] if s["family"] == "shared-implementation-fan-out"])
+
+    def test_non_pro_mode_never_computes_fan_out_or_selfdestruct_reachable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "Impl.sol", "pragma solidity 0.8.20;\ncontract LogicV1 { function kill() external { selfdestruct(payable(msg.sender)); } }\n")
+            for name in ("ProxyA", "ProxyB"):
+                write(tmp, name + ".sol", (
+                    'pragma solidity 0.8.20;\nimport "./Impl.sol";\n'
+                    "contract %s { LogicV1 internal implementation;"
+                    " fallback() external payable { (bool ok, ) = implementation.delegatecall(msg.data); require(ok); } }\n" % name
+                ))
+            artifact = run_paths([tmp], mode="standard")
+            new_fams = {"shared-implementation-fan-out", "implementation-selfdestruct-reachable"}
+            self.assertFalse([s for s in artifact["signals"] if s["family"] in new_fams])
+
+    def test_implementation_with_selfdestruct_is_flagged_reachable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "Impl3.sol", "pragma solidity 0.8.20;\ncontract LogicV3 { function kill() external { selfdestruct(payable(msg.sender)); } }\n")
+            write(tmp, "ProxyD.sol", (
+                'pragma solidity 0.8.20;\nimport "./Impl3.sol";\n'
+                "contract ProxyD { LogicV3 internal implementation;"
+                " fallback() external payable { (bool ok, ) = implementation.delegatecall(msg.data); require(ok); } }\n"
+            ))
+            artifact = run_paths([tmp], mode="pro")
+            hits = [s for s in artifact["signals"] if s["family"] == "implementation-selfdestruct-reachable"]
+            self.assertTrue(hits)
+            self.assertEqual(hits[0]["contract"], "LogicV3")
+            self.assertEqual(hits[0]["details"]["proxyKey"], "ProxyD.sol#ProxyD")
+
+    def test_implementation_without_selfdestruct_is_not_flagged_reachable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "Impl4.sol", "pragma solidity 0.8.20;\ncontract LogicV4 { function noop() external {} }\n")
+            write(tmp, "ProxyE.sol", (
+                'pragma solidity 0.8.20;\nimport "./Impl4.sol";\n'
+                "contract ProxyE { LogicV4 internal implementation;"
+                " fallback() external payable { (bool ok, ) = implementation.delegatecall(msg.data); require(ok); } }\n"
+            ))
+            artifact = run_paths([tmp], mode="pro")
+            self.assertFalse([s for s in artifact["signals"] if s["family"] == "implementation-selfdestruct-reachable"])
 
 
 class MultilingualTests(unittest.TestCase):

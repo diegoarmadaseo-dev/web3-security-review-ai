@@ -59,6 +59,11 @@ EIP1967_SLOT_KIND = {
 }
 REINITIALIZER_MODIFIER_RE = re.compile(r"^reinitializer$")
 
+# --- V2.3, Access Control + Proxy/Upgradeability, second block (docs/decisiones.md D-040) ---
+GOVERNANCE_REFERENCE_RE = re.compile(r"TimelockController|Governor|GnosisSafe|\bSafe\b|MultiSig", re.I)
+ADMIN_ROLE_GRANT_RE = re.compile(r"\bgrantRole\s*\(\s*([^,()]+?)\s*,")
+ADMIN_ROLE_REVOKE_RE_TEMPLATE = r"\b(?:revokeRole|renounceRole)\s*\(\s*{role}\s*,"
+
 
 # --- scope-phase checks -----------------------------------------------------
 
@@ -84,8 +89,33 @@ def detect_hardcoded_role_holder(ctx: Dict[str, Any]) -> None:
         ctx["collector"].add("hardcoded-role-holder.general", offset, ctx["cname"], scope, {"call": match.group(1), "address": addr.group(0)})
 
 
+def detect_admin_function_uses_tx_origin_check(ctx: Dict[str, Any]) -> None:
+    """V2.3, Access Control + Proxy/Upgradeability, second block
+    (docs/decisiones.md D-040). Narrows tx-origin.general's own
+    already-computed `inCondition` detail into a gate, further restricted to
+    functions whose name matches the same ADMIN_NAME_RE/ADMIN_NAME_EXCLUDE_RE
+    heuristic admin-function-unprotected.general already uses. Reads the
+    tx-origin signal already emitted earlier in this same scope-phase pass
+    (calls_and_transfers.CHECKS runs before access_control.CHECKS in
+    registry.py's SCOPE_CHECKS - see that module's docstring) - zero new
+    regex over raw text, zero re-scan. tx.origin used in a condition on an
+    admin-named function is a well-known, essentially always-wrong pattern
+    (any contract can relay the call and pass the check), so fpRisk is low."""
+    cname = ctx["cname"]
+    for s in ctx["collector"].signals:
+        if s["family"] != "tx-origin" or s["contract"] != cname or not s["details"].get("inCondition"):
+            continue
+        fn_name = s.get("function") or ""
+        if not ADMIN_NAME_RE.match(fn_name) or ADMIN_NAME_EXCLUDE_RE.match(fn_name):
+            continue
+        offset = ctx["line_index"].offset_of_line(s["line"])
+        scope = {"function": s["function"], "modifier": s["modifier"], "kind": None}
+        ctx["collector"].add("admin-function-uses-tx-origin-check.general", offset, cname, scope, {})
+
+
 CHECKS = [
     ("hardcoded-role-holder.general", detect_hardcoded_role_holder),
+    ("admin-function-uses-tx-origin-check.general", detect_admin_function_uses_tx_origin_check),
 ]
 
 
@@ -243,6 +273,34 @@ def detect_mismatched_array_length(fctx: Dict[str, Any]) -> None:
     if checked:
         return
     fctx["collector"].add("mismatched-array-length.general", fn["_headStart"], fctx["cname"], scope, {"name": fn["name"], "arrayParams": indexed})
+
+
+def detect_access_control_admin_transfer_no_two_step(fctx: Dict[str, Any]) -> None:
+    """V2.3, Access Control + Proxy/Upgradeability, second block
+    (docs/decisiones.md D-040). AccessControl's analogue of
+    single-step-ownership-transfer.general (which only covers Ownable):
+    a `grantRole(X, ...)` and a `revokeRole(X, ...)`/`renounceRole(X, ...)`
+    on the SAME role expression X inside the SAME function, with no
+    on-chain acceptance step from the new holder. Restricted to role
+    expressions whose text contains "ADMIN" (case-insensitive) to keep this
+    narrow to the highest-stakes role rather than firing on routine
+    same-function role rotations (e.g. MINTER_ROLE). Potential signal only,
+    not an automatic vulnerability - an atomic grant+revoke behind an
+    already well-guarded caller (e.g. a timelock) can be a perfectly
+    reasonable design; fpRisk is medium, not high, since the pattern itself
+    is specific (same role, same function)."""
+    fn, scope, cname = fctx["fn"], fctx["scope"], fctx["cname"]
+    body = fn.get("_body", "")
+    grant_match = ADMIN_ROLE_GRANT_RE.search(body)
+    if not grant_match:
+        return
+    role_expr = grant_match.group(1).strip()
+    if not re.search(r"ADMIN", role_expr, re.I):
+        return
+    revoke_re = re.compile(ADMIN_ROLE_REVOKE_RE_TEMPLATE.format(role=re.escape(role_expr)))
+    if not revoke_re.search(body):
+        return
+    fctx["collector"].add("access-control-admin-transfer-no-two-step.general", fn["_headStart"], cname, scope, {"role": role_expr})
 
 
 # --- contract-phase checks --------------------------------------------------
@@ -523,6 +581,120 @@ def detect_initializer_reinitializer_inconsistency(ctx: Dict[str, Any]) -> None:
     ctx["collector"].add("initializer-reinitializer-inconsistency.general", unguarded_fn["_headStart"], cname, scope, {"guarded": guarded_names, "unguarded": unguarded_names})
 
 
+def detect_reinitializer_version_not_increasing(ctx: Dict[str, Any]) -> None:
+    """V2.3, Access Control + Proxy/Upgradeability, second block
+    (docs/decisiones.md D-040). `reinitializer(N)` is meant to be a single,
+    monotonically increasing per-contract counter (each version usable only
+    once, and only after all lower versions). Walks every reinitializer-
+    tagged function in declaration order (already-parsed `fn["modifiers"]`,
+    including each modifier's own already-parsed `args` text - no new
+    scan) and flags any version that is not strictly greater than the
+    previous one seen: a duplicate or out-of-order version number would let
+    an already-used re-initialization entry point run again, or run out of
+    the intended sequence."""
+    contract, cname = ctx["contract"], ctx["cname"]
+    if cname is None:
+        return
+    versions = []
+    for fn in contract["functions"]:
+        for m in fn["modifiers"]:
+            if m["name"] != "reinitializer":
+                continue
+            args = (m.get("args") or "").strip()
+            if re.match(r"^\d+$", args):
+                versions.append((fn, int(args)))
+            break
+    if len(versions) < 2:
+        return
+    last_version = versions[0][1]
+    for fn, version in versions[1:]:
+        if version <= last_version:
+            scope = {"function": fn["name"] or fn["kind"], "modifier": None, "kind": fn["kind"]}
+            ctx["collector"].add("reinitializer-version-not-increasing.general", fn["_headStart"], cname, scope, {"version": version, "previousVersion": last_version})
+        last_version = version
+
+
+def detect_constructor_sets_state_in_upgradeable(ctx: Dict[str, Any]) -> None:
+    """V2.3, Access Control + Proxy/Upgradeability, second block
+    (docs/decisiones.md D-040). An upgradeable-indicated contract (same
+    `PROXY_BASE_RE` gate as storage-gap-missing/implementation-not-disabled)
+    that also defines an initializer function but sets non-constant,
+    non-immutable state in its constructor: constructor code runs once at
+    the IMPLEMENTATION's own deployment, never in the proxy's storage
+    context, so any such write is invisible to every proxy delegating to
+    it. Immutable/constant variables are excluded - they are compiled into
+    the implementation's bytecode, not storage, so setting them in a
+    constructor is the standard, correct pattern precisely because it works
+    under delegatecall. Skipped entirely if the constructor already calls
+    `_disableInitializers()`, same as implementation-not-disabled - that
+    call is itself evidence the constructor is deliberately
+    deployment-time-only. Reuses find_state_writes (context.py), already
+    used the same way by admin-function-unprotected.general."""
+    contract, cname = ctx["contract"], ctx["cname"]
+    if cname is None or not any(PROXY_BASE_RE.search(base) for base in contract["bases"]):
+        return
+    function_names = [fn["name"] for fn in contract["functions"] if fn["name"]]
+    if not any(INITIALIZER_NAME_RE.match(n) for n in function_names):
+        return
+    ctor = next((fn for fn in contract["functions"] if fn["kind"] == "constructor"), None)
+    if not ctor or ctor["_bodyStart"] is None or ctor["_bodyEnd"] is None:
+        return
+    if "_disableInitializers" in ctor.get("_body", ""):
+        return
+    state_names = [v["name"] for v in contract["stateVariables"] if not v.get("constant") and not v.get("immutable")]
+    if not state_names:
+        return
+    writes, internal_calls = find_state_writes(ctor["_body"], ctor["_bodyStart"] + 1, ctor["_bodyStart"] + 1, state_names, ctx["line_index"])
+    if not writes and not internal_calls:
+        return
+    scope = {"function": ctor["name"] or ctor["kind"], "modifier": None, "kind": ctor["kind"]}
+    ctx["collector"].add("constructor-sets-state-in-upgradeable.general", ctor["_headStart"], cname, scope, {})
+
+
+def detect_multiple_upgradeable_bases(ctx: Dict[str, Any]) -> None:
+    """V2.3, Access Control + Proxy/Upgradeability, second block
+    (docs/decisiones.md D-040). Purely structural fact, reusing PROXY_BASE_RE
+    against the already-parsed `bases` list (no new scan): inheriting 2+
+    upgradeable-indicated bases makes Solidity's C3 linearization order of
+    those bases significant for the final storage layout - reordering the
+    `is A, B` list can silently change slot assignment. Informational, not
+    a defect by itself, hence fpRisk low."""
+    contract, cname = ctx["contract"], ctx["cname"]
+    if cname is None:
+        return
+    matching_bases = [base for base in contract["bases"] if PROXY_BASE_RE.search(base)]
+    if len(matching_bases) < 2:
+        return
+    ctx["collector"].add("multiple-upgradeable-bases.general", contract["_start"], cname, {"function": None, "modifier": None, "kind": None}, {"bases": matching_bases})
+
+
+def detect_governance_reference(ctx: Dict[str, Any]) -> None:
+    """V2.3, Access Control + Proxy/Upgradeability, second block
+    (docs/decisiones.md D-040). Presence-only signal: a base or a state
+    variable's already-resolved `userType` naming a known
+    timelock/governor/multisig shape (TimelockController, Governor,
+    GnosisSafe/Safe, MultiSig). Fires ONLY when such a reference is found -
+    there is no "absence" branch anywhere in this function, by design: not
+    finding a governance-shaped name is not evidence a contract lacks
+    governance (it could be an externally-owned multisig address with no
+    on-chain type trace at all), so this family must never be read as
+    "no timelock/multisig detected = risk"."""
+    contract, cname = ctx["contract"], ctx["cname"]
+    if cname is None:
+        return
+    matches = set()
+    for base in contract["bases"]:
+        if GOVERNANCE_REFERENCE_RE.search(base):
+            matches.add(base)
+    for var in contract["stateVariables"]:
+        user_type = var.get("userType")
+        if user_type and GOVERNANCE_REFERENCE_RE.search(user_type):
+            matches.add(user_type)
+    if not matches:
+        return
+    ctx["collector"].add("governance-reference-detected.general", contract["_start"], cname, {"function": None, "modifier": None, "kind": None}, {"references": sorted(matches)})
+
+
 FUNCTION_CHECKS = [
     ("initializer-unprotected.general", detect_initializer_unprotected),
     ("zero-address-unchecked.general", detect_zero_address_unchecked),
@@ -532,6 +704,7 @@ FUNCTION_CHECKS = [
     ("unprotected-callback-handler.general", detect_unprotected_callback_handler),
     ("mismatched-array-length.general", detect_mismatched_array_length),
     ("upgrade-function-unprotected.general", detect_upgrade_function_unprotected),
+    ("access-control-admin-transfer-no-two-step.general", detect_access_control_admin_transfer_no_two_step),
 ]
 
 CONTRACT_CHECKS = [
@@ -545,4 +718,8 @@ CONTRACT_CHECKS = [
     ("eip1967-slot-specific.general", detect_eip1967_slot_specific),
     ("naive-proxy-storage-collision.general", detect_naive_proxy_storage_collision),
     ("initializer-reinitializer-inconsistency.general", detect_initializer_reinitializer_inconsistency),
+    ("reinitializer-version-not-increasing.general", detect_reinitializer_version_not_increasing),
+    ("constructor-sets-state-in-upgradeable.general", detect_constructor_sets_state_in_upgradeable),
+    ("multiple-upgradeable-bases.general", detect_multiple_upgradeable_bases),
+    ("governance-reference-detected.general", detect_governance_reference),
 ]
