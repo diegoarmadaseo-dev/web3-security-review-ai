@@ -72,6 +72,11 @@ SET_ROLE_ADMIN_RE = re.compile(r"\b_?setRoleAdmin\s*\(\s*([^,()]+?)\s*,\s*([^,()
 DEFAULT_ADMIN_ROLE_LITERAL_RE = re.compile(r"^(DEFAULT_ADMIN_ROLE|0x0+|bytes32\s*\(\s*0x?0*\s*\))$")
 ROLE_GRANT_TO_SELF_RE = re.compile(r"\b(?:_setupRole|_grantRole|grantRole)\s*\(\s*([^,()]+?)\s*,\s*(address\s*\(\s*this\s*\)|this)\s*\)")
 
+# --- V2.3, Access Control + Proxy/Upgradeability, fourth block (docs/decisiones.md D-043) ---
+PLACEHOLDER_RE = re.compile(r"_\s*;")
+ADMIN_CHECK_HARDCODED_ADDRESS_RE = re.compile(r"\bmsg\.sender\s*[!=]=\s*(0x[0-9a-fA-F]{40})\b|\b(0x[0-9a-fA-F]{40})\b\s*[!=]=\s*msg\.sender\b")
+TIMELOCK_ZERO_DELAY_RE = re.compile(r"\bnew\s+TimelockController\s*\(\s*0\s*,")
+
 
 # --- scope-phase checks -----------------------------------------------------
 
@@ -166,11 +171,54 @@ def detect_role_granted_to_self_contract(ctx: Dict[str, Any]) -> None:
         ctx["collector"].add("role-granted-to-self-contract.general", offset, ctx["cname"], scope, {"role": role_expr})
 
 
+def detect_admin_check_hardcoded_address(ctx: Dict[str, Any]) -> None:
+    """V2.3, Access Control + Proxy/Upgradeability, fourth block
+    (docs/decisiones.md D-043). A narrowing of hardcoded-address.general to
+    the specific case where the literal is used directly in an
+    authorization comparison (`msg.sender == 0x...` or the reverse
+    order) - a hardcoded owner/admin address can never be rotated without
+    a contract upgrade, and unlike a hardcoded role holder (already
+    covered by hardcoded-role-holder.general's grantRole-argument shape)
+    this pattern often does not look like a "role" at a glance, making it
+    an easy review miss. Does not match `address(0)`-shaped sentinel
+    checks (a function-call expression, not a raw 40-hex-char literal) -
+    those belong to zero-address-unchecked's own, unrelated concern."""
+    contract, span_start, body = ctx["contract"], ctx["span_start"], ctx["body"]
+    for match in ADMIN_CHECK_HARDCODED_ADDRESS_RE.finditer(body):
+        address = match.group(1) or match.group(2)
+        offset = span_start + match.start()
+        scope = locate_scope(contract, offset)
+        ctx["collector"].add("admin-check-hardcoded-address.general", offset, ctx["cname"], scope, {"address": address})
+
+
+def detect_timelock_zero_delay_configured(ctx: Dict[str, Any]) -> None:
+    """V2.3, Access Control + Proxy/Upgradeability, fourth block
+    (docs/decisiones.md D-043). `new TimelockController(0, ...)` configures
+    a governance timelock with zero delay, defeating its entire purpose
+    (no window for anyone to react to a queued proposal). A configuration
+    signal, not an automatic vulnerability per Diego's explicit
+    requirement: a zero-delay timelock can be a deliberate placeholder in
+    a not-yet-launched deployment script, or a devnet/test configuration
+    never meant for production - hence fpRisk low but framed as
+    informational, same spirit as governance-reference-detected.general.
+    Deliberately narrow: only the literal `0` first-argument spelling is
+    matched (same "never guess" discipline as every other narrow-regex
+    check in this module) - a delay computed from a named constant is not
+    traced back to its value."""
+    contract, span_start, body = ctx["contract"], ctx["span_start"], ctx["body"]
+    for match in TIMELOCK_ZERO_DELAY_RE.finditer(body):
+        offset = span_start + match.start()
+        scope = locate_scope(contract, offset)
+        ctx["collector"].add("timelock-zero-delay-configured.general", offset, ctx["cname"], scope, {})
+
+
 CHECKS = [
     ("hardcoded-role-holder.general", detect_hardcoded_role_holder),
     ("admin-function-uses-tx-origin-check.general", detect_admin_function_uses_tx_origin_check),
     ("role-admin-reassigned-non-default.general", detect_role_admin_reassigned_non_default),
     ("role-granted-to-self-contract.general", detect_role_granted_to_self_contract),
+    ("admin-check-hardcoded-address.general", detect_admin_check_hardcoded_address),
+    ("timelock-zero-delay-configured.general", detect_timelock_zero_delay_configured),
 ]
 
 
@@ -638,6 +686,41 @@ def detect_naive_proxy_storage_collision(ctx: Dict[str, Any]) -> None:
     ctx["collector"].add("naive-proxy-storage-collision.general", contract["_start"], cname, {"function": None, "modifier": None, "kind": None}, {"stateVariables": storage_vars})
 
 
+def detect_proxy_partial_eip1967_adoption(ctx: Dict[str, Any]) -> None:
+    """V2.3, Access Control + Proxy/Upgradeability, fourth block
+    (docs/decisiones.md D-043). The exact complementary gap
+    naive-proxy-storage-collision.general leaves open: that check returns
+    immediately once ANY known EIP-1967/EIP-1822 slot is found in the
+    contract, on the reasoning that adopting a namespaced slot means the
+    contract is not using naive sequential storage. But a proxy can adopt
+    EIP-1967 for its `implementation` pointer while STILL declaring
+    ordinary (non-constant, non-immutable) state variables at the normal
+    sequential slots (0, 1, 2, ...) - those still collide with the
+    delegated-to contract's own slot-0-based variables exactly like the
+    fully-naive case does. Same preconditions as
+    naive-proxy-storage-collision (delegatecall present, has non-const/
+    non-immutable state vars) with the slot condition inverted - mutually
+    exclusive with it by construction, so the two families never both fire
+    for the same contract. Potential signal only, not an automatic
+    vulnerability - the extra variables could themselves be intentionally
+    unused by the implementation - hence fpRisk medium (lower than naive-
+    proxy-storage-collision's high, since partial EIP-1967 adoption is
+    already evidence of some storage-layout awareness)."""
+    contract, cname = ctx["contract"], ctx["cname"]
+    if cname is None:
+        return
+    delegate_hits = [s for s in ctx["collector"].signals if s["family"] == "delegatecall" and s["contract"] == cname]
+    if not delegate_hits:
+        return
+    contract_original = ctx["original"][contract["_start"]:contract["_bodyEnd"]].lower()
+    if not any(slot in contract_original for slot in EIP1967_SLOT_KIND):
+        return
+    storage_vars = [v["name"] for v in contract["stateVariables"] if not v.get("constant") and not v.get("immutable")]
+    if not storage_vars:
+        return
+    ctx["collector"].add("proxy-partial-eip1967-adoption.general", contract["_start"], cname, {"function": None, "modifier": None, "kind": None}, {"stateVariables": storage_vars})
+
+
 def _is_initializer_guarded(fn: Dict[str, Any]) -> bool:
     guarded_by_modifier = any(INITIALIZER_GUARD_RE.match(m["name"]) for m in fn["modifiers"])
     guarded_by_body = bool(INITIALIZED_BODY_RE.search(fn.get("_body", ""))) or function_access_info(fn)["guarded"]
@@ -823,6 +906,41 @@ def detect_auth_modifier_empty_guard(ctx: Dict[str, Any]) -> None:
         ctx["collector"].add("auth-modifier-empty-guard.general", mod["_start"], cname, {"function": None, "modifier": mod["name"], "kind": None}, {"modifier": mod["name"]})
 
 
+def detect_auth_modifier_check_after_placeholder(ctx: Dict[str, Any]) -> None:
+    """V2.3, Access Control + Proxy/Upgradeability, fourth block
+    (docs/decisiones.md D-043). Distinct root cause from
+    auth-modifier-empty-guard.general (no check at all): here a real check
+    exists, but the `_;` placeholder - which runs the guarded function's
+    own body - appears textually BEFORE it, so the guarded code executes
+    first and is only checked afterward, when it is too late to prevent
+    anything. Reuses the same modifier `_start`/`_end` span slicing and
+    body-isolation (after the first `{`) as auth-modifier-empty-guard, and
+    the same MODIFIER_HAS_ANY_CHECK_RE shape for "a real check exists" -
+    only the relative order of the two matches is new. Explicitly
+    defers to auth-modifier-empty-guard when no check exists at all (no
+    double-flagging): this family only fires when a check IS present.
+    fpRisk low - there is essentially no legitimate reason to place the
+    placeholder before the only check in an access-control modifier."""
+    contract, cname, masked = ctx["contract"], ctx["cname"], ctx["masked"]
+    if cname is None:
+        return
+    for mod in contract["modifiers"]:
+        if not AUTH_MODIFIER_NAME_RE.match(mod["name"]):
+            continue
+        span = masked[mod["_start"]:mod["_end"]]
+        brace_idx = span.find("{")
+        if brace_idx == -1:
+            continue
+        body = span[brace_idx + 1:]
+        placeholder_match = PLACEHOLDER_RE.search(body)
+        if not placeholder_match:
+            continue
+        check_match = MODIFIER_HAS_ANY_CHECK_RE.search(body)
+        if not check_match or check_match.start() <= placeholder_match.start():
+            continue
+        ctx["collector"].add("auth-modifier-check-after-placeholder.general", mod["_start"], cname, {"function": None, "modifier": mod["name"], "kind": None}, {"modifier": mod["name"]})
+
+
 def detect_upgradeable_contract_has_selfdestruct(ctx: Dict[str, Any]) -> None:
     """V2.3, Access Control + Proxy/Upgradeability, third block
     (docs/decisiones.md D-041). Single-file, all-modes complement to
@@ -892,11 +1010,13 @@ CONTRACT_CHECKS = [
     ("reentrancy-guard-not-first-modifier.general", detect_reentrancy_guard_not_first_modifier),
     ("eip1967-slot-specific.general", detect_eip1967_slot_specific),
     ("naive-proxy-storage-collision.general", detect_naive_proxy_storage_collision),
+    ("proxy-partial-eip1967-adoption.general", detect_proxy_partial_eip1967_adoption),
     ("initializer-reinitializer-inconsistency.general", detect_initializer_reinitializer_inconsistency),
     ("reinitializer-version-not-increasing.general", detect_reinitializer_version_not_increasing),
     ("constructor-sets-state-in-upgradeable.general", detect_constructor_sets_state_in_upgradeable),
     ("multiple-upgradeable-bases.general", detect_multiple_upgradeable_bases),
     ("governance-reference-detected.general", detect_governance_reference),
     ("auth-modifier-empty-guard.general", detect_auth_modifier_empty_guard),
+    ("auth-modifier-check-after-placeholder.general", detect_auth_modifier_check_after_placeholder),
     ("upgradeable-contract-has-selfdestruct.general", detect_upgradeable_contract_has_selfdestruct),
 ]

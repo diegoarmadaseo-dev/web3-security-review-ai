@@ -112,6 +112,12 @@ CHECK_METADATA: Dict[str, Dict[str, Any]] = {
     "disable-initializers-outside-constructor-unprotected.general": {"family": "disable-initializers-outside-constructor-unprotected", "categories": ["SC10"], "needsContext": True, "fpRisk": "low", "groupHint": None},
     "upgradeable-contract-has-selfdestruct.general": {"family": "upgradeable-contract-has-selfdestruct", "categories": ["SC10", "SC01"], "needsContext": True, "fpRisk": "low", "groupHint": None},
     "role-granted-to-self-contract.general": {"family": "role-granted-to-self-contract", "categories": ["SC01"], "needsContext": True, "fpRisk": "low", "groupHint": None},
+    # --- V2.3, Access Control + Proxy/Upgradeability, fourth block (docs/decisiones.md D-043) ---
+    "auth-modifier-check-after-placeholder.general": {"family": "auth-modifier-check-after-placeholder", "categories": ["SC01"], "needsContext": True, "fpRisk": "low", "groupHint": None},
+    "delegatecall-in-loop.general": {"family": "delegatecall-in-loop", "categories": ["SC06", "SC10"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
+    "proxy-partial-eip1967-adoption.general": {"family": "proxy-partial-eip1967-adoption", "categories": ["SC10"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
+    "admin-check-hardcoded-address.general": {"family": "admin-check-hardcoded-address", "categories": ["SC01", "SC05"], "needsContext": True, "fpRisk": "low", "groupHint": None},
+    "timelock-zero-delay-configured.general": {"family": "timelock-zero-delay-configured", "categories": ["SC01"], "needsContext": True, "fpRisk": "low", "groupHint": None},
 }
 
 # checkIds computed cross-contract, outside the per-file phase lists below (need

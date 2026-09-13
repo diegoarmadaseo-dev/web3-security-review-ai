@@ -260,6 +260,48 @@ def detect_chained_division_precision_loss(ctx: Dict[str, Any]) -> None:
         ctx["collector"].add("chained-division-precision-loss.general", offset, ctx["cname"], scope, {"expression": truncate(collapse_ws(stmt), 120)[0]})
 
 
+def detect_delegatecall_in_loop(ctx: Dict[str, Any]) -> None:
+    """V2.3, Access Control + Proxy/Upgradeability, fourth block
+    (docs/decisiones.md D-043). external-call-in-loop.general's own
+    ctx["external_call_offsets"] is populated only by low-level .call/
+    .send/.staticcall/.callcode sites plus token transfers/interface
+    calls elsewhere in this same scope-phase pass - delegatecall is its
+    own, architecturally separate signal family (delegatecall.general)
+    and was never one of those contributors, so a delegatecall inside a
+    loop (e.g. a naive multi-target batch executor) was invisible to
+    external-call-in-loop despite compounding arbitrary-code-execution
+    risk once per iteration, not just a revert-griefing surface -
+    confirmed empirically (not just by reading the code) before proposing
+    this check. Reuses the already-emitted delegatecall.general signal
+    (no new text scan for the call itself) plus loop_spans() - the same
+    per-loop analysis unbounded-loop/msg-value-in-loop/external-call-in-loop
+    already use, recomputed here per this module's documented
+    independent-detectors tradeoff (see module docstring). Compares LINE
+    ranges rather than the signal's re-derived offset against the loop's
+    own byte-offset bounds, since a signal only carries `line`/`column`,
+    not a stashed original offset - offset_of_line(line) always returns a
+    line's START, which would wrongly fall before bodyStart for a loop
+    whose body opens and calls delegatecall on the same physical line (a
+    common compact style); comparing line-to-line has no such gap."""
+    contract, cname = ctx["contract"], ctx["cname"]
+    if cname is None:
+        return
+    delegate_hits = [s for s in ctx["collector"].signals if s["family"] == "delegatecall" and s["contract"] == cname]
+    if not delegate_hits:
+        return
+    loops = loop_spans(ctx["masked"], ctx["span_start"], ctx["span_end"], ctx["pairs"])
+    if not loops:
+        return
+    line_index = ctx["line_index"]
+    for hit in delegate_hits:
+        loop = next((l for l in loops if line_index.line_of(l["bodyStart"]) <= hit["line"] <= line_index.line_of(l["bodyEnd"])), None)
+        if loop is None:
+            continue
+        offset = line_index.offset_of_line(hit["line"])
+        scope = {"function": hit.get("function"), "modifier": hit.get("modifier"), "kind": None}
+        ctx["collector"].add("delegatecall-in-loop.general", offset, cname, scope, {"loopLine": line_index.line_of(loop["start"])})
+
+
 CHECKS = [
     ("hardcoded-address.general", detect_hardcoded_address),
     ("unchecked-block.general", detect_unchecked_block),
@@ -272,4 +314,5 @@ CHECKS = [
     ("gas-unbounded-storage-array-push.general", detect_gas_unbounded_storage_array_push),
     ("unsafe-downcast.general", detect_unsafe_downcast),
     ("chained-division-precision-loss.general", detect_chained_division_precision_loss),
+    ("delegatecall-in-loop.general", detect_delegatecall_in_loop),
 ]

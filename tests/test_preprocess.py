@@ -272,6 +272,12 @@ SIGNAL_FIXTURES = {
     "disable-initializers-outside-constructor-unprotected": 'contract A is Initializable { function lock() external { _disableInitializers(); } }',
     "upgradeable-contract-has-selfdestruct": 'contract A is UUPSUpgradeable { function kill() external { selfdestruct(payable(msg.sender)); } }',
     "role-granted-to-self-contract": 'contract A { function grantSelf() external { grantRole(DEFAULT_ADMIN_ROLE, address(this)); } }',
+    # --- V2.3, Access Control + Proxy/Upgradeability, fourth block (docs/decisiones.md D-043) ---
+    "auth-modifier-check-after-placeholder": 'contract A { address owner; modifier onlyOwner() { _; require(msg.sender == owner); } function f() external onlyOwner {} }',
+    "delegatecall-in-loop": 'contract A { function batch(address[] calldata t, bytes[] calldata d) external { for (uint i = 0; i < t.length; i++) { t[i].delegatecall(d[i]); } } }',
+    "proxy-partial-eip1967-adoption": 'contract A { bytes32 internal constant SLOT = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc; uint256 public extraVar; fallback() external payable { (bool ok, ) = address(0).delegatecall(msg.data); require(ok); } }',
+    "admin-check-hardcoded-address": 'contract A { function f() external view returns (bool) { return msg.sender == 0x1234567890123456789012345678901234567890; } }',
+    "timelock-zero-delay-configured": 'contract A { function deploy(address[] memory p, address[] memory e) external returns (address) { return address(new TimelockController(0, p, e, address(0))); } }',
 }
 
 
@@ -891,6 +897,74 @@ class SignalFamilyNegativeControlTests(unittest.TestCase):
         hits = [s for s in signals if s["family"] == "upgradeable-contract-has-selfdestruct"]
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["details"]["baseSignalFamily"], "selfdestruct")
+
+    # --- V2.3, Access Control + Proxy/Upgradeability, fourth block (docs/decisiones.md D-043) ---
+
+    def test_check_before_placeholder_is_not_flagged_check_after_placeholder(self):
+        source = 'contract A { address owner; modifier onlyOwner() { require(msg.sender == owner); _; } function f() external onlyOwner {} }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "auth-modifier-check-after-placeholder"))
+
+    def test_empty_guard_is_not_flagged_check_after_placeholder(self):
+        # No check at all is auth-modifier-empty-guard's own job, not this family's.
+        source = 'contract A { modifier onlyOwner() { _; } function f() external onlyOwner {} }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "auth-modifier-check-after-placeholder"))
+
+    def test_oz_v5_delegation_pattern_is_not_flagged_check_after_placeholder(self):
+        source = 'contract A { modifier onlyOwner() { _checkOwner(); _; } function _checkOwner() internal view {} function f() external onlyOwner {} }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "auth-modifier-check-after-placeholder"))
+
+    def test_delegatecall_outside_loop_is_not_flagged_in_loop(self):
+        source = 'contract A { function f(address t, bytes calldata d) external { t.delegatecall(d); } }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "delegatecall-in-loop"))
+
+    def test_single_line_loop_body_delegatecall_is_flagged_in_loop(self):
+        # Regression for the offset-vs-line-range design: a loop whose body
+        # opens and calls delegatecall on the same physical line must still
+        # be recognized (offset_of_line(line) alone would land before
+        # bodyStart here).
+        source = 'contract A { function batch(address[] calldata t, bytes[] calldata d) external { for (uint i = 0; i < t.length; i++) { t[i].delegatecall(d[i]); } } }'
+        signals = self._signals_for(source)
+        self.assertTrue(signals_of({"signals": signals}, "delegatecall-in-loop"))
+
+    def test_slot_present_without_extra_state_vars_is_not_flagged_partial_adoption(self):
+        source = (
+            'contract A { bytes32 internal constant SLOT = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;'
+            ' fallback() external payable { (bool ok, ) = address(0).delegatecall(msg.data); require(ok); } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "proxy-partial-eip1967-adoption"))
+
+    def test_naive_and_partial_adoption_are_mutually_exclusive(self):
+        eip1967_slot = "360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+        source = (
+            "contract A { bytes32 internal constant SLOT = 0x%s; uint256 public extraVar;"
+            " fallback() external payable { (bool ok, ) = address(0).delegatecall(msg.data); require(ok); } }" % eip1967_slot
+        )
+        signals = self._signals_for(source)
+        self.assertTrue(signals_of({"signals": signals}, "proxy-partial-eip1967-adoption"))
+        self.assertFalse(signals_of({"signals": signals}, "naive-proxy-storage-collision"))
+
+    def test_zero_address_sentinel_is_not_flagged_hardcoded_address_check(self):
+        source = 'contract A { function f(address a) external view returns (bool) { return a != address(0); } }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "admin-check-hardcoded-address"))
+
+    def test_variable_comparison_is_not_flagged_hardcoded_address_check(self):
+        source = 'contract A { address owner; function f() external view returns (bool) { return msg.sender == owner; } }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "admin-check-hardcoded-address"))
+
+    def test_nonzero_delay_is_not_flagged_timelock_zero_delay(self):
+        source = (
+            'contract A { function deploy(address[] memory p, address[] memory e) external returns (address) {'
+            ' return address(new TimelockController(2 days, p, e, address(0))); } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "timelock-zero-delay-configured"))
 
     def test_disabled_initializers_suppresses_implementation_not_disabled(self):
         source = 'contract A is Initializable { constructor() { _disableInitializers(); } function initialize() public initializer {} }'
