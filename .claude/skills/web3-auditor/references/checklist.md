@@ -123,6 +123,7 @@ strong corroborating evidence exists.
 | `accept-ownership-unprotected` | SC01 | yes | low | A hand-reimplemented `acceptOwnership()` (Ownable2Step's accept-the-pending-owner entry point) with no caller check at all - `admin-function-unprotected`'s own name heuristic has no "accept*" prefix, so this exact name is otherwise invisible to it. Restricted to public/external. | A purely-internal helper that happens to share this exact name, reached only through an already-guarded external entry point elsewhere. |
 | `role-granted-to-tx-origin` | SC01 | yes | low | `grantRole`/`_grantRole`/`_setupRole` whose account argument is literally `tx.origin` - binds the role to whoever originated the transaction chain, not to the immediate caller. Unlike `role-granted-to-self-contract`, not restricted to ADMIN-named roles: there is no common legitimate reason to bind any role to `tx.origin`. | N/A - no known legitimate pattern uses `tx.origin` as a role-grant target, for any role. |
 | `reinitializer-one-collides-with-initializer` | SC10 | yes | low | A contract with a primary `initialize()`-shaped function guarded by the `initializer` modifier (by OpenZeppelin convention, internally equivalent to version 1 of the shared version counter) that *also* has a separate function carrying an explicit `reinitializer(1)` - a real version collision `reinitializer-version-not-increasing` cannot see, since that family only compares `reinitializer`-tagged functions against each other, never against the primary initializer's own implicit version 1. | One function carrying both modifiers at once is excluded (a different, contradictory pattern, not the two-distinct-functions collision this family targets). |
+| `state-write-guard-inconsistency` | SC02, SC01 | yes | high | The first Business Logic / Invariants family (V2.4): the same non-constant, non-immutable state variable is written by 2+ functions where at least one is guarded and at least one is completely unguarded - a restriction enforced in one function can be bypassed by calling another that reaches the same state with no check. Constructors and initializer-shaped functions are excluded entirely from both roles. | Two extremely common, legitimate patterns this heuristic cannot distinguish from a real bypass, both observed directly on the 16 real eval fixtures: a self-service function indexed by `msg.sender` (e.g. `credits[msg.sender] -= amount`) needs no owner-style guard - the mapping index IS the authorization; and a deliberately permissionless inflow function (e.g. `deposit() external payable { totalDeposits += msg.value; }`) paired with an admin-gated outflow function (`sweepToOwner()`) on the same counter is an ordinary pool/ledger design, not a bypassed restriction. |
 
 The eight families from `unprotected-callback-handler` through `gas-unbounded-storage-array-push` are the
 first detector-expansion block added under the V2.1 registry architecture (`scripts/detectors/`); see
@@ -152,6 +153,14 @@ lives in `scripts/detectors/arithmetic_and_gas.py` alongside `external-call-in-l
 `accept-ownership-unprotected` through `reinitializer-one-collides-with-initializer` are V2.3's fifth and
 final block (D-045) - the last block of this initiative; all three are single-file, available in every
 mode, and none need `systemGraph`.
+
+`state-write-guard-inconsistency` opens V2.4 (Business Logic / Invariants, D-046), a new logical group
+living in its own `scripts/detectors/business_logic.py` module rather than `access_control.py`. Per the
+V2.4 audit, most of what "business logic" usually means - broken invariants, impossible states,
+inconsistent economic conditions, incomplete workflows, call-sequence abuse beyond reentrancy - has no
+reliable mechanical signal, same documented limitation as SC02/SC03/SC04 above, and stays AI's job (Step
+6); this first family is deliberately the one narrow slice that is purely structural (which functions
+write which state variable, with what guard) rather than a guess at intent.
 
 ### EIP-1967-style storage slots
 

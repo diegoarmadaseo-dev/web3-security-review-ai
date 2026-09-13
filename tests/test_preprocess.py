@@ -282,6 +282,11 @@ SIGNAL_FIXTURES = {
     "accept-ownership-unprotected": 'contract A { address owner; function acceptOwnership() external { owner = msg.sender; } }',
     "role-granted-to-tx-origin": 'contract A { function grantSelf() external { grantRole(MINTER_ROLE, tx.origin); } }',
     "reinitializer-one-collides-with-initializer": 'contract A { function initialize() public initializer {} function reinitV1() public reinitializer(1) {} }',
+    # --- V2.4, Business Logic / Invariants, first check (docs/decisiones.md D-046) ---
+    "state-write-guard-inconsistency": (
+        'contract A { address owner; uint256 x; function setXAdmin(uint256 v) external { require(msg.sender == owner); x = v; }'
+        ' function setXAnyone(uint256 v) external { x = v; } }'
+    ),
 }
 
 
@@ -1045,6 +1050,70 @@ class SignalFamilyNegativeControlTests(unittest.TestCase):
         source = 'contract A { function initialize() public initializer reinitializer(1) {} }'
         signals = self._signals_for(source)
         self.assertFalse(signals_of({"signals": signals}, "reinitializer-one-collides-with-initializer"))
+
+    # --- V2.4, Business Logic / Invariants, first check (docs/decisiones.md D-046) ---
+
+    def test_both_writers_guarded_is_not_flagged_state_write_guard_inconsistency(self):
+        source = (
+            'contract A { address owner; uint256 x; function setXAdmin(uint256 v) external { require(msg.sender == owner); x = v; }'
+            ' function setXAdmin2(uint256 v) external { require(msg.sender == owner); x = v; } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "state-write-guard-inconsistency"))
+
+    def test_both_writers_unguarded_is_not_flagged_state_write_guard_inconsistency(self):
+        # A uniformly-unguarded pair is admin-function-unprotected's own job,
+        # not this family's - it requires at least one guarded writer too.
+        source = 'contract A { uint256 x; function setX1(uint256 v) external { x = v; } function setX2(uint256 v) external { x = v; } }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "state-write-guard-inconsistency"))
+
+    def test_single_writer_is_not_flagged_state_write_guard_inconsistency(self):
+        source = 'contract A { uint256 x; function setX(uint256 v) external { x = v; } }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "state-write-guard-inconsistency"))
+
+    def test_constructor_writer_is_excluded_from_state_write_guard_inconsistency(self):
+        source = (
+            'contract A { address owner; uint256 x; constructor(uint256 v) { x = v; }'
+            ' function setX(uint256 v) external { require(msg.sender == owner); x = v; } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "state-write-guard-inconsistency"))
+
+    def test_initializer_writer_is_excluded_from_state_write_guard_inconsistency(self):
+        source = (
+            'contract A { address owner; uint256 x; function initialize(uint256 v) public initializer { x = v; }'
+            ' function setX(uint256 v) external { require(msg.sender == owner); x = v; } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "state-write-guard-inconsistency"))
+
+    def test_local_variable_is_never_treated_as_state_write_guard_inconsistency(self):
+        source = (
+            'contract A { uint256 x; function setX(uint256 v) external { x = v; }'
+            ' function f() external pure returns (uint256) { uint256 temp = 5; temp = temp + 1; return temp; } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "state-write-guard-inconsistency"))
+
+    def test_multiple_writers_fires_once_and_distinguishes_modifier_from_inline_guard(self):
+        source = (
+            'contract A { address owner; uint256 x; modifier onlyOwner() { require(msg.sender == owner); _; }'
+            ' function setXByModifier(uint256 v) external onlyOwner { x = v; }'
+            ' function setXByInline(uint256 v) external { require(msg.sender == owner); x = v; }'
+            ' function setXAnyone(uint256 v) external { x = v; } }'
+        )
+        signals = self._signals_for(source)
+        hits = [s for s in signals if s["family"] == "state-write-guard-inconsistency"]
+        self.assertEqual(len(hits), 1)
+        details = hits[0]["details"]
+        self.assertEqual(details["unguardedWriters"], ["setXAnyone"])
+        guarded_by_name = {g["function"]: g for g in details["guardedWriters"]}
+        self.assertEqual(guarded_by_name["setXByModifier"]["modifiers"], ["onlyOwner"])
+        self.assertEqual(guarded_by_name["setXByModifier"]["bodyGuards"], [])
+        self.assertEqual(guarded_by_name["setXByInline"]["modifiers"], [])
+        self.assertTrue(guarded_by_name["setXByInline"]["bodyGuards"])
 
     def test_disabled_initializers_suppresses_implementation_not_disabled(self):
         source = 'contract A is Initializable { constructor() { _disableInitializers(); } function initialize() public initializer {} }'

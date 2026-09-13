@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Tuple
 
-from . import access_control, arithmetic_and_gas, calls_and_transfers, defi, file_level, vyper
+from . import access_control, arithmetic_and_gas, business_logic, calls_and_transfers, defi, file_level, vyper
 
 CHECK_METADATA: Dict[str, Dict[str, Any]] = {
     "tx-origin.general": {"family": "tx-origin", "categories": ["SC01", "EXTRA-tx-origin"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
@@ -122,6 +122,8 @@ CHECK_METADATA: Dict[str, Dict[str, Any]] = {
     "accept-ownership-unprotected.general": {"family": "accept-ownership-unprotected", "categories": ["SC01"], "needsContext": True, "fpRisk": "low", "groupHint": None},
     "role-granted-to-tx-origin.general": {"family": "role-granted-to-tx-origin", "categories": ["SC01"], "needsContext": True, "fpRisk": "low", "groupHint": None},
     "reinitializer-one-collides-with-initializer.general": {"family": "reinitializer-one-collides-with-initializer", "categories": ["SC10"], "needsContext": True, "fpRisk": "low", "groupHint": None},
+    # --- V2.4, Business Logic / Invariants, first check (docs/decisiones.md D-046) ---
+    "state-write-guard-inconsistency.general": {"family": "state-write-guard-inconsistency", "categories": ["SC02", "SC01"], "needsContext": True, "fpRisk": "high", "groupHint": None},
 }
 
 # checkIds computed cross-contract, outside the per-file phase lists below (need
@@ -148,7 +150,7 @@ SCOPE_CHECKS: List[Tuple[str, Callable[[Dict[str, Any]], None]]] = (
 
 FUNCTION_CHECKS: List[Tuple[str, Callable[[Dict[str, Any]], None]]] = list(access_control.FUNCTION_CHECKS)
 
-CONTRACT_CHECKS: List[Tuple[str, Callable[[Dict[str, Any]], None]]] = list(access_control.CONTRACT_CHECKS)
+CONTRACT_CHECKS: List[Tuple[str, Callable[[Dict[str, Any]], None]]] = list(access_control.CONTRACT_CHECKS) + list(business_logic.CONTRACT_CHECKS)
 
 VYPER_CHECKS: List[Callable[[Dict[str, Any]], None]] = list(vyper.CHECKS)
 
