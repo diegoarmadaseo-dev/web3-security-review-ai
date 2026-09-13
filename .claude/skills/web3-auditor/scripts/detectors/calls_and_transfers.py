@@ -283,6 +283,71 @@ def detect_call_value_from_parameter(ctx: Dict[str, Any]) -> None:
         ctx["collector"].add("call-value-from-parameter.general", offset, ctx["cname"], scope, {"kind": match.group(1), "valueParam": value_expr})
 
 
+# --- V2.1 detector-expansion, third block (docs/decisiones.md D-035) ---
+CALL_RETURN_BYTES_RE = re.compile(r"\(\s*bool\s+\w+\s*,\s*bytes\s+memory\s+(\w+)\s*\)\s*=\s*[A-Za-z_$][\w$.\[\]()]*?\s*\.(call|staticcall)\s*(\{[^}]*\})?\s*\(")
+
+
+def detect_selfdestruct_unprotected(ctx: Dict[str, Any]) -> None:
+    """Narrows selfdestruct.general's own already-computed `guarded` detail
+    into a gated signal: reads the signal detect_selfdestruct already
+    emitted earlier in this same scope-phase pass (enforced by CHECKS list
+    order below) - zero new regex, zero new scan. An unguarded
+    selfdestruct is almost never intentional, so fpRisk is low."""
+    cname = ctx["cname"]
+    for s in ctx["collector"].signals:
+        if s["family"] != "selfdestruct" or s["contract"] != cname:
+            continue
+        if s["details"].get("guarded"):
+            continue
+        offset = ctx["line_index"].offset_of_line(s["line"])
+        scope = {"function": s["function"], "modifier": s["modifier"], "kind": None}
+        ctx["collector"].add("selfdestruct-unprotected.general", offset, cname, scope, {})
+
+
+def detect_delegatecall_arbitrary_unprotected(ctx: Dict[str, Any]) -> None:
+    """Narrows delegatecall.general's own already-computed `targetIsParameter`
+    and `guarded` details into a gated signal, same technique as
+    detect_selfdestruct_unprotected above. A delegatecall to a
+    caller-supplied address with no caller guard is close to arbitrary code
+    execution in the calling contract's storage, so fpRisk is low despite
+    reusing an fpRisk-medium base signal."""
+    cname = ctx["cname"]
+    for s in ctx["collector"].signals:
+        if s["family"] != "delegatecall" or s["contract"] != cname:
+            continue
+        details = s["details"]
+        if not details.get("targetIsParameter") or details.get("guarded"):
+            continue
+        offset = ctx["line_index"].offset_of_line(s["line"])
+        scope = {"function": s["function"], "modifier": s["modifier"], "kind": None}
+        ctx["collector"].add("delegatecall-arbitrary-unprotected.general", offset, cname, scope, {"target": details.get("target")})
+
+
+def detect_low_level_call_return_data_unbounded_decode(ctx: Dict[str, Any]) -> None:
+    """A `(bool ok, bytes memory data) = target.call(...)` result later
+    passed straight into `abi.decode(data, ...)` with no `data.length`/
+    `returndatasize()` guard anywhere in the function is a return-bomb/
+    gas-griefing surface against an untrusted callee. Independent regex on
+    the already-extracted function body, same bounded-cost pattern as the
+    module's other checks - does not modify detect_low_level_call."""
+    span_start, body, masked = ctx["span_start"], ctx["body"], ctx["masked"]
+    for match in CALL_RETURN_BYTES_RE.finditer(body):
+        offset = span_start + match.start()
+        if in_assembly(ctx, offset):
+            continue
+        var_name = match.group(1)
+        fn = _fn_at(ctx, offset)
+        fbody = fn.get("_body", "") if fn else ""
+        if not fbody:
+            continue
+        if not re.search(r"\babi\.decode\s*\(\s*" + re.escape(var_name) + r"\b", fbody):
+            continue
+        if re.search(re.escape(var_name) + r"\s*\.\s*length\b|\breturndatasize\s*\(", fbody):
+            continue
+        scope = locate_scope(ctx["contract"], offset)
+        ctx["collector"].add("low-level-call-return-data-unbounded-decode.general", offset, ctx["cname"], scope, {"variable": var_name})
+
+
 CHECKS = [
     ("assembly-block.general", detect_assembly_block),
     ("low-level-call.general", detect_low_level_call),
@@ -294,4 +359,7 @@ CHECKS = [
     ("delegatecall.general", detect_delegatecall),
     ("selfdestruct.general", detect_selfdestruct),
     ("call-value-from-parameter.general", detect_call_value_from_parameter),
+    ("selfdestruct-unprotected.general", detect_selfdestruct_unprotected),
+    ("delegatecall-arbitrary-unprotected.general", detect_delegatecall_arbitrary_unprotected),
+    ("low-level-call-return-data-unbounded-decode.general", detect_low_level_call_return_data_unbounded_decode),
 ]

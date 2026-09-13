@@ -77,6 +77,16 @@ CHECK_METADATA: Dict[str, Dict[str, Any]] = {
     "implementation-not-disabled.general": {"family": "implementation-not-disabled", "categories": ["SC10"], "needsContext": True, "fpRisk": "high", "groupHint": None},
     "signature-missing-nonce-or-deadline.general": {"family": "signature-missing-nonce-or-deadline", "categories": ["EXTRA-replay-permit"], "needsContext": True, "fpRisk": "high", "groupHint": None},
     "unsafe-downcast.general": {"family": "unsafe-downcast", "categories": ["SC09"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
+    # --- V2.1 detector-expansion, third block (docs/decisiones.md D-035) ---
+    "selfdestruct-unprotected.general": {"family": "selfdestruct-unprotected", "categories": ["SC01"], "needsContext": True, "fpRisk": "low", "groupHint": None},
+    "upgrade-function-unprotected.general": {"family": "upgrade-function-unprotected", "categories": ["SC10", "SC01"], "needsContext": True, "fpRisk": "low", "groupHint": None},
+    "delegatecall-arbitrary-unprotected.general": {"family": "delegatecall-arbitrary-unprotected", "categories": ["SC06", "SC01"], "needsContext": True, "fpRisk": "low", "groupHint": None},
+    "reentrancy-guard-not-first-modifier.general": {"family": "reentrancy-guard-not-first-modifier", "categories": ["SC08"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
+    "unlimited-approval-in-loop.general": {"family": "unlimited-approval-in-loop", "categories": ["SC02", "SC01"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
+    "permit-not-wrapped-in-try-catch.general": {"family": "permit-not-wrapped-in-try-catch", "categories": ["EXTRA-replay-permit"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
+    "signature-domain-separator-missing.general": {"family": "signature-domain-separator-missing", "categories": ["EXTRA-replay-permit"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
+    "chained-division-precision-loss.general": {"family": "chained-division-precision-loss", "categories": ["SC07"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
+    "low-level-call-return-data-unbounded-decode.general": {"family": "low-level-call-return-data-unbounded-decode", "categories": ["SC06"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
 }
 
 # Phase order matters (see module docstring). Do not alphabetize or reorder

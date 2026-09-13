@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict
 
-from .context import collapse_ws, fn_at, locate_scope, statement_at
+from .context import collapse_ws, fn_at, locate_scope, loop_spans, statement_at
 from text_utils import matching_paren, split_top_level
 
 ORACLE_METHOD_RE = re.compile(r"\.(latestRoundData|latestAnswer|getReserves|slot0|observe|consult|getPrice\w*|price|getAmountsOut|getAmountOut|getAmountsIn|quote\w*|getRate\w*|exchangeRate\w*|pricePerShare|getPricePerFullShare|convertToAssets|convertToShares|totalAssets)\s*\(")
@@ -21,6 +21,13 @@ ECRECOVER_RE = re.compile(r"\becrecover\s*\(")
 ECRECOVER_ASSIGN_RE = re.compile(r"([A-Za-z_$][\w$]*)\s*=\s*$")
 LATEST_ROUND_DATA_RE = re.compile(r"\.latestRoundData\s*\(\s*\)")
 ANSWER_VALIDATION_RE = re.compile(r"\banswer\b\s*[<>]=?\s*0\b|\b0\b\s*[<>]=?\s*\banswer\b|require\s*\([^;]*\banswer\b[^;]*\)|\bupdatedAt\b|\bansweredInRound\b|\broundId\b|\bstale\b|\bheartbeat\b|\bmaxAge\b|\bMAX_DELAY\b")
+# --- V2.1 detector-expansion, third block (docs/decisiones.md D-035) ---
+APPROVE_METHOD_RE = re.compile(r"\.(approve|safeApprove|forceApprove|increaseAllowance)\s*\(")
+MAX_APPROVAL_ARG_RE = re.compile(r"type\s*\(\s*uint(256)?\s*\)\s*\.max|2\s*\*\*\s*256\s*-\s*1|uint256\s*\(\s*-\s*1\s*\)|MAX_UINT|MAX_INT|0x[fF]{64}")
+PERMIT_CALL_RE = re.compile(r"([A-Za-z_$][\w$.\[\]()]*?)\s*\.\s*permit\s*\(")
+TRY_BEFORE_CALL_RE = re.compile(r"\btry\s+$")
+DOMAIN_SEPARATOR_RE = re.compile(r"DOMAIN_SEPARATOR|_domainSeparator|EIP712|_hashTypedData|typedDataHash", re.I)
+DOMAIN_SEPARATOR_BASE_RE = re.compile(r"EIP712|Permit", re.I)
 
 
 def detect_oracle_usage(ctx: Dict[str, Any]) -> None:
@@ -184,6 +191,99 @@ def detect_signature_missing_nonce_or_deadline(ctx: Dict[str, Any]) -> None:
         ctx["collector"].add("signature-missing-nonce-or-deadline.general", offset, ctx["cname"], scope, {"api": collapse_ws(match.group(0)).rstrip("(")})
 
 
+def detect_unlimited_approval_in_loop(ctx: Dict[str, Any]) -> None:
+    """V2.1 detector-expansion, third block (docs/decisiones.md D-035).
+    Granting a max-value approval repeatedly inside a loop (one per
+    loop-controlled spender/token) multiplies unlimited-approval's own
+    exposure surface across every iteration. Reuses loop_spans (already in
+    context.py, used by arithmetic_and_gas.py's loop analysis) and the same
+    max-approval literal shapes as unlimited-approval, applied only within
+    each loop's own body span - no new file-wide scan.
+
+    loop_spans() returns one entry per loop keyword found, so a nested loop
+    (for inside for) yields an outer entry whose body span physically
+    contains the inner loop's own span too - the same approve() call site
+    would then be visited once per enclosing loop level. `seen_offsets`
+    dedupes by exact match position so each call site is only ever flagged
+    once regardless of nesting depth; found and fixed during review
+    (docs/decisiones.md D-035), see
+    test_nested_loop_reports_unlimited_approval_only_once."""
+    contract, span_start, span_end, masked, pairs = ctx["contract"], ctx["span_start"], ctx["span_end"], ctx["masked"], ctx["pairs"]
+    seen_offsets = set()
+    for loop in loop_spans(masked, span_start, span_end, pairs):
+        loop_body = masked[loop["bodyStart"]:loop["bodyEnd"]]
+        for match in APPROVE_METHOD_RE.finditer(loop_body):
+            offset = loop["bodyStart"] + match.start()
+            if offset in seen_offsets:
+                continue
+            open_paren = loop["bodyStart"] + match.end() - 1
+            close_paren = matching_paren(masked, open_paren)
+            if close_paren == -1:
+                continue
+            args_text = masked[open_paren + 1:close_paren]
+            if not MAX_APPROVAL_ARG_RE.search(args_text):
+                continue
+            seen_offsets.add(offset)
+            scope = locate_scope(contract, offset)
+            ctx["collector"].add("unlimited-approval-in-loop.general", offset, ctx["cname"], scope, {"method": match.group(1), "loopLine": ctx["line_index"].line_of(loop["start"])})
+
+
+def detect_permit_not_wrapped_in_try_catch(ctx: Dict[str, Any]) -> None:
+    """V2.1 detector-expansion, third block (docs/decisiones.md D-035).
+    `IERC20Permit.permit(...)` reverts if the signature was already used or
+    front-run - calling it unwrapped means that revert propagates and can
+    block the whole transaction; `try token.permit(...) { ... } catch { ...
+    }` is the documented mitigation. Checks a window of `masked` immediately
+    before the call for a literal `try` token (TRY_BEFORE_CALL_RE below):
+    the pattern already requires everything between "try" and the call to
+    be whitespace, so a generous window is safe - it cannot pick up an
+    unrelated, more distant `try` that has other tokens (a statement
+    terminator, another call) in between. A 10-char window was tried first
+    and missed the common multi-line-argument style (`try` on its own line
+    before a long call), a false positive found and fixed during review
+    (docs/decisiones.md D-035); see
+    test_permit_wrapped_in_multiline_try_is_not_flagged."""
+    contract, span_start, masked = ctx["contract"], ctx["span_start"], ctx["masked"]
+    body = ctx["body"]
+    for match in PERMIT_CALL_RE.finditer(body):
+        offset = span_start + match.start()
+        window_start = max(span_start, offset - 100)
+        preceding = masked[window_start:offset]
+        if TRY_BEFORE_CALL_RE.search(preceding):
+            continue
+        scope = locate_scope(contract, offset)
+        ctx["collector"].add("permit-not-wrapped-in-try-catch.general", offset, ctx["cname"], scope, {"callee": match.group(1)})
+
+
+def detect_signature_domain_separator_missing(ctx: Dict[str, Any]) -> None:
+    """V2.1 detector-expansion, third block (docs/decisiones.md D-035).
+    A contract using ecrecover/ECDSA-shaped signature verification
+    (SIGNATURE_RE, reused verbatim) with no EIP-712 domain-separator
+    construction anywhere in the same contract risks the same signature
+    being replayed against a different contract or chain. Fires once per
+    contract, not per signature site.
+
+    Also checks contract["bases"] (already parsed, no new scan) for an
+    EIP712/Permit-shaped base name: `ctx["body"]` is only the text inside
+    the contract's own braces, so a contract that gets its domain separator
+    by inheriting OpenZeppelin's EIP712/ERC20Permit - the standard,
+    correct, extremely common way to do this - would never spell
+    "DOMAIN_SEPARATOR" anywhere in its own body. An earlier version missed
+    this and false-positived on exactly that pattern; found and fixed
+    during review (docs/decisiones.md D-035), see
+    test_eip712_permit_base_suppresses_domain_separator_missing."""
+    contract, cname, body = ctx["contract"], ctx["cname"], ctx["body"]
+    if cname is None:
+        return
+    if not SIGNATURE_RE.search(body):
+        return
+    if DOMAIN_SEPARATOR_RE.search(body):
+        return
+    if any(DOMAIN_SEPARATOR_BASE_RE.search(base) for base in contract["bases"]):
+        return
+    ctx["collector"].add("signature-domain-separator-missing.general", ctx["span_start"], cname, {"function": None, "modifier": None, "kind": None}, {})
+
+
 CHECKS = [
     ("oracle-usage.general", detect_oracle_usage),
     ("flash-loan-surface.general", detect_flash_loan_surface),
@@ -193,4 +293,7 @@ CHECKS = [
     ("ecrecover-zero-address-unchecked.general", detect_ecrecover_zero_address_unchecked),
     ("oracle-answer-unchecked.general", detect_oracle_answer_unchecked),
     ("signature-missing-nonce-or-deadline.general", detect_signature_missing_nonce_or_deadline),
+    ("unlimited-approval-in-loop.general", detect_unlimited_approval_in_loop),
+    ("permit-not-wrapped-in-try-catch.general", detect_permit_not_wrapped_in_try_catch),
+    ("signature-domain-separator-missing.general", detect_signature_domain_separator_missing),
 ]

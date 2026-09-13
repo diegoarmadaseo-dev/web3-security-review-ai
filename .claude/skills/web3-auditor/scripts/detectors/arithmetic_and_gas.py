@@ -25,6 +25,8 @@ RANDOM_FUNCTION_RE = re.compile(r"random|lottery|draw|winner|seed|dice|roll|raff
 # --- V2.1 detector-expansion, second block (docs/decisiones.md D-033) ---
 NARROW_CAST_RE = re.compile(r"\b(u?int)(\d{1,3})\s*\(")
 LITERAL_ARG_RE = re.compile(r"^(\d+|0x[0-9a-fA-F]+)$")
+# --- V2.1 detector-expansion, third block (docs/decisiones.md D-035) ---
+CHAINED_DIVISION_RE = re.compile(r"[\w\)\]]\s*/(?![/=*])\s*[\w\(\[][^;{}*]*?/(?![/=*])\s*[\w\(\[]")
 
 
 def detect_hardcoded_address(ctx: Dict[str, Any]) -> None:
@@ -239,6 +241,25 @@ def detect_unsafe_downcast(ctx: Dict[str, Any]) -> None:
         ctx["collector"].add("unsafe-downcast.general", offset, ctx["cname"], scope, {"targetType": match.group(1) + match.group(2), "expression": truncate(arg, 80)[0]})
 
 
+def detect_chained_division_precision_loss(ctx: Dict[str, Any]) -> None:
+    """V2.1 detector-expansion, third block (docs/decisiones.md D-035).
+    Two divisions chained in the same expression with no intervening
+    multiplication (`a / b / c`) compound truncation loss beyond what a
+    single division-before-multiplication already flags - a distinct root
+    cause from that family, which requires a later `*` in the same
+    statement. CHAINED_DIVISION_RE explicitly excludes `*` between the two
+    `/` operators, so `a / b * c / d` (already scaled, a normal pattern)
+    does not match."""
+    contract, span_start, body, masked = ctx["contract"], ctx["span_start"], ctx["body"], ctx["masked"]
+    for match in CHAINED_DIVISION_RE.finditer(body):
+        offset = span_start + match.start()
+        if in_assembly(ctx, offset):
+            continue
+        stmt, _ = statement_at(masked, offset, span_start, ctx["span_end"])
+        scope = locate_scope(contract, offset)
+        ctx["collector"].add("chained-division-precision-loss.general", offset, ctx["cname"], scope, {"expression": truncate(collapse_ws(stmt), 120)[0]})
+
+
 CHECKS = [
     ("hardcoded-address.general", detect_hardcoded_address),
     ("unchecked-block.general", detect_unchecked_block),
@@ -250,4 +271,5 @@ CHECKS = [
     ("external-call-in-loop.general", detect_external_call_in_loop),
     ("gas-unbounded-storage-array-push.general", detect_gas_unbounded_storage_array_push),
     ("unsafe-downcast.general", detect_unsafe_downcast),
+    ("chained-division-precision-loss.general", detect_chained_division_precision_loss),
 ]

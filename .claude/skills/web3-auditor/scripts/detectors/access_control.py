@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict
 
-from .context import INTERNAL_STATE_CALL_RE, find_state_writes, locate_scope
+from .context import INTERNAL_STATE_CALL_RE, REENTRANCY_GUARD_RE, find_state_writes, locate_scope
 from text_utils import matching_paren
 
 ADMIN_NAME_RE = re.compile(r"^(set|update|change|configure|withdraw|sweep|rescue|drain|emergency|pause|unpause|mint|burn|upgrade|migrate|whitelist|blacklist|add|remove|grant|revoke|kill|destroy|transferOwnership|renounce|register|unregister|enable|disable|toggle|reset|claim(All|Fees)?)", re.I)
@@ -130,6 +130,23 @@ def detect_upgrade_function(fctx: Dict[str, Any]) -> None:
         return
     body_stripped = re.sub(r"\s+", "", fn["_body"])
     fctx["collector"].add("upgrade-function.general", fn["_headStart"], fctx["cname"], scope, {"name": name, "visibility": fn["visibility"], "guarded": access["guarded"], "guards": access["modifiers"] + access["bodyGuards"], "emptyBody": body_stripped == "" or body_stripped == "{}"})
+
+
+def detect_upgrade_function_unprotected(fctx: Dict[str, Any]) -> None:
+    """V2.1 detector-expansion, third block (docs/decisiones.md D-035).
+    Narrows upgrade-function.general's own already-computed `guarded` detail
+    into a gated signal, instead of re-deriving it: reads the signal
+    detect_upgrade_function already emitted for THIS function earlier in
+    this same FUNCTION_CHECKS pass (enforced by list order below, not by
+    this function) - zero new regex, zero new scan. An unguarded upgrade
+    entry point is a near-total proxy takeover, so fpRisk is low."""
+    fn, scope, cname = fctx["fn"], fctx["scope"], fctx["cname"]
+    for s in fctx["collector"].signals:
+        if s["checkId"] != "upgrade-function.general" or s["contract"] != cname or s["function"] != scope.get("function"):
+            continue
+        if s["details"].get("guarded"):
+            continue
+        fctx["collector"].add("upgrade-function-unprotected.general", fn["_headStart"], cname, scope, {"name": s["details"].get("name")})
 
 
 def detect_reentrancy_pattern(fctx: Dict[str, Any]) -> None:
@@ -350,6 +367,40 @@ def detect_external_call_in_modifier(ctx: Dict[str, Any]) -> None:
         ctx["collector"].add("external-call-in-modifier.general", offset, cname, {"function": None, "modifier": mod["name"], "kind": None}, {"modifier": mod["name"], "call": match.group(1)})
 
 
+def detect_reentrancy_guard_not_first_modifier(ctx: Dict[str, Any]) -> None:
+    """V2.1 detector-expansion, third block (docs/decisiones.md D-035).
+    Modifiers run in the order listed, each wrapping the next - a
+    `nonReentrant`-style guard that is not the FIRST modifier leaves
+    whatever runs in an earlier modifier outside the guard. Only fires when
+    an earlier modifier is one this same contract's own
+    external-call-in-modifier.general already flagged as making a real
+    external call (read from ctx["collector"].signals, populated earlier in
+    this same CONTRACT_CHECKS pass by list order below) - a plain
+    access-control modifier before the guard is not flagged. No new text
+    scan; reuses REENTRANCY_GUARD_RE (context.py) and the already-parsed,
+    ordered fn["modifiers"]."""
+    contract, cname = ctx["contract"], ctx["cname"]
+    if cname is None:
+        return
+    risky_modifier_names = {
+        s["details"]["modifier"]
+        for s in ctx["collector"].signals
+        if s["checkId"] == "external-call-in-modifier.general" and s["contract"] == cname
+    }
+    if not risky_modifier_names:
+        return
+    for fn in contract["functions"]:
+        mods = fn["modifiers"]
+        guard_idx = next((i for i, m in enumerate(mods) if REENTRANCY_GUARD_RE.match(m["name"])), None)
+        if guard_idx is None or guard_idx == 0:
+            continue
+        earlier_risky = [m["name"] for m in mods[:guard_idx] if m["name"] in risky_modifier_names]
+        if not earlier_risky:
+            continue
+        scope = {"function": fn["name"] or fn["kind"], "modifier": None, "kind": fn["kind"]}
+        ctx["collector"].add("reentrancy-guard-not-first-modifier.general", fn["_headStart"], cname, scope, {"guard": mods[guard_idx]["name"], "earlierModifiers": earlier_risky})
+
+
 FUNCTION_CHECKS = [
     ("initializer-unprotected.general", detect_initializer_unprotected),
     ("zero-address-unchecked.general", detect_zero_address_unchecked),
@@ -358,6 +409,7 @@ FUNCTION_CHECKS = [
     ("reentrancy-pattern.general", detect_reentrancy_pattern),
     ("unprotected-callback-handler.general", detect_unprotected_callback_handler),
     ("mismatched-array-length.general", detect_mismatched_array_length),
+    ("upgrade-function-unprotected.general", detect_upgrade_function_unprotected),
 ]
 
 CONTRACT_CHECKS = [
@@ -367,4 +419,5 @@ CONTRACT_CHECKS = [
     ("reentrancy-inconsistent-guarding.general", detect_reentrancy_inconsistent_guarding),
     ("implementation-not-disabled.general", detect_implementation_not_disabled),
     ("external-call-in-modifier.general", detect_external_call_in_modifier),
+    ("reentrancy-guard-not-first-modifier.general", detect_reentrancy_guard_not_first_modifier),
 ]

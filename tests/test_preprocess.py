@@ -244,6 +244,16 @@ SIGNAL_FIXTURES = {
     "implementation-not-disabled": 'contract A is Initializable { function initialize() public initializer {} }',
     "signature-missing-nonce-or-deadline": 'contract A { address owner; mapping(address=>uint256) balances; function claim(bytes32 h, uint8 v, bytes32 r, bytes32 s, uint256 amount) external { address signer = ecrecover(h, v, r, s); require(signer == owner); balances[msg.sender] += amount; } }',
     "unsafe-downcast": 'contract A { function pack(uint256 x) external pure returns (uint128) { return uint128(x); } }',
+    # --- V2.1 detector-expansion, third block (docs/decisiones.md D-035) ---
+    "selfdestruct-unprotected": 'contract A { function kill() external { selfdestruct(payable(msg.sender)); } }',
+    "upgrade-function-unprotected": 'contract A { function _authorizeUpgrade(address n) internal {} }',
+    "delegatecall-arbitrary-unprotected": 'contract A { function exec(address target, bytes calldata data) external { target.delegatecall(data); } }',
+    "reentrancy-guard-not-first-modifier": 'contract A { address registry; modifier onlyAllowed() { (bool ok, ) = registry.call(""); require(ok); _; } modifier nonReentrant() { _; } function f() external onlyAllowed nonReentrant {} }',
+    "unlimited-approval-in-loop": 'contract A { IERC20 token; function batchApprove(address[] memory spenders) external { for (uint i = 0; i < spenders.length; i++) { token.approve(spenders[i], type(uint256).max); } } }',
+    "permit-not-wrapped-in-try-catch": 'contract A { function claim(address token, uint256 value, uint8 v, bytes32 r, bytes32 s) external { IERC20Permit(token).permit(msg.sender, address(this), value, block.timestamp, v, r, s); } }',
+    "signature-domain-separator-missing": 'contract A { function verify(bytes32 h, uint8 v, bytes32 r, bytes32 s) external pure returns (address) { return ecrecover(h, v, r, s); } }',
+    "chained-division-precision-loss": 'contract A { function f(uint a, uint b, uint c) external pure returns (uint) { return a / b / c; } }',
+    "low-level-call-return-data-unbounded-decode": 'contract A { function f(address target, bytes calldata data) external returns (uint256) { (bool ok, bytes memory ret) = target.call(data); require(ok); return abi.decode(ret, (uint256)); } }',
 }
 
 
@@ -472,6 +482,123 @@ class SignalFamilyNegativeControlTests(unittest.TestCase):
         )
         signals = self._signals_for(source)
         self.assertTrue(signals_of({"signals": signals}, "call-value-from-parameter"))
+
+    # --- V2.1 detector-expansion, third block (docs/decisiones.md D-035) ---
+
+    def test_guarded_selfdestruct_is_not_flagged_unprotected(self):
+        source = 'contract A { address owner; function kill() external { require(msg.sender == owner); selfdestruct(payable(msg.sender)); } }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "selfdestruct-unprotected"))
+
+    def test_guarded_upgrade_function_is_not_flagged_unprotected(self):
+        source = (
+            'contract A { address owner; function _authorizeUpgrade(address n) internal onlyOwner {}'
+            ' modifier onlyOwner() { require(msg.sender == owner); _; } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "upgrade-function-unprotected"))
+
+    def test_guarded_delegatecall_is_not_flagged_arbitrary(self):
+        source = (
+            'contract A { address owner; function exec(address target, bytes calldata data) external {'
+            ' require(msg.sender == owner); target.delegatecall(data); } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "delegatecall-arbitrary-unprotected"))
+
+    def test_reentrancy_guard_first_modifier_is_not_flagged(self):
+        source = (
+            'contract A { address registry; modifier onlyAllowed() { (bool ok, ) = registry.call(""); require(ok); _; }'
+            ' modifier nonReentrant() { _; } function f() external nonReentrant onlyAllowed {} }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "reentrancy-guard-not-first-modifier"))
+
+    def test_non_call_modifier_before_guard_is_not_flagged(self):
+        source = (
+            'contract A { address owner; modifier onlyOwner() { require(msg.sender == owner); _; }'
+            ' modifier nonReentrant() { _; } function f() external onlyOwner nonReentrant {} }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "reentrancy-guard-not-first-modifier"))
+
+    def test_bounded_approval_in_loop_is_not_flagged_unlimited(self):
+        source = (
+            'contract A { IERC20 token; function batchApprove(address[] memory spenders, uint256 amt) external {'
+            ' for (uint i = 0; i < spenders.length; i++) { token.approve(spenders[i], amt); } } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "unlimited-approval-in-loop"))
+
+    def test_nested_loop_reports_unlimited_approval_only_once(self):
+        # D-035: loop_spans() yields one entry per loop, so a nested loop's
+        # outer entry physically contains the inner loop's own body too -
+        # the same approve() call was counted once per enclosing loop level
+        # before this was found and fixed; must report exactly one signal.
+        source = (
+            'contract A { IERC20 token; function batchApprove(address[][] memory groups) external {'
+            ' for (uint i = 0; i < groups.length; i++) {'
+            ' for (uint j = 0; j < groups[i].length; j++) {'
+            ' token.approve(groups[i][j], type(uint256).max); } } } }'
+        )
+        signals = self._signals_for(source)
+        self.assertEqual(len(signals_of({"signals": signals}, "unlimited-approval-in-loop")), 1)
+
+    def test_permit_wrapped_in_try_catch_is_not_flagged(self):
+        source = (
+            'contract A { function claim(address token, uint256 value, uint8 v, bytes32 r, bytes32 s) external {'
+            ' try IERC20Permit(token).permit(msg.sender, address(this), value, block.timestamp, v, r, s) {} catch {} } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "permit-not-wrapped-in-try-catch"))
+
+    def test_permit_wrapped_in_multiline_try_is_not_flagged(self):
+        # D-035: a 10-char lookbehind window missed `try` on its own line
+        # before a long call - a common, realistic formatting style. Fixed
+        # by widening the window (the \btry\s+$ anchor stays precise
+        # regardless of window size).
+        source = (
+            'contract A { function claim(address token, uint256 value, uint8 v, bytes32 r, bytes32 s) external {'
+            ' try\n            IERC20Permit(token).permit(msg.sender, address(this), value, block.timestamp, v, r, s)'
+            ' {} catch {} } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "permit-not-wrapped-in-try-catch"))
+
+    def test_domain_separator_present_suppresses_signature_domain_separator_missing(self):
+        source = (
+            'contract A { bytes32 public DOMAIN_SEPARATOR; function verify(bytes32 h, uint8 v, bytes32 r, bytes32 s)'
+            ' external pure returns (address) { return ecrecover(h, v, r, s); } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "signature-domain-separator-missing"))
+
+    def test_eip712_permit_base_suppresses_domain_separator_missing(self):
+        # D-035: ctx["body"] is only the text inside the contract's own
+        # braces, so inheriting OpenZeppelin's ERC20Permit/EIP712 - the
+        # standard, correct, extremely common way to get a domain separator
+        # - never spells "DOMAIN_SEPARATOR" in the contract's own body.
+        # False-positived on exactly this before being found and fixed.
+        source = (
+            'contract A is ERC20Permit { function verify(bytes32 h, uint8 v, bytes32 r, bytes32 s)'
+            ' external pure returns (address) { return ecrecover(h, v, r, s); } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "signature-domain-separator-missing"))
+
+    def test_scaled_division_is_not_flagged_chained(self):
+        source = 'contract A { function f(uint a, uint b, uint c, uint d) external pure returns (uint) { return a / b * c / d; } }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "chained-division-precision-loss"))
+
+    def test_length_checked_return_data_is_not_flagged_unbounded_decode(self):
+        source = (
+            'contract A { function f(address target, bytes calldata data) external returns (uint256) {'
+            ' (bool ok, bytes memory ret) = target.call(data); require(ok); require(ret.length >= 32);'
+            ' return abi.decode(ret, (uint256)); } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "low-level-call-return-data-unbounded-decode"))
 
     def test_disabled_initializers_suppresses_implementation_not_disabled(self):
         source = 'contract A is Initializable { constructor() { _disableInitializers(); } function initialize() public initializer {} }'
