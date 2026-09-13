@@ -73,7 +73,7 @@ DEFAULT_ADMIN_ROLE_LITERAL_RE = re.compile(r"^(DEFAULT_ADMIN_ROLE|0x0+|bytes32\s
 ROLE_GRANT_TO_SELF_RE = re.compile(r"\b(?:_setupRole|_grantRole|grantRole)\s*\(\s*([^,()]+?)\s*,\s*(address\s*\(\s*this\s*\)|this)\s*\)")
 
 # --- V2.3, Access Control + Proxy/Upgradeability, fourth block (docs/decisiones.md D-043) ---
-PLACEHOLDER_RE = re.compile(r"_\s*;")
+PLACEHOLDER_RE = re.compile(r"\b_\s*;")
 ADMIN_CHECK_HARDCODED_ADDRESS_RE = re.compile(r"\bmsg\.sender\s*[!=]=\s*(0x[0-9a-fA-F]{40})\b|\b(0x[0-9a-fA-F]{40})\b\s*[!=]=\s*msg\.sender\b")
 TIMELOCK_ZERO_DELAY_RE = re.compile(r"\bnew\s+TimelockController\s*\(\s*0\s*,")
 
@@ -920,7 +920,23 @@ def detect_auth_modifier_check_after_placeholder(ctx: Dict[str, Any]) -> None:
     defers to auth-modifier-empty-guard when no check exists at all (no
     double-flagging): this family only fires when a check IS present.
     fpRisk low - there is essentially no legitimate reason to place the
-    placeholder before the only check in an access-control modifier."""
+    placeholder before the only check in an access-control modifier.
+
+    Bugfix (docs/decisiones.md D-044): PLACEHOLDER_RE originally matched a
+    bare underscore followed by optional whitespace then a semicolon,
+    which also matches the tail of any identifier ending in underscore
+    immediately followed by a semicolon (e.g. a local "uint256 x_;"
+    declaration with no initializer) - not just Solidity's own standalone
+    underscore placeholder token. That false match could sit BEFORE a
+    real check that is itself correctly placed before the real
+    placeholder, making a properly-ordered modifier look like its check
+    came after the placeholder. Fixed by requiring a word-boundary
+    assertion immediately before the underscore: the underscore in
+    "x_;" is not preceded by a boundary (the character before it, "x", is
+    itself a word character), so it no longer matches, while a genuinely
+    standalone placeholder (preceded by whitespace, a brace, a semicolon,
+    or the start of the body - always a non-word character or nothing)
+    still does."""
     contract, cname, masked = ctx["contract"], ctx["cname"], ctx["masked"]
     if cname is None:
         return

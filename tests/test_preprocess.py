@@ -916,6 +916,42 @@ class SignalFamilyNegativeControlTests(unittest.TestCase):
         signals = self._signals_for(source)
         self.assertFalse(signals_of({"signals": signals}, "auth-modifier-check-after-placeholder"))
 
+    # --- D-044 bugfix: PLACEHOLDER_RE false-matching identifiers like "x_;" ---
+
+    def test_trailing_underscore_local_var_before_correct_check_is_not_a_false_positive(self):
+        source = (
+            'contract A { address owner; modifier onlyOwner() { uint256 x_; require(msg.sender == owner); _; }'
+            ' function f() external onlyOwner {} }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "auth-modifier-check-after-placeholder"))
+
+    def test_real_placeholder_before_check_still_fires(self):
+        source = 'contract A { address owner; modifier onlyOwner() { _; require(msg.sender == owner); } function f() external onlyOwner {} }'
+        signals = self._signals_for(source)
+        self.assertTrue(signals_of({"signals": signals}, "auth-modifier-check-after-placeholder"))
+
+    def test_real_placeholder_after_check_does_not_fire(self):
+        source = 'contract A { address owner; modifier onlyOwner() { require(msg.sender == owner); _; } function f() external onlyOwner {} }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "auth-modifier-check-after-placeholder"))
+
+    def test_trailing_underscore_var_combined_with_real_placeholder_before_check_fires(self):
+        source = (
+            'contract A { address owner; modifier onlyOwner() { uint256 x_; _; require(msg.sender == owner); }'
+            ' function f() external onlyOwner {} }'
+        )
+        signals = self._signals_for(source)
+        self.assertTrue(signals_of({"signals": signals}, "auth-modifier-check-after-placeholder"))
+
+    def test_trailing_underscore_var_combined_with_real_placeholder_after_check_does_not_fire(self):
+        source = (
+            'contract A { address owner; modifier onlyOwner() { require(msg.sender == owner); uint256 x_; _; }'
+            ' function f() external onlyOwner {} }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "auth-modifier-check-after-placeholder"))
+
     def test_delegatecall_outside_loop_is_not_flagged_in_loop(self):
         source = 'contract A { function f(address t, bytes calldata d) external { t.delegatecall(d); } }'
         signals = self._signals_for(source)
