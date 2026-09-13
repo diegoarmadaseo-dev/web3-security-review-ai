@@ -77,6 +77,10 @@ PLACEHOLDER_RE = re.compile(r"\b_\s*;")
 ADMIN_CHECK_HARDCODED_ADDRESS_RE = re.compile(r"\bmsg\.sender\s*[!=]=\s*(0x[0-9a-fA-F]{40})\b|\b(0x[0-9a-fA-F]{40})\b\s*[!=]=\s*msg\.sender\b")
 TIMELOCK_ZERO_DELAY_RE = re.compile(r"\bnew\s+TimelockController\s*\(\s*0\s*,")
 
+# --- V2.3, Access Control + Proxy/Upgradeability, fifth/last block (docs/decisiones.md D-045) ---
+ACCEPT_OWNERSHIP_NAME_RE = re.compile(r"^acceptOwnership$")
+ROLE_GRANT_TO_TX_ORIGIN_RE = re.compile(r"\b(?:_setupRole|_grantRole|grantRole)\s*\(\s*([^,()]+?)\s*,\s*tx\.origin\s*\)")
+
 
 # --- scope-phase checks -----------------------------------------------------
 
@@ -212,6 +216,31 @@ def detect_timelock_zero_delay_configured(ctx: Dict[str, Any]) -> None:
         ctx["collector"].add("timelock-zero-delay-configured.general", offset, ctx["cname"], scope, {})
 
 
+def detect_role_granted_to_tx_origin(ctx: Dict[str, Any]) -> None:
+    """V2.3, Access Control + Proxy/Upgradeability, fifth/last block
+    (docs/decisiones.md D-045). A role-granting call whose account
+    argument is literally `tx.origin` binds the role to whoever
+    originated the current transaction chain, not to the immediate
+    caller - if any intermediate contract sits between the real signer
+    and this call (a relayer, a multisig executor, a batch/forwarder
+    contract), the role lands on that original EOA regardless of which
+    contract actually invoked this function. Unlike
+    role-granted-to-self-contract.general, not restricted to ADMIN-named
+    roles: there is no common legitimate reason to bind ANY role to
+    tx.origin rather than msg.sender (self-granting a routine operational
+    role to `address(this)` has a known legitimate bootstrap use;
+    tx.origin as a grant target does not), so fpRisk stays low without
+    that extra narrowing. Same regex-with-capture-group architecture as
+    role-granted-to-self-contract.general, substituting the target
+    pattern."""
+    contract, span_start, body = ctx["contract"], ctx["span_start"], ctx["body"]
+    for match in ROLE_GRANT_TO_TX_ORIGIN_RE.finditer(body):
+        role_expr = match.group(1).strip()
+        offset = span_start + match.start()
+        scope = locate_scope(contract, offset)
+        ctx["collector"].add("role-granted-to-tx-origin.general", offset, ctx["cname"], scope, {"role": role_expr})
+
+
 CHECKS = [
     ("hardcoded-role-holder.general", detect_hardcoded_role_holder),
     ("admin-function-uses-tx-origin-check.general", detect_admin_function_uses_tx_origin_check),
@@ -219,6 +248,7 @@ CHECKS = [
     ("role-granted-to-self-contract.general", detect_role_granted_to_self_contract),
     ("admin-check-hardcoded-address.general", detect_admin_check_hardcoded_address),
     ("timelock-zero-delay-configured.general", detect_timelock_zero_delay_configured),
+    ("role-granted-to-tx-origin.general", detect_role_granted_to_tx_origin),
 ]
 
 
@@ -423,6 +453,32 @@ def detect_diamond_cut_unprotected(fctx: Dict[str, Any]) -> None:
     if access["guarded"]:
         return
     fctx["collector"].add("diamond-cut-unprotected.general", fn["_headStart"], cname, scope, {"name": name})
+
+
+def detect_accept_ownership_unprotected(fctx: Dict[str, Any]) -> None:
+    """V2.3, Access Control + Proxy/Upgradeability, fifth/last block
+    (docs/decisiones.md D-045). A hand-reimplemented `acceptOwnership()`
+    (Ownable2Step's own accept-the-pending-owner entry point) with no
+    caller check at all lets ANYONE claim ownership, not just the
+    intended pending owner. ADMIN_NAME_RE (admin-function-unprotected's
+    own name heuristic) has no "accept*" prefix, so this exact name is
+    invisible to that broader check today. Restricted to public/external
+    - unlike diamond-cut-unprotected/upgrade-function-unprotected, which
+    deliberately skip a visibility check since `_authorizeUpgrade`-shaped
+    functions are legitimately internal - there is no legitimate reason
+    for acceptOwnership itself to be internal-only, so this narrows out a
+    purely-internal helper that happens to share the name. fpRisk low -
+    this exact name is essentially only ever used for exactly this
+    purpose."""
+    fn, access, scope, cname = fctx["fn"], fctx["access"], fctx["scope"], fctx["cname"]
+    name = fn["name"] or ""
+    if not ACCEPT_OWNERSHIP_NAME_RE.match(name):
+        return
+    if fn["visibility"] not in ("public", "external"):
+        return
+    if access["guarded"]:
+        return
+    fctx["collector"].add("accept-ownership-unprotected.general", fn["_headStart"], cname, scope, {"name": name})
 
 
 def detect_disable_initializers_outside_constructor_unprotected(fctx: Dict[str, Any]) -> None:
@@ -794,6 +850,47 @@ def detect_reinitializer_version_not_increasing(ctx: Dict[str, Any]) -> None:
         last_version = version
 
 
+def detect_reinitializer_one_collides_with_initializer(ctx: Dict[str, Any]) -> None:
+    """V2.3, Access Control + Proxy/Upgradeability, fifth/last block
+    (docs/decisiones.md D-045). OpenZeppelin's `initializer` modifier is,
+    by convention, internally equivalent to consuming version 1 of
+    Initializable's own shared version counter - a SEPARATE function
+    carrying an explicit `reinitializer(1)` modifier claims that exact
+    same version number again. reinitializer-version-not-increasing.general
+    cannot see this collision: it only compares reinitializer-tagged
+    functions against each other, never against the primary initializer's
+    own implicit version 1. Depending on declaration/call order, this can
+    let an already-consumed initialization entry point run again, or make
+    the "reinitializer(1)" function permanently unreachable - either way
+    a real version collision, not a hypothetical one. Reuses the same
+    `fn["modifiers"]` walk and `args` parsing as
+    reinitializer-version-not-increasing.general, plus the already-used
+    INITIALIZER_NAME_RE for the primary initializer - no new scan.
+    Excludes the (contradictory, but theoretically possible) case of one
+    function carrying BOTH modifiers at once - the collision this family
+    targets is specifically between two DIFFERENT functions."""
+    contract, cname = ctx["contract"], ctx["cname"]
+    if cname is None:
+        return
+    primary_initializers = [
+        fn for fn in contract["functions"]
+        if fn["name"] and INITIALIZER_NAME_RE.match(fn["name"]) and any(m["name"] == "initializer" for m in fn["modifiers"])
+    ]
+    if not primary_initializers:
+        return
+    primary_ids = {id(fn) for fn in primary_initializers}
+    for fn in contract["functions"]:
+        if id(fn) in primary_ids:
+            continue
+        for m in fn["modifiers"]:
+            if m["name"] != "reinitializer":
+                continue
+            if (m.get("args") or "").strip() == "1":
+                scope = {"function": fn["name"] or fn["kind"], "modifier": None, "kind": fn["kind"]}
+                ctx["collector"].add("reinitializer-one-collides-with-initializer.general", fn["_headStart"], cname, scope, {"primaryInitializer": primary_initializers[0]["name"]})
+            break
+
+
 def detect_constructor_sets_state_in_upgradeable(ctx: Dict[str, Any]) -> None:
     """V2.3, Access Control + Proxy/Upgradeability, second block
     (docs/decisiones.md D-040). An upgradeable-indicated contract (same
@@ -1014,6 +1111,7 @@ FUNCTION_CHECKS = [
     ("access-control-admin-transfer-no-two-step.general", detect_access_control_admin_transfer_no_two_step),
     ("diamond-cut-unprotected.general", detect_diamond_cut_unprotected),
     ("disable-initializers-outside-constructor-unprotected.general", detect_disable_initializers_outside_constructor_unprotected),
+    ("accept-ownership-unprotected.general", detect_accept_ownership_unprotected),
 ]
 
 CONTRACT_CHECKS = [
@@ -1029,6 +1127,7 @@ CONTRACT_CHECKS = [
     ("proxy-partial-eip1967-adoption.general", detect_proxy_partial_eip1967_adoption),
     ("initializer-reinitializer-inconsistency.general", detect_initializer_reinitializer_inconsistency),
     ("reinitializer-version-not-increasing.general", detect_reinitializer_version_not_increasing),
+    ("reinitializer-one-collides-with-initializer.general", detect_reinitializer_one_collides_with_initializer),
     ("constructor-sets-state-in-upgradeable.general", detect_constructor_sets_state_in_upgradeable),
     ("multiple-upgradeable-bases.general", detect_multiple_upgradeable_bases),
     ("governance-reference-detected.general", detect_governance_reference),

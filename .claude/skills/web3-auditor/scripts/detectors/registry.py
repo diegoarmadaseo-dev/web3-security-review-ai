@@ -118,6 +118,10 @@ CHECK_METADATA: Dict[str, Dict[str, Any]] = {
     "proxy-partial-eip1967-adoption.general": {"family": "proxy-partial-eip1967-adoption", "categories": ["SC10"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
     "admin-check-hardcoded-address.general": {"family": "admin-check-hardcoded-address", "categories": ["SC01", "SC05"], "needsContext": True, "fpRisk": "low", "groupHint": None},
     "timelock-zero-delay-configured.general": {"family": "timelock-zero-delay-configured", "categories": ["SC01"], "needsContext": True, "fpRisk": "low", "groupHint": None},
+    # --- V2.3, Access Control + Proxy/Upgradeability, fifth/last block (docs/decisiones.md D-045) ---
+    "accept-ownership-unprotected.general": {"family": "accept-ownership-unprotected", "categories": ["SC01"], "needsContext": True, "fpRisk": "low", "groupHint": None},
+    "role-granted-to-tx-origin.general": {"family": "role-granted-to-tx-origin", "categories": ["SC01"], "needsContext": True, "fpRisk": "low", "groupHint": None},
+    "reinitializer-one-collides-with-initializer.general": {"family": "reinitializer-one-collides-with-initializer", "categories": ["SC10"], "needsContext": True, "fpRisk": "low", "groupHint": None},
 }
 
 # checkIds computed cross-contract, outside the per-file phase lists below (need

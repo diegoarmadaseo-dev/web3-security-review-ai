@@ -278,6 +278,10 @@ SIGNAL_FIXTURES = {
     "proxy-partial-eip1967-adoption": 'contract A { bytes32 internal constant SLOT = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc; uint256 public extraVar; fallback() external payable { (bool ok, ) = address(0).delegatecall(msg.data); require(ok); } }',
     "admin-check-hardcoded-address": 'contract A { function f() external view returns (bool) { return msg.sender == 0x1234567890123456789012345678901234567890; } }',
     "timelock-zero-delay-configured": 'contract A { function deploy(address[] memory p, address[] memory e) external returns (address) { return address(new TimelockController(0, p, e, address(0))); } }',
+    # --- V2.3, Access Control + Proxy/Upgradeability, fifth/last block (docs/decisiones.md D-045) ---
+    "accept-ownership-unprotected": 'contract A { address owner; function acceptOwnership() external { owner = msg.sender; } }',
+    "role-granted-to-tx-origin": 'contract A { function grantSelf() external { grantRole(MINTER_ROLE, tx.origin); } }',
+    "reinitializer-one-collides-with-initializer": 'contract A { function initialize() public initializer {} function reinitV1() public reinitializer(1) {} }',
 }
 
 
@@ -1001,6 +1005,46 @@ class SignalFamilyNegativeControlTests(unittest.TestCase):
         )
         signals = self._signals_for(source)
         self.assertFalse(signals_of({"signals": signals}, "timelock-zero-delay-configured"))
+
+    # --- V2.3, Access Control + Proxy/Upgradeability, fifth/last block (docs/decisiones.md D-045) ---
+
+    def test_guarded_accept_ownership_is_not_flagged(self):
+        source = (
+            'contract A { address pendingOwner; address owner; function acceptOwnership() external {'
+            ' require(msg.sender == pendingOwner); owner = msg.sender; } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "accept-ownership-unprotected"))
+
+    def test_internal_accept_ownership_is_not_flagged(self):
+        source = 'contract A { function acceptOwnership() internal { } }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "accept-ownership-unprotected"))
+
+    def test_role_granted_to_msg_sender_is_not_flagged_tx_origin(self):
+        source = 'contract A { function grantSelf() external { grantRole(MINTER_ROLE, msg.sender); } }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "role-granted-to-tx-origin"))
+
+    def test_role_granted_to_parameter_is_not_flagged_tx_origin(self):
+        source = 'contract A { function grantOther(address a) external { grantRole(MINTER_ROLE, a); } }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "role-granted-to-tx-origin"))
+
+    def test_reinitializer_two_does_not_collide_with_initializer(self):
+        source = 'contract A { function initialize() public initializer {} function reinitV2() public reinitializer(2) {} }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "reinitializer-one-collides-with-initializer"))
+
+    def test_reinitializer_one_without_primary_initializer_does_not_collide(self):
+        source = 'contract A { function reinitV1() public reinitializer(1) {} }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "reinitializer-one-collides-with-initializer"))
+
+    def test_both_modifiers_on_same_function_does_not_collide(self):
+        source = 'contract A { function initialize() public initializer reinitializer(1) {} }'
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "reinitializer-one-collides-with-initializer"))
 
     def test_disabled_initializers_suppresses_implementation_not_disabled(self):
         source = 'contract A is Initializable { constructor() { _disableInitializers(); } function initialize() public initializer {} }'

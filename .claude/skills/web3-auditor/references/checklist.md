@@ -120,6 +120,9 @@ strong corroborating evidence exists.
 | `proxy-partial-eip1967-adoption` | SC10 | yes | medium | The exact complementary gap `naive-proxy-storage-collision` leaves open: a contract that delegatecalls and has a known EIP-1967/EIP-1822 slot present (so the naive check stays silent) but *also* declares other non-constant, non-immutable state variables at ordinary sequential slots - those still collide with the delegated-to contract's own storage. Mutually exclusive with `naive-proxy-storage-collision` by construction. | The extra variables are provably never read/written by the implementation, or the contract uses a namespaced scheme this heuristic does not recognize for them specifically. |
 | `admin-check-hardcoded-address` | SC01, SC05 | yes | low | A narrowing of `hardcoded-address` to the specific case of `msg.sender == <20-byte hex literal>` (or the reverse order) - authorization tied to an address that can never be rotated without a contract upgrade, and easy to miss since it doesn't look like a "role" at a glance. | The comparison is `address(0)` (a function-call expression, not a raw literal) - that belongs to `zero-address-unchecked`'s own concern, never matched here. |
 | `timelock-zero-delay-configured` | SC01 | yes | low | Configuration signal, not an automatic vulnerability: `new TimelockController(0, ...)` sets up a governance timelock with zero delay, defeating its entire purpose. Only the literal `0` first-argument spelling is matched - never guessed from a named constant. | A deliberate placeholder in a not-yet-launched deployment script or a devnet/test configuration never meant for production. |
+| `accept-ownership-unprotected` | SC01 | yes | low | A hand-reimplemented `acceptOwnership()` (Ownable2Step's accept-the-pending-owner entry point) with no caller check at all - `admin-function-unprotected`'s own name heuristic has no "accept*" prefix, so this exact name is otherwise invisible to it. Restricted to public/external. | A purely-internal helper that happens to share this exact name, reached only through an already-guarded external entry point elsewhere. |
+| `role-granted-to-tx-origin` | SC01 | yes | low | `grantRole`/`_grantRole`/`_setupRole` whose account argument is literally `tx.origin` - binds the role to whoever originated the transaction chain, not to the immediate caller. Unlike `role-granted-to-self-contract`, not restricted to ADMIN-named roles: there is no common legitimate reason to bind any role to `tx.origin`. | N/A - no known legitimate pattern uses `tx.origin` as a role-grant target, for any role. |
+| `reinitializer-one-collides-with-initializer` | SC10 | yes | low | A contract with a primary `initialize()`-shaped function guarded by the `initializer` modifier (by OpenZeppelin convention, internally equivalent to version 1 of the shared version counter) that *also* has a separate function carrying an explicit `reinitializer(1)` - a real version collision `reinitializer-version-not-increasing` cannot see, since that family only compares `reinitializer`-tagged functions against each other, never against the primary initializer's own implicit version 1. | One function carrying both modifiers at once is excluded (a different, contradictory pattern, not the two-distinct-functions collision this family targets). |
 
 The eight families from `unprotected-callback-handler` through `gas-unbounded-storage-array-push` are the
 first detector-expansion block added under the V2.1 registry architecture (`scripts/detectors/`); see
@@ -145,7 +148,10 @@ are V2.3's fourth block (D-043) - also all single-file and available in every mo
 lives in `scripts/detectors/arithmetic_and_gas.py` alongside `external-call-in-loop`/`msg-value-in-loop`
 (the loop-analysis checks), not in `access_control.py` like the rest of this block, and
 `proxy-partial-eip1967-adoption` is mutually exclusive with `naive-proxy-storage-collision` by construction
-(their slot-presence conditions are exact inverses of each other).
+(their slot-presence conditions are exact inverses of each other). The three families from
+`accept-ownership-unprotected` through `reinitializer-one-collides-with-initializer` are V2.3's fifth and
+final block (D-045) - the last block of this initiative; all three are single-file, available in every
+mode, and none need `systemGraph`.
 
 ### EIP-1967-style storage slots
 
