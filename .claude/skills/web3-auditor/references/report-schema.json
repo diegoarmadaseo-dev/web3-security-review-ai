@@ -78,7 +78,7 @@
     "limitations": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "Free-text, user-language list of what this review does not cover (off-chain logic, deployment configuration, key management, tokenomics, governance outside the analyzed code, oracle/bridge infrastructure, deployed contract state, third-party systems, etc.)."
+      "description": "Free-text, user-language list of what this review does not cover (off-chain logic, deployment configuration, key management, tokenomics, governance outside the analyzed code, oracle/bridge infrastructure, third-party systems, etc.), and - since V2.6.1 (docs/decisiones.md D-055) - a deployed contract's RUNTIME state specifically (live storage values, balances, transaction history, in-flight execution): distinct from a deployed contract's own VERIFIED SOURCE CODE, which V2.6.1's ingestion step can recover and hand to this same static pipeline like any other source input when explicitly supplied - that source is analyzed normally, not excluded."
     },
     "riskIndicator": {
       "type": "object",

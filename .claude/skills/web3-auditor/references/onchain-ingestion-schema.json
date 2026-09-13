@@ -1,0 +1,100 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "web3-security-review-ai/onchain-ingestion-schema.json",
+  "title": "Deployed Contract Ingestion - verified-only (V2.6.1)",
+  "description": "Reference shape for scripts/ingest_onchain.py's output record (docs/decisiones.md D-055). This script NEVER makes a network call - it only normalizes an ALREADY-FETCHED JSON blob (see #/definitions/rawInput) describing one (address, network) pair, obtained by some tool OUTSIDE this Skill. Like report-schema.json, this document is the authoritative human/AI-facing reference; it is not executed by a JSON Schema library at runtime (scripts/ingest_onchain.py is a hand-written, standard-library-only script).",
+  "type": "object",
+  "required": ["ingestVersion", "address", "network", "verified", "hasCode", "contractName", "compilerVersion", "virtualPathPrefix", "bundle", "sourceFileCount", "skippedSourceFiles", "completeness", "provenance", "note", "runtimeStateNote"],
+  "additionalProperties": false,
+  "properties": {
+    "ingestVersion": { "type": "string" },
+    "address": { "type": ["string", "null"], "pattern": "^0x[0-9a-f]{40}$", "description": "Lowercase-normalized only. EIP-55 mixed-case checksum verification is deliberately NOT performed (rule R-I4) - null when the input address was not well-formed (see completeness.reasons, code INVALID_ADDRESS)." },
+    "network": {
+      "type": "object",
+      "required": ["chainId", "name"],
+      "additionalProperties": false,
+      "properties": {
+        "chainId": { "type": ["integer", "null"] },
+        "name": { "type": ["string", "null"], "description": "Null for an unrecognized-but-still-numeric chainId (never blocks ingestion - rule R-I3), or when chainId itself is null." }
+      }
+    },
+    "verified": { "type": "boolean", "description": "As reported by whatever explorer/tool produced the raw input. False is a transparency fact, never itself a vulnerability finding (rule R-I1)." },
+    "hasCode": { "type": ["boolean", "null"], "description": "Null when the raw input did not report it. False means the queried address has no deployed bytecode at all (EMPTY_BYTECODE) and takes precedence over any verified/sourceFiles claim." },
+    "contractName": { "type": ["string", "null"] },
+    "compilerVersion": { "type": ["string", "null"] },
+    "virtualPathPrefix": { "type": ["string", "null"], "description": "\"onchain://<chainId>/<address>/\", used to build each recovered source file's path in `bundle`. Null when address or network could not be resolved (IDENTITY_INCOMPLETE). CAVEAT (rule R-I5): preprocess.py's own, unmodified normalize_path() collapses the doubled \"//\" down to a single \"/\" once this bundle is actually parsed - the REALIZED systemGraph/contract key ends up \"onchain:/<chainId>/<address>/...\", not byte-identical to this prefix." },
+    "bundle": { "type": ["string", "null"], "description": "A multi-file bundle in preprocess.py's own, unmodified \"=== FILE: ... ===\" / \"=== END FILE ===\" format, ready to pipe into preprocess.py's stdin unchanged - only when verified=true, hasCode is not false, and at least one source file survived safety checks. Null otherwise." },
+    "sourceFileCount": { "type": "integer", "minimum": 0, "description": "Number of source files actually included in `bundle`." },
+    "skippedSourceFiles": {
+      "type": "array",
+      "description": "Every rejected source file, with why - never a silent drop (rule R-I6).",
+      "items": {
+        "type": "object",
+        "required": ["path", "reason"],
+        "additionalProperties": false,
+        "properties": { "path": { "type": ["string", "null"] }, "reason": { "type": "string" } }
+      }
+    },
+    "completeness": {
+      "type": "object",
+      "required": ["status", "reasons"],
+      "additionalProperties": false,
+      "description": "Same {status, reasons[{code, detail}]} shape preprocess.py's own `completeness` and report-schema.json's `scope` already use (rule R-I7) - not a new, parallel vocabulary.",
+      "properties": {
+        "status": { "enum": ["complete", "partial", "failed"] },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["code", "detail"],
+            "additionalProperties": false,
+            "properties": {
+              "code": { "enum": ["INVALID_ADDRESS", "UNRECOGNIZED_NETWORK", "IDENTITY_INCOMPLETE", "EMPTY_BYTECODE", "UNVERIFIED_CONTRACT", "SOURCE_NOT_INGESTED", "NO_SOURCE_FILES", "NO_USABLE_SOURCE_FILES", "PARTIAL_SOURCE_RECOVERY"] },
+              "detail": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "description": "Per-field origin tag: \"on-chain\" (a direct, already-performed RPC read - e.g. hasCode), \"explorer\" (third-party-reported - e.g. verified, sourceFiles, contractName, compilerVersion), or \"analyzer-inferred\" (computed by this script - e.g. virtualPathPrefix). Never a blanket single tag for the whole record (rule R-I2) - different facts genuinely have different origins within one ingestion.",
+      "additionalProperties": { "enum": ["on-chain", "explorer", "analyzer-inferred"] }
+    },
+    "note": { "type": "string", "description": "Fixed English sentence restating the hard rule: verified=false (or any completeness limitation) is never a vulnerability by itself (rule R-I1)." },
+    "runtimeStateNote": { "type": "string", "description": "Fixed English sentence: this record never carries live storage/balances/tx history - deployed runtime state stays out of scope (see docs/legal-risk-register.md RISK-014, as clarified by D-055)." }
+  },
+  "definitions": {
+    "rawInput": {
+      "description": "The ALREADY-FETCHED JSON this script consumes - never produced by this Skill itself. address and network are required; everything else is optional and missing fields simply narrow what can be ingested (never an error).",
+      "type": "object",
+      "required": ["address", "network"],
+      "properties": {
+        "address": { "type": "string" },
+        "network": { "description": "A chain id (number or numeric string), a recognized network name (e.g. \"ethereum\", \"polygon\"), or {\"chainId\": N}." },
+        "verified": { "type": "boolean" },
+        "hasCode": { "type": "boolean" },
+        "contractName": { "type": "string" },
+        "compilerVersion": { "type": "string" },
+        "sourceFiles": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["path", "content"],
+            "properties": { "path": { "type": "string" }, "content": { "type": "string" } }
+          }
+        }
+      }
+    }
+  },
+  "businessRules": [
+    "R-I1: `verified: false` (or any other completeness limitation this script records) is a transparency fact about what could be recovered, never a vulnerability finding or signal on its own - this script has no code path capable of emitting a finding/signal at all.",
+    "R-I2: provenance is tagged per field (on-chain / explorer / analyzer-inferred), never as one blanket tag for the whole record.",
+    "R-I3: an unrecognized-but-numeric chainId is always accepted (name stays null) - only a genuinely unparseable `network` value fails ingestion; this script never blocks on an incomplete chain registry.",
+    "R-I4: address normalization is lowercase-canonicalization and basic well-formedness only. EIP-55 checksum verification is not performed - it requires Keccak-256, unavailable in Python's stdlib (hashlib.sha3_256 is the different, NIST-finalized SHA3-256 and would silently produce a wrong checksum).",
+    "R-I5: contract identity for recovered source is the virtual path \"onchain://<chainId>/<address>/<file>\", fed to preprocess.py as a bundle (never as a real file on disk, never via any preprocess.py code change). preprocess.py's own unmodified normalize_path collapses the doubled slash to a single one - the realized key is \"onchain:/<chainId>/<address>/<file>#Contract\", not byte-identical to the constructed prefix.",
+    "R-I6: a source file is rejected (path traversal, absolute path, control characters, duplicate-after-normalization, or content shaped like a bundle boundary marker) only ever WITH a recorded reason in skippedSourceFiles - never a silent drop.",
+    "R-I7: completeness reuses preprocess.py's/report-schema.json's own {status: complete|partial|failed, reasons: [{code, detail}]} shape verbatim, so it can be propagated (e.g. into an eventual report's scope/categoryCoverage NOT_ASSESSED reasoning) without translation.",
+    "R-I8: this script never modifies preprocess.py, score.py, validate_report.py, the detectors registry, or config/modes.json, and never makes an HTTP/RPC call itself."
+  ]
+}

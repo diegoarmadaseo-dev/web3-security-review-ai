@@ -108,8 +108,8 @@ y separación estricta entre el análisis técnico y cualquier condición comerc
 ## RISK-014 · Protocol/economic risk outside code
 - **Descripción:** manipulación de oráculos, flash loans, gobernanza, MEV, tokenomics o infraestructura requieren contexto que el código no contiene; el informe podría leerse como si los cubriera.
 - **Impacto:** alto.
-- **Mitigación técnica:** SC02–SC04 con `confidence` acorde a la evidencia y nunca elevados automáticamente; sección explícita de fuera de alcance (off-chain, despliegue, claves, infraestructura, tokenomics, gobernanza externa, oráculos, estado desplegado, bridges, terceros); el indicador de riesgo se define como separado de la seguridad global del protocolo.
-- **Estado:** planificado (1.2, 2.1, 2.2).
+- **Mitigación técnica:** SC02–SC04 con `confidence` acorde a la evidencia y nunca elevados automáticamente; sección explícita de fuera de alcance (off-chain, despliegue, claves, infraestructura, tokenomics, gobernanza externa, oráculos, bridges, terceros, y - precisado en V2.6.1, D-055 - el **estado en tiempo de ejecución** de un contrato desplegado: valores de storage en vivo, balances, historial de transacciones, ejecución en curso); el indicador de riesgo se define como separado de la seguridad global del protocolo. Aclaración D-055: lo anterior NO incluye el **código fuente verificado** de un contrato desplegado - cuando V2.6.1 lo recupera explícitamente (a partir de un JSON ya obtenido por el propio usuario/workflow, nunca consultado por el Skill), ese fuente se analiza con el mismo pipeline estático de siempre, sin ninguna afirmación adicional sobre el estado on-chain real.
+- **Estado:** planificado (1.2, 2.1, 2.2); V2.6.1 (D-055) confirma que la ingestión de fuente verificada no reabre este riesgo, siempre que el análisis nunca infiera nada sobre bytecode no verificado ni sobre estado en vivo.
 - **Duda legal pendiente:** ninguna específica más allá de RISK-004.
 
 ## Anexo A · PROPOSED COMMERCIAL TERMS LANGUAGE — LEGAL REVIEW REQUIRED
