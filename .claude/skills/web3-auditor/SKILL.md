@@ -67,8 +67,9 @@ python3 scripts/preprocess.py <path-or-bundle> --mode quick|standard|pro
 Accepts a file, a directory, or a bundle piped via stdin; add `--max-loc N` only if the user
 explicitly asked for a non-default override. The output JSON is ground truth for this run: signals,
 structural inventory, `completeness`, `limits`, `injectionSignals`, `secretsDetected`/`secrets`,
-`priorityRanking`. Never hand-edit it; if something looks wrong, that's a preprocessing bug to flag,
-not something to silently fix in place.
+`priorityRanking`, `systemGraph` (multi-contract relationships; only populated in `pro` mode - see
+Step 6). Never hand-edit it; if something looks wrong, that's a preprocessing bug to flag, not
+something to silently fix in place.
 
 ## Step 4 - Check scope before analyzing
 
@@ -98,6 +99,18 @@ A signal firing is never by itself a finding - `references/checklist.md` documen
 `fpRisk` and what would need to be true for it to matter. Categories SC02-SC04 in particular need
 real contextual support; without it, keep `confidence` at `medium` or `low` rather than promoting a
 bare signal.
+
+When `systemGraph.status` is `"computed"` (`pro` mode only), use it to reason across contracts: its
+`nodes`/`edges` (`inherits`, `calls`, `delegatesTo`) and `proxies[]` can help correlate a signal in one
+contract with a related one in another it calls, inherits from, or is delegated to by - e.g. an
+unguarded admin function reachable via a `calls` edge from a contract you're already flagging. It is
+context/inventory like the rest of the preprocess artifact, never a finding by itself: never copy a
+node, edge, or proxy entry into `findings[]` or `categoryCoverage[]` as if it were one. The graph is
+1-hop only (direct relationships as computed, nothing chained or inferred across multiple edges) - do
+not extend it by reasoning about indirect relationships it does not contain. Never treat a `proxies[]`
+entry with `status: "unresolved"` as if the implementation were known: the preprocessing layer could
+not resolve it (ambiguous type, no bundle match, no delegatecall site, or similar - see its `reason`),
+so proceed as unresolved, note the limitation, and do not guess which contract it might be.
 
 Produce a draft report JSON shaped like `references/report-schema.json`:
 
