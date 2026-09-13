@@ -50,6 +50,12 @@ PAYABLE_FUNDED_WRITE_RE_TEMPLATE = r"\b{name}\b\s*(=(?!=)|\+=)\s*[^;]*\bmsg\.val
 RELATIVE_WRITE_RE_TEMPLATE = r"\b{name}\b\s*(?:\[[^\]]*\])*(?:\.\w+)*\s*(?:\+=|-=|\*=|/=|\|=|&=|\+\+|--)"
 ABSOLUTE_WRITE_RE_TEMPLATE = r"\b{name}\b\s*(?:\[[^\]]*\])*(?:\.\w+)*\s*=(?!=)\s*([^;]*);"
 
+# D-050: structural signature of a deliberate "close out and clear" reset
+# (liquidation/sweep/claim), as opposed to a genuinely suspicious
+# arbitrary overwrite - see _has_closeout_signal.
+ZERO_LITERAL_RE = re.compile(r"^(0+|0x0+)$")
+VALUE_TRANSFER_RE = re.compile(r"\.\s*transfer\s*\(|\.\s*send\s*\(|\.\s*call\s*\{[^}]*\bvalue\b")
+
 
 def _excluded_write_lines(fn: Dict[str, Any], name: str, line_index: Any) -> set:
     """Lines where `fn` writes `name` in one of the two structural shapes
@@ -267,22 +273,59 @@ def detect_state_pair_write_mismatch(ctx: Dict[str, Any]) -> None:
             })
 
 
+def _has_closeout_signal(body: str, name: str, match: Any) -> bool:
+    """D-050: structural evidence that an absolute `name = 0` overwrite is
+    a deliberate "close out this position and clear it" reset rather than
+    a blind, unexplained stomp - never inferred from the function's or
+    variable's name. Either of two independent, purely syntactic signals
+    is enough: (a) `name` is referenced somewhere else in the SAME
+    function body, outside this exact write's own span - the classic
+    `uint256 seized = collateralDeposited[account]; collateralDeposited[account] = 0;`
+    read-then-clear idiom; or (b) the function contains a value-transfer-
+    shaped call anywhere (`.transfer(`/`.send(`/`.call{value...`) - a
+    liquidation/sweep that reads the OLD value of a *different* variable
+    (e.g. `borrowed[account] = 0;` in the same function that transfers
+    out `collateralDeposited`) still needs a closeout signal to exclude
+    it, and (a) alone would miss that case since `borrowed` itself is
+    never re-read in that function."""
+    other_refs = [
+        m for m in re.finditer(r"\b" + re.escape(name) + r"\b", body)
+        if not (match.start() <= m.start() < match.end())
+    ]
+    if other_refs:
+        return True
+    return bool(VALUE_TRANSFER_RE.search(body))
+
+
 def _write_operator_kinds(fn: Dict[str, Any], name: str) -> Dict[str, bool]:
-    """Whether `fn` writes `name` in a relative (self-referencing) shape
-    or a true absolute overwrite. `+=`/`-=`/`++`/`--`-shaped writes are
-    unambiguously relative from their own syntax. A bare `name = <rhs>`
-    is only counted as an overwrite when `<rhs>` never mentions `name` at
-    all - `x = x + amount` is a disguised increment (a common long-form
-    style) and must not be misread as a reset just because it uses `=`."""
+    """Whether `fn` writes `name` in a relative (self-referencing) shape,
+    a true absolute overwrite, or a deliberate zero-reset (D-050).
+    `+=`/`-=`/`++`/`--`-shaped writes are unambiguously relative from
+    their own syntax. A bare `name = <rhs>` is first checked for
+    self-reference - `x = x + amount` is a disguised increment (a common
+    long-form style) and must not be misread as a reset just because it
+    uses `=`. Only once a write is confirmed to genuinely discard the
+    previous value (RHS never mentions `name`) does its shape matter: an
+    overwrite to a literal zero (`x = 0`) WITH a closeout signal
+    (_has_closeout_signal) is a `safeReset`, not counted as `absolute` -
+    everything else (a non-zero overwrite, or a zero overwrite with no
+    closeout evidence at all) still counts as `absolute`, so a genuinely
+    unexpected operator change is never hidden just because it happens to
+    assign zero."""
     body = fn["_body"]
     has_relative = bool(re.search(RELATIVE_WRITE_RE_TEMPLATE.format(name=re.escape(name)), body))
     has_absolute = False
+    has_safe_reset = False
     for match in re.finditer(ABSOLUTE_WRITE_RE_TEMPLATE.format(name=re.escape(name)), body):
-        if re.search(r"\b" + re.escape(name) + r"\b", match.group(1)):
+        rhs = match.group(1).strip()
+        if re.search(r"\b" + re.escape(name) + r"\b", rhs):
             has_relative = True
+            continue
+        if ZERO_LITERAL_RE.match(rhs) and _has_closeout_signal(body, name, match):
+            has_safe_reset = True
         else:
             has_absolute = True
-    return {"relative": has_relative, "absolute": has_absolute}
+    return {"relative": has_relative, "absolute": has_absolute, "safeReset": has_safe_reset}
 
 
 def detect_state_write_operator_inconsistency(ctx: Dict[str, Any]) -> None:
@@ -308,22 +351,32 @@ def detect_state_write_operator_inconsistency(ctx: Dict[str, Any]) -> None:
     exists to catch, not something to filter out before even asking which
     operator was used.
 
-    fpRisk high (revised from an initial medium estimate during the D-049
-    fix's own FP review, on empirical evidence, not just reasoning): once
-    self-scoped/payable-funded writes stopped being excluded, 3/16 real
-    evals/cases/*.sol fixtures started firing - SpotPriceLending.liquidate
-    (`collateralDeposited[account] = 0; borrowed[account] = 0;` after
-    seizing collateral) and UpgradeableVaultLogic.sweepToOwner
-    (`totalDeposits = 0;`, the same function already identified as
-    legitimate in D-046) are confirmed false positives: resetting a
-    per-account balance to zero as part of a legitimate close-out
-    (liquidation, treasury sweep) is exactly as common and correct a
-    pattern as D-046/D-047's self-scoped and payable-funded ones, just a
-    different shape (reset-to-zero, not indexed-by-msg.sender or
-    payable-funded) - not yet excluded structurally, a known, documented
-    open gap rather than a silent one. A deliberate, documented admin
-    "reset" function generally remains a legitimate design this
-    heuristic cannot distinguish from an accidental one."""
+    D-050 refinement: an initial version found 3/16 real evals/cases/*.sol
+    fixtures firing once D-049 stopped excluding self-scoped/payable-funded
+    writes - SpotPriceLending.liquidate (`collateralDeposited[account] = 0;
+    borrowed[account] = 0;` after seizing collateral, transferring the
+    seized amount out) and UpgradeableVaultLogic.sweepToOwner
+    (`totalDeposits = 0;` after transferring the swept total to the owner,
+    the same function already identified as legitimate in D-046), all
+    confirmed false positives - resetting a per-account balance to
+    literal zero as part of a legitimate close-out is exactly as common
+    and correct a pattern as D-046/D-047's self-scoped/payable-funded
+    ones, just a different shape. Fixed structurally (never by function/
+    variable name) via _write_operator_kinds' new `safeReset` category:
+    an overwrite to a literal zero WITH a closeout signal
+    (_has_closeout_signal - the variable read elsewhere in the same
+    function, or the function containing any value-transfer-shaped call)
+    is excluded from the writer's own classification entirely, the same
+    treatment constructors already get. A non-zero overwrite, or a zero
+    overwrite with no closeout evidence at all, is deliberately NOT
+    excluded - a genuinely unexpected operator change is never hidden
+    just because it happens to assign zero. fpRisk medium (reverted from
+    the D-049 high once the confirmed false positives were excluded
+    structurally) - residual risk is a deliberate, documented "reset"
+    admin function with no read/transfer nearby, or a genuinely
+    suspicious zero-write that happens to share a function with an
+    unrelated transfer, both of which this heuristic still cannot
+    perfectly distinguish."""
     contract, cname = ctx["contract"], ctx["cname"]
     if cname is None:
         return
@@ -336,6 +389,8 @@ def detect_state_write_operator_inconsistency(ctx: Dict[str, Any]) -> None:
         fn = entry["fn"]
         for name in entry["vars"]:
             kinds = _write_operator_kinds(fn, name)
+            if kinds["safeReset"] and not kinds["relative"] and not kinds["absolute"]:
+                continue
             writers.setdefault(name, []).append({"fn": fn, "hasAbsolute": kinds["absolute"]})
     for name in sorted(writers):
         entries = writers[name]

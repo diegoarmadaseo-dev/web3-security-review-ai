@@ -1326,6 +1326,67 @@ class SignalFamilyNegativeControlTests(unittest.TestCase):
         self.assertFalse(signals_of({"signals": self._signals_for(credit_ledger)}, "state-write-guard-inconsistency"))
         self.assertFalse(signals_of({"signals": self._signals_for(vault)}, "state-write-guard-inconsistency"))
 
+    # --- D-050: distinguish a deliberate close-out reset from a genuine operator change ---
+
+    def test_liquidation_read_then_clear_reset_is_not_flagged_state_write_operator_inconsistency(self):
+        # SpotPriceLending.liquidate, verbatim shape: collateralDeposited
+        # is read into a local before being reset to 0 - a real fixture
+        # false positive found during the D-049 FP review, must not fire.
+        source = (
+            'contract A { mapping(address=>uint256) collateralDeposited; mapping(address=>uint256) borrowed;'
+            ' function deposit() external payable { collateralDeposited[msg.sender] += msg.value; }'
+            ' function liquidate(address account) external {'
+            ' uint256 seized = collateralDeposited[account]; collateralDeposited[account] = 0; borrowed[account] = 0;'
+            ' payable(msg.sender).transfer(seized); } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "state-write-operator-inconsistency"))
+
+    def test_liquidation_reset_without_direct_reread_is_not_flagged_via_transfer_signal(self):
+        # Same liquidate() function: borrowed[account] = 0 is never itself
+        # re-read in this function, but the function's own value-transfer
+        # call is still evidence of a closeout - must not fire either.
+        source = (
+            'contract A { mapping(address=>uint256) collateralDeposited; mapping(address=>uint256) borrowed;'
+            ' function borrow(uint256 amt) external { borrowed[msg.sender] += amt; }'
+            ' function liquidate(address account) external {'
+            ' uint256 seized = collateralDeposited[account]; collateralDeposited[account] = 0; borrowed[account] = 0;'
+            ' payable(msg.sender).transfer(seized); } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "state-write-operator-inconsistency"))
+
+    def test_sweep_reset_after_transfer_is_not_flagged_state_write_operator_inconsistency(self):
+        # UpgradeableVaultLogic.sweepToOwner, verbatim shape: the real
+        # fixture false positive found during the D-049 FP review.
+        source = (
+            'contract A { address owner; uint256 totalDeposits;'
+            ' function deposit() external payable { totalDeposits += msg.value; }'
+            ' function sweepToOwner() external { require(msg.sender == owner);'
+            ' payable(owner).transfer(totalDeposits); totalDeposits = 0; } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "state-write-operator-inconsistency"))
+
+    def test_nonzero_overwrite_still_flags_state_write_operator_inconsistency(self):
+        # The original genuine-positive shape must be completely
+        # unaffected by the D-050 zero-reset exclusion.
+        source = 'contract A { uint256 x; function inc(uint256 v) external { x += v; } function dec(uint256 v) external { x -= v; } function reset(uint256 v) external { x = v; } }'
+        signals = self._signals_for(source)
+        hits = [s for s in signals if s["family"] == "state-write-operator-inconsistency"]
+        self.assertTrue(hits)
+        self.assertEqual(hits[0]["details"]["overwriteFunction"], "reset")
+
+    def test_zero_overwrite_with_no_closeout_signal_still_flags_state_write_operator_inconsistency(self):
+        # A bare `x = 0` with no other reference to x and no value-transfer
+        # anywhere in the function is NOT excused just because it assigns
+        # zero - the closeout signal must be genuinely present, not assumed.
+        source = 'contract A { uint256 x; function inc(uint256 v) external { x += v; } function suspiciousReset() external { x = 0; } }'
+        signals = self._signals_for(source)
+        hits = [s for s in signals if s["family"] == "state-write-operator-inconsistency"]
+        self.assertTrue(hits)
+        self.assertEqual(hits[0]["details"]["overwriteFunction"], "suspiciousReset")
+
     def test_disabled_initializers_suppresses_implementation_not_disabled(self):
         source = 'contract A is Initializable { constructor() { _disableInitializers(); } function initialize() public initializer {} }'
         signals = self._signals_for(source)
