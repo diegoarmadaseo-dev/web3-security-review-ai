@@ -1274,6 +1274,58 @@ class SignalFamilyNegativeControlTests(unittest.TestCase):
         signals = self._signals_for(source)
         self.assertFalse(signals_of({"signals": signals}, "array-pop-during-forward-iteration"))
 
+    # --- D-049: D-047's exclusions must apply ONLY to state-write-guard-inconsistency ---
+
+    def test_self_scoped_write_breaking_a_pair_is_flagged_state_pair_write_mismatch(self):
+        # Found hidden by the V2.4 second-block audit: a self-scoped
+        # withdraw that skips the paired totalSupply write must still be
+        # detected - state-pair-write-mismatch does not inherit D-047's
+        # self-scoped exclusion.
+        source = (
+            'contract A { mapping(address=>uint256) balances; uint256 totalSupply;'
+            ' function mint(address to, uint256 amount) external { balances[to] += amount; totalSupply += amount; }'
+            ' function airdrop(address to, uint256 amount) external { balances[to] += amount; totalSupply += amount; }'
+            ' function withdraw(uint256 amount) external { balances[msg.sender] -= amount; } }'
+        )
+        signals = self._signals_for(source)
+        hits = [s for s in signals if s["family"] == "state-pair-write-mismatch"]
+        self.assertTrue(hits)
+        self.assertEqual(hits[0]["details"]["onlyFirst"], ["withdraw"])
+
+    def test_self_scoped_overwrite_vs_relative_writers_is_flagged_state_write_operator_inconsistency(self):
+        # Found hidden by the same audit: a self-scoped overwrite
+        # (credits[msg.sender] = v) against two relative admin writers
+        # must still be detected.
+        source = (
+            'contract A { mapping(address=>uint256) credits;'
+            ' function grant1(address to, uint256 amount) external { credits[to] += amount; }'
+            ' function grant2(address to, uint256 amount) external { credits[to] += amount; }'
+            ' function selfReset(uint256 v) external { credits[msg.sender] = v; } }'
+        )
+        signals = self._signals_for(source)
+        hits = [s for s in signals if s["family"] == "state-write-operator-inconsistency"]
+        self.assertTrue(hits)
+        self.assertEqual(hits[0]["details"]["overwriteFunction"], "selfReset")
+
+    def test_d047_exclusions_still_apply_only_to_state_write_guard_inconsistency(self):
+        # Both original D-046 false positives (self-scoped write, payable
+        # msg.value inflow) must remain excluded from
+        # state-write-guard-inconsistency specifically, confirming D-047's
+        # own scope is unchanged by the D-049 fix.
+        credit_ledger = (
+            'contract CreditLedger { address public issuer; mapping(address => uint256) public credits;'
+            ' modifier onlyIssuer() { require(msg.sender == issuer, "not issuer"); _; }'
+            ' function issueCredit(address to, uint256 amount) external onlyIssuer { credits[to] += amount; }'
+            ' function spendCredit(uint256 amount) external { unchecked { credits[msg.sender] -= amount; } } }'
+        )
+        vault = (
+            'contract UpgradeableVaultLogic { address public owner; uint256 public totalDeposits;'
+            ' function deposit() external payable { totalDeposits += msg.value; }'
+            ' function sweepToOwner() external { require(msg.sender == owner, "not owner"); totalDeposits = 0; } }'
+        )
+        self.assertFalse(signals_of({"signals": self._signals_for(credit_ledger)}, "state-write-guard-inconsistency"))
+        self.assertFalse(signals_of({"signals": self._signals_for(vault)}, "state-write-guard-inconsistency"))
+
     def test_disabled_initializers_suppresses_implementation_not_disabled(self):
         source = 'contract A is Initializable { constructor() { _disableInitializers(); } function initialize() public initializer {} }'
         signals = self._signals_for(source)

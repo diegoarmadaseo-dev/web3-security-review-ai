@@ -126,7 +126,7 @@ CHECK_METADATA: Dict[str, Dict[str, Any]] = {
     "state-write-guard-inconsistency.general": {"family": "state-write-guard-inconsistency", "categories": ["SC02", "SC01"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
     # --- V2.4, Business Logic / Invariants, second block (docs/decisiones.md D-048) ---
     "state-pair-write-mismatch.general": {"family": "state-pair-write-mismatch", "categories": ["SC02"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
-    "state-write-operator-inconsistency.general": {"family": "state-write-operator-inconsistency", "categories": ["SC02"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
+    "state-write-operator-inconsistency.general": {"family": "state-write-operator-inconsistency", "categories": ["SC02"], "needsContext": True, "fpRisk": "high", "groupHint": None},
     "array-pop-during-forward-iteration.general": {"family": "array-pop-during-forward-iteration", "categories": ["SC02"], "needsContext": True, "fpRisk": "medium", "groupHint": None},
 }
 

@@ -39,9 +39,16 @@ SELF_SCOPED_WRITE_RE_TEMPLATE = r"\b{name}\b\s*\[\s*msg\.sender\s*\](?:\s*\[[^\]
 PAYABLE_FUNDED_WRITE_RE_TEMPLATE = r"\b{name}\b\s*(=(?!=)|\+=)\s*[^;]*\bmsg\.value\b[^;]*;"
 
 # D-048: write-shape regexes reused by both state-pair-write-mismatch.general
-# and state-write-operator-inconsistency.general.
+# and state-write-operator-inconsistency.general. Both allow the same
+# optional bracket/dot suffixes between the name and the operator so a
+# mapping/array write (`credits[msg.sender] = v`) is matched exactly like
+# a plain variable write (`x = v`) - D-049 found ABSOLUTE_WRITE_RE_TEMPLATE
+# missing this (RELATIVE_WRITE_RE_TEMPLATE already had it), which silently
+# made every indexed overwrite invisible to
+# state-write-operator-inconsistency.general regardless of the D-047
+# exclusion-scope question that prompted the fix.
 RELATIVE_WRITE_RE_TEMPLATE = r"\b{name}\b\s*(?:\[[^\]]*\])*(?:\.\w+)*\s*(?:\+=|-=|\*=|/=|\|=|&=|\+\+|--)"
-ABSOLUTE_WRITE_RE_TEMPLATE = r"\b{name}\b\s*=(?!=)\s*([^;]*);"
+ABSOLUTE_WRITE_RE_TEMPLATE = r"\b{name}\b\s*(?:\[[^\]]*\])*(?:\.\w+)*\s*=(?!=)\s*([^;]*);"
 
 
 def _excluded_write_lines(fn: Dict[str, Any], name: str, line_index: Any) -> set:
@@ -162,13 +169,27 @@ def detect_state_write_guard_inconsistency(ctx: Dict[str, Any]) -> None:
 
 def _written_vars_by_function(contract: Dict[str, Any], state_names: List[str], line_index: Any) -> Dict[int, Dict[str, Any]]:
     """Shared scan for D-048's two checks: per non-constructor,
-    non-initializer function, which of `state_names` it genuinely writes
-    (D-047's self-scoped/payable-funded exclusions already applied, so a
-    self-service or self-funded write never counts as "this function
-    writes this variable" here either - same reasoning as
-    state-write-guard-inconsistency.general). Keyed by `id(fn)` since
-    function dicts aren't hashable by value and two functions can share a
-    name (overloads)."""
+    non-initializer function, which of `state_names` it genuinely writes.
+
+    D-049: deliberately does NOT apply D-047's self-scoped/payable-funded
+    exclusions, unlike state-write-guard-inconsistency.general. Those
+    exclusions were designed and justified for one specific question - is
+    the lack of an access-control guard actually dangerous, given the
+    write's own shape already bounds who it can affect - which has no
+    bearing on the two questions this shared scan feeds: does a write
+    participate in an established co-occurrence pattern
+    (state-pair-write-mismatch.general), or is it relative vs. an
+    absolute overwrite (state-write-operator-inconsistency.general). A
+    self-scoped withdraw that skips a paired totalSupply write, or a
+    self-scoped overwrite breaking an otherwise-relative pattern, are
+    exactly the kind of case those two checks exist to catch - excluding
+    them silently hid real cases, confirmed empirically during the V2.4
+    second-block audit (docs/decisiones.md D-049). Reuses
+    find_state_writes exactly as state-write-guard-inconsistency.general
+    does (once per (function, single variable) pair, never the combined
+    state_names shape) - only the D-047 filtering step is skipped here.
+    Keyed by `id(fn)` since function dicts aren't hashable by value and
+    two functions can share a name (overloads)."""
     written_by: Dict[int, Dict[str, Any]] = {}
     for fn in contract["functions"]:
         if fn["_bodyStart"] is None or fn["_bodyEnd"] is None:
@@ -178,7 +199,7 @@ def _written_vars_by_function(contract: Dict[str, Any], state_names: List[str], 
         written_vars = set()
         for name in state_names:
             writes, _internal_calls = find_state_writes(fn["_body"], fn["_bodyStart"] + 1, fn["_bodyStart"] + 1, [name], line_index)
-            if writes and not (set(writes) <= _excluded_write_lines(fn, name, line_index)):
+            if writes:
                 written_vars.add(name)
         if written_vars:
             written_by[id(fn)] = {"fn": fn, "vars": written_vars}
@@ -202,10 +223,11 @@ def detect_state_pair_write_mismatch(ctx: Dict[str, Any]) -> None:
     operators adds real complexity and its own FP surface for a signal
     that is already only informational; out of scope for this first
     version. Reuses the exact same per-(function, variable)
-    find_state_writes call and D-047 exclusions as
-    state-write-guard-inconsistency.general - a self-scoped or
-    payable-funded write never counts toward establishing OR breaking a
-    pair pattern either, for the same reasons. Constructors and
+    find_state_writes call as state-write-guard-inconsistency.general,
+    but - unlike that check - does NOT apply D-047's self-scoped/
+    payable-funded exclusions (see _written_vars_by_function's own
+    docstring, D-049): a self-scoped write can still break or establish a
+    co-occurrence pattern like any other write. Constructors and
     initializer-shaped functions are excluded entirely (see
     _written_vars_by_function) - a constructor's one-time genesis writes
     should not, by themselves as a single data point, define what
@@ -279,10 +301,28 @@ def detect_state_write_operator_inconsistency(ctx: Dict[str, Any]) -> None:
     and initializer-shaped functions are excluded (see
     _written_vars_by_function) - a constructor's `x = INITIAL` is the
     universal, expected way to set a variable's genesis value and would
-    otherwise make this fire on nearly every stateful contract. Reuses
-    the same D-047 self-scoped/payable-funded exclusions before even
-    asking which operator was used. fpRisk medium - a deliberate,
-    documented "reset" admin function is a legitimate design this
+    otherwise make this fire on nearly every stateful contract. Does NOT
+    apply D-047's self-scoped/payable-funded exclusions (D-049) - a
+    self-scoped overwrite (`credits[msg.sender] = v`) breaking an
+    otherwise-relative pattern is exactly the kind of case this check
+    exists to catch, not something to filter out before even asking which
+    operator was used.
+
+    fpRisk high (revised from an initial medium estimate during the D-049
+    fix's own FP review, on empirical evidence, not just reasoning): once
+    self-scoped/payable-funded writes stopped being excluded, 3/16 real
+    evals/cases/*.sol fixtures started firing - SpotPriceLending.liquidate
+    (`collateralDeposited[account] = 0; borrowed[account] = 0;` after
+    seizing collateral) and UpgradeableVaultLogic.sweepToOwner
+    (`totalDeposits = 0;`, the same function already identified as
+    legitimate in D-046) are confirmed false positives: resetting a
+    per-account balance to zero as part of a legitimate close-out
+    (liquidation, treasury sweep) is exactly as common and correct a
+    pattern as D-046/D-047's self-scoped and payable-funded ones, just a
+    different shape (reset-to-zero, not indexed-by-msg.sender or
+    payable-funded) - not yet excluded structurally, a known, documented
+    open gap rather than a silent one. A deliberate, documented admin
+    "reset" function generally remains a legitimate design this
     heuristic cannot distinguish from an accidental one."""
     contract, cname = ctx["contract"], ctx["cname"]
     if cname is None:
