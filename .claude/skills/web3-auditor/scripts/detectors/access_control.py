@@ -134,19 +134,32 @@ def detect_upgrade_function(fctx: Dict[str, Any]) -> None:
 
 def detect_upgrade_function_unprotected(fctx: Dict[str, Any]) -> None:
     """V2.1 detector-expansion, third block (docs/decisiones.md D-035).
-    Narrows upgrade-function.general's own already-computed `guarded` detail
-    into a gated signal, instead of re-deriving it: reads the signal
-    detect_upgrade_function already emitted for THIS function earlier in
-    this same FUNCTION_CHECKS pass (enforced by list order below, not by
-    this function) - zero new regex, zero new scan. An unguarded upgrade
-    entry point is a near-total proxy takeover, so fpRisk is low."""
-    fn, scope, cname = fctx["fn"], fctx["scope"], fctx["cname"]
-    for s in fctx["collector"].signals:
-        if s["checkId"] != "upgrade-function.general" or s["contract"] != cname or s["function"] != scope.get("function"):
-            continue
-        if s["details"].get("guarded"):
-            continue
-        fctx["collector"].add("upgrade-function-unprotected.general", fn["_headStart"], cname, scope, {"name": s["details"].get("name")})
+    Narrows upgrade-function.general's own gating condition
+    (UPGRADE_FUNCTION_RE.match(name), access["guarded"]) into a signal by
+    evaluating THIS function's own already-computed `fctx["fn"]`/
+    `fctx["access"]` directly - not by reading back detect_upgrade_function's
+    emitted signal from ctx["collector"].signals filtered by function name.
+
+    An earlier version did read the signal history by name, which broke on
+    overloaded functions sharing a name (`upgradeTo(address)` and
+    `upgradeTo(address,bytes)`): processing the second overload re-scanned
+    ALL prior same-named signals, including the first overload's, and could
+    fire (mis-attributed to the second overload's location) even when the
+    second overload was itself properly guarded. Evaluating `fn`/`access`
+    directly is immune to this by construction - each overload is its own
+    object, never confused with a sibling. Found and fixed during review
+    (docs/decisiones.md D-036); see
+    test_upgrade_function_overload_only_unguarded_one_flagged. Still
+    reuses UPGRADE_FUNCTION_RE and access["guarded"] verbatim - same
+    already-computed pieces detect_upgrade_function itself uses, just read
+    directly instead of round-tripped through a signal."""
+    fn, access, scope, cname = fctx["fn"], fctx["access"], fctx["scope"], fctx["cname"]
+    name = fn["name"] or ""
+    if not UPGRADE_FUNCTION_RE.match(name):
+        return
+    if access["guarded"]:
+        return
+    fctx["collector"].add("upgrade-function-unprotected.general", fn["_headStart"], cname, scope, {"name": name})
 
 
 def detect_reentrancy_pattern(fctx: Dict[str, Any]) -> None:

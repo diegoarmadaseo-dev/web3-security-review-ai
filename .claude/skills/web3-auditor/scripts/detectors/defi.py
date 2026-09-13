@@ -24,7 +24,7 @@ ANSWER_VALIDATION_RE = re.compile(r"\banswer\b\s*[<>]=?\s*0\b|\b0\b\s*[<>]=?\s*\
 # --- V2.1 detector-expansion, third block (docs/decisiones.md D-035) ---
 APPROVE_METHOD_RE = re.compile(r"\.(approve|safeApprove|forceApprove|increaseAllowance)\s*\(")
 MAX_APPROVAL_ARG_RE = re.compile(r"type\s*\(\s*uint(256)?\s*\)\s*\.max|2\s*\*\*\s*256\s*-\s*1|uint256\s*\(\s*-\s*1\s*\)|MAX_UINT|MAX_INT|0x[fF]{64}")
-PERMIT_CALL_RE = re.compile(r"([A-Za-z_$][\w$.\[\]()]*?)\s*\.\s*permit\s*\(")
+PERMIT_CALL_RE = re.compile(r"([A-Za-z_$][\w$.\[\]()]*?)\s*\.\s*permit\s*(?:\{[^}]*\})?\s*\(")
 TRY_BEFORE_CALL_RE = re.compile(r"\btry\s+$")
 DOMAIN_SEPARATOR_RE = re.compile(r"DOMAIN_SEPARATOR|_domainSeparator|EIP712|_hashTypedData|typedDataHash", re.I)
 DOMAIN_SEPARATOR_BASE_RE = re.compile(r"EIP712|Permit", re.I)
@@ -242,7 +242,11 @@ def detect_permit_not_wrapped_in_try_catch(ctx: Dict[str, Any]) -> None:
     and missed the common multi-line-argument style (`try` on its own line
     before a long call), a false positive found and fixed during review
     (docs/decisiones.md D-035); see
-    test_permit_wrapped_in_multiline_try_is_not_flagged."""
+    test_permit_wrapped_in_multiline_try_is_not_flagged. PERMIT_CALL_RE
+    also accepts an optional `{...}` call-options block between `permit`
+    and `(` (e.g. `token.permit{gas: 50000}(...)`), a coverage gap found
+    and closed during the D-036 review; see
+    test_permit_with_gas_call_options_is_flagged_unwrapped."""
     contract, span_start, masked = ctx["contract"], ctx["span_start"], ctx["masked"]
     body = ctx["body"]
     for match in PERMIT_CALL_RE.finditer(body):

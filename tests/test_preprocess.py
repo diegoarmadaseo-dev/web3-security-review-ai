@@ -498,6 +498,54 @@ class SignalFamilyNegativeControlTests(unittest.TestCase):
         signals = self._signals_for(source)
         self.assertFalse(signals_of({"signals": signals}, "upgrade-function-unprotected"))
 
+    def test_upgrade_function_overload_only_unguarded_one_flagged(self):
+        # D-036: an earlier version read detect_upgrade_function's signal
+        # back from the collector, filtered by function NAME - on two
+        # upgradeTo overloads sharing that name, processing the second
+        # overload re-scanned both signals and could fire on the guarded
+        # one too (mis-attributed), regardless of declaration order. Fixed
+        # by evaluating each function's own fn/access directly. Checked in
+        # both declaration orders, since the original bug was order-dependent.
+        unguarded_first = (
+            'contract A { address owner;'
+            ' function upgradeTo(address n, bytes calldata d) external {}'
+            ' function upgradeTo(address n) external onlyOwner {}'
+            ' modifier onlyOwner() { require(msg.sender == owner); _; } }'
+        )
+        guarded_first = (
+            'contract A { address owner;'
+            ' function upgradeTo(address n) external onlyOwner {}'
+            ' function upgradeTo(address n, bytes calldata d) external {}'
+            ' modifier onlyOwner() { require(msg.sender == owner); _; } }'
+        )
+        for source in (unguarded_first, guarded_first):
+            with self.subTest(source=source):
+                signals = self._signals_for(source)
+                hits = signals_of({"signals": signals}, "upgrade-function-unprotected")
+                self.assertEqual(len(hits), 1)
+                self.assertIsNone(hits[0]["modifier"])
+
+    def test_permit_with_gas_call_options_is_flagged_unwrapped(self):
+        # D-036: PERMIT_CALL_RE originally required `.permit` to be followed
+        # directly by `(`, missing the `{gas: ...}`/`{value: ...}`
+        # call-options syntax entirely (neither flagged nor suppressed -
+        # a coverage gap, not a wrong verdict). Now matched and, unwrapped,
+        # correctly flagged.
+        source = (
+            'contract A { function f(address token) external {'
+            ' IERC20Permit(token).permit{gas: 50000}(msg.sender, address(this), 1, 1, 1, bytes32(0), bytes32(0)); } }'
+        )
+        signals = self._signals_for(source)
+        self.assertTrue(signals_of({"signals": signals}, "permit-not-wrapped-in-try-catch"))
+
+    def test_permit_with_gas_call_options_wrapped_in_try_is_not_flagged(self):
+        source = (
+            'contract A { function f(address token) external {'
+            ' try IERC20Permit(token).permit{gas: 50000}(msg.sender, address(this), 1, 1, 1, bytes32(0), bytes32(0)) {} catch {} } }'
+        )
+        signals = self._signals_for(source)
+        self.assertFalse(signals_of({"signals": signals}, "permit-not-wrapped-in-try-catch"))
+
     def test_guarded_delegatecall_is_not_flagged_arbitrary(self):
         source = (
             'contract A { address owner; function exec(address target, bytes calldata data) external {'
