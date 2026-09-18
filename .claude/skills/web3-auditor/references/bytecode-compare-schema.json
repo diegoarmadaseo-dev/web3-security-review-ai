@@ -1,0 +1,144 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "web3-security-review-ai/bytecode-compare-schema.json",
+  "title": "Deterministic Bytecode Comparison (V2.7)",
+  "description": "Reference shape for scripts/compare_bytecode.py's output record (docs/decisiones.md D-057). This script NEVER makes a network call and NEVER modifies preprocess.py, score.py, registry.py, detectors/ or systemGraph. It compares source-compiled bytecode vs deployed runtime bytecode, constructor/deployed vs runtime, and proxy implementation source vs runtime. Verdicts are strictly MATCH, MISMATCH, UNAVAILABLE, INCOMPLETE, UNRESOLVED. MISMATCH is a technical fact, never an automatic vulnerability finding.",
+  "type": "object",
+  "required": [
+    "compareVersion",
+    "address",
+    "network",
+    "verified",
+    "comparisons",
+    "limitations",
+    "provenance",
+    "note"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "compareVersion": {
+      "type": "string",
+      "description": "Version identifier of the bytecode comparison module (e.g. '2026.1')."
+    },
+    "address": {
+      "type": ["string", "null"],
+      "pattern": "^0x[0-9a-f]{40}$",
+      "description": "Lowercase-normalized address of the primary analyzed contract, or null if unresolvable."
+    },
+    "network": {
+      "description": "Network identification as chainId, canonical name, or network object.",
+      "type": ["object", "string", "integer", "null"]
+    },
+    "verified": {
+      "type": "boolean",
+      "description": "Whether the source code is verified. Evaluated by identity (is True), never bool()-coerced."
+    },
+    "comparisons": {
+      "type": "object",
+      "required": ["sourceVsRuntime", "constructorVsRuntime", "proxyComparisons"],
+      "additionalProperties": false,
+      "properties": {
+        "sourceVsRuntime": {
+          "type": "object",
+          "required": ["verdict", "detail"],
+          "additionalProperties": false,
+          "properties": {
+            "verdict": {
+              "enum": ["MATCH", "MISMATCH", "UNAVAILABLE", "INCOMPLETE", "UNRESOLVED"]
+            },
+            "detail": { "type": "string" },
+            "normalizedA": { "type": "string" },
+            "normalizedB": { "type": "string" },
+            "sourceCborStripped": { "type": "boolean" },
+            "sourceCborDetail": { "type": "string" },
+            "runtimeCborStripped": { "type": "boolean" },
+            "runtimeCborDetail": { "type": "string" }
+          }
+        },
+        "constructorVsRuntime": {
+          "type": "object",
+          "required": ["verdict", "detail"],
+          "additionalProperties": false,
+          "properties": {
+            "verdict": {
+              "enum": ["MATCH", "MISMATCH", "UNAVAILABLE", "INCOMPLETE", "UNRESOLVED"]
+            },
+            "detail": { "type": "string" },
+            "constructorArgs": { "type": ["string", "null"] },
+            "constructorArgBytes": { "type": "integer", "minimum": 0 },
+            "abiUsed": { "type": "boolean" },
+            "separationDetail": { "type": "string" }
+          }
+        },
+        "proxyComparisons": {
+          "type": "array",
+          "description": "Per-proxy implementation comparisons derived from systemGraph.proxies[].",
+          "items": {
+            "type": "object",
+            "required": ["proxyKey", "implementationKey", "verdict", "detail"],
+            "additionalProperties": false,
+            "properties": {
+              "proxyKey": { "type": "string" },
+              "implementationKey": { "type": ["string", "null"] },
+              "verdict": {
+                "enum": ["MATCH", "MISMATCH", "UNAVAILABLE", "INCOMPLETE", "UNRESOLVED"]
+              },
+              "detail": { "type": "string" },
+              "sourceCborStripped": { "type": "boolean" },
+              "sourceCborDetail": { "type": "string" },
+              "runtimeCborStripped": { "type": "boolean" },
+              "runtimeCborDetail": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "description": "Technical limitations and non-MATCH comparison findings propagated for contextual AI interpretation.",
+      "items": { "type": "string" }
+    },
+    "provenance": {
+      "type": "object",
+      "description": "Per-field origin mapping (e.g. 'on-chain', 'explorer-or-compiler', 'preprocess-computed').",
+      "additionalProperties": { "type": "string" }
+    },
+    "note": {
+      "type": "string",
+      "description": "Fixed legal/methodological disclaimer restating that non-MATCH verdicts are technical facts, never automatic findings."
+    }
+  },
+  "definitions": {
+    "rawInput": {
+      "description": "Extended V2.6.1 ingestion record consumed by compare_bytecode.py. Contains V2.6.1 fields plus optional bytecode and systemGraph fields.",
+      "type": "object",
+      "properties": {
+        "address": { "type": "string" },
+        "network": { "description": "Chain id, network name, or object." },
+        "verified": { "type": "boolean" },
+        "hasCode": { "type": "boolean" },
+        "sourceBytecode": { "type": "string" },
+        "runtimeBytecode": { "type": "string" },
+        "deploymentBytecode": { "type": "string" },
+        "abi": { "type": "array" },
+        "systemGraph": { "type": "object" },
+        "sourceBytecodeMap": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "runtimeBytecodeMap": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    }
+  },
+  "businessRules": [
+    "R-C1: Verdicts are strictly MATCH, MISMATCH, UNAVAILABLE, INCOMPLETE, UNRESOLVED. No other verdict codes are permitted.",
+    "R-C2: MISMATCH is never an automatic vulnerability finding or security signal; it is a technical fact recorded in comparisons and limitations.",
+    "R-C3: CBOR metadata stripping is deterministic, stdlib-only, requiring len >= 4, declared length > 0 and < len - 2, and fixmap marker 0xa0..0xb7.",
+    "R-C4: Constructor args separated via runtime prefix or elementary static ABI types; non-elementary types or missing data yield INCOMPLETE without guessing lengths.",
+    "R-C5: Proxy comparisons read systemGraph.proxies[]; unresolved proxies stay UNRESOLVED; proxy != implementation is not a mismatch by itself.",
+    "R-C6: Zero network/RPC calls; stdlib only; never modifies preprocess.py, score.py, registry.py, detectors/, or systemGraph."
+  ]
+}
