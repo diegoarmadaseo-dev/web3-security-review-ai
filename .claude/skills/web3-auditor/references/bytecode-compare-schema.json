@@ -35,7 +35,7 @@
     },
     "comparisons": {
       "type": "object",
-      "required": ["sourceVsRuntime", "constructorVsRuntime", "proxyComparisons", "capabilityChecks", "compilerVersionCheck", "crossChainImplementationDrift"],
+      "required": ["sourceVsRuntime", "constructorVsRuntime", "proxyComparisons", "capabilityChecks", "compilerVersionCheck", "crossChainImplementationDrift", "crossChainProvenanceConsistency"],
       "additionalProperties": false,
       "properties": {
         "sourceVsRuntime": {
@@ -93,7 +93,7 @@
         },
         "capabilityChecks": {
           "type": "array",
-          "description": "V2.8 Block 2 (C-01/C-05). One entry per chains.py-tracked EVM capability (supportsPush0, supportsTransientStorage): whether the opcode is actually used in the scanned bytecode and, if so, whether the target chain's catalog supports it. UNAVAILABLE covers both 'no bytecode to scan' and 'chain unknown/uncataloged' - the latter is this script's equivalent of NOT_ASSESSED (compatibility could not be evaluated, never assumed compatible).",
+          "description": "V2.8 Block 2/3 (C-01/C-05/C-07). One entry per chains.py-tracked EVM capability (supportsPush0, supportsTransientStorage, supportsCancun/MCOPY): whether the opcode is actually used in the scanned bytecode and, if so, whether the target chain's catalog supports it. UNAVAILABLE covers both 'no bytecode to scan' and 'chain unknown/uncataloged' - the latter is this script's equivalent of NOT_ASSESSED (compatibility could not be evaluated, never assumed compatible).",
           "items": {
             "type": "object",
             "required": ["verdict", "detail", "capability"],
@@ -101,7 +101,7 @@
             "properties": {
               "verdict": { "enum": ["MATCH", "MISMATCH", "UNAVAILABLE", "INCOMPLETE", "UNRESOLVED"] },
               "detail": { "type": "string" },
-              "capability": { "enum": ["supportsPush0", "supportsTransientStorage"] },
+              "capability": { "enum": ["supportsPush0", "supportsTransientStorage", "supportsCancun"] },
               "opcodeUsed": { "type": "boolean" },
               "chainId": { "type": "integer" },
               "chainKnown": { "type": "boolean" }
@@ -122,7 +122,7 @@
         },
         "crossChainImplementationDrift": {
           "type": "array",
-          "description": "V2.8 Block 2 (C-03), corrected in D-060. When 2+ RESOLVED proxies on DIFFERENT chains delegate to implementations that share a reliable, content-based identity (the CBOR-embedded source metadata hash - ipfs/bzzr - Solidity's own compiler emits; reuses C-02's decoder), compares their runtime bytecode after CBOR normalization. Bare contract name and address are NEVER used to group candidates (D-060: bare-name grouping was removed after it was found to false-group unrelated same-named contracts). An implementation whose metadata identity cannot be established contributes no comparison. Empty for single-chain deployments or when no reliable identity exists.",
+          "description": "V2.8 Block 2 (C-03), corrected in D-060, extended in D-061 (C-10). When 2+ RESOLVED proxies on DIFFERENT chains delegate to implementations that share a reliable, content-based identity (the CBOR-embedded source metadata hash - ipfs/bzzr - Solidity's own compiler emits; reuses C-02's decoder), compares their runtime bytecode after CBOR normalization. Bare contract name and address are NEVER used to group candidates (D-060: bare-name grouping was removed after it was found to false-group unrelated same-named contracts). An implementation whose metadata identity cannot be established contributes no comparison. Empty for single-chain deployments or when no reliable identity exists. A MISMATCH item additionally carries 'divergenceProfile' (C-10): a PURELY DESCRIPTIVE byte-diff characterization against a reference chain - it NEVER changes the verdict and NEVER constitutes a finding by itself (R-C2 still governs interpretation).",
           "items": {
             "type": "object",
             "required": ["verdict", "detail", "metadataIdentity", "chainIds", "implementationKeys"],
@@ -132,7 +132,53 @@
               "detail": { "type": "string" },
               "metadataIdentity": { "type": "string" },
               "chainIds": { "type": "array", "items": { "type": "string" } },
-              "implementationKeys": { "type": "object", "additionalProperties": { "type": "string" } }
+              "implementationKeys": { "type": "object", "additionalProperties": { "type": "string" } },
+              "divergenceProfile": {
+                "type": "object",
+                "description": "C-10, MISMATCH items only. Descriptive only - never a verdict, never a finding.",
+                "required": ["referenceChainId", "perChain"],
+                "additionalProperties": false,
+                "properties": {
+                  "referenceChainId": { "type": "string" },
+                  "perChain": {
+                    "type": "object",
+                    "description": "One entry per OTHER chain whose bytecode differs from the reference; a chain matching the reference is simply omitted.",
+                    "additionalProperties": {
+                      "type": "object",
+                      "required": ["sameLength", "totalBytes", "differingBytes", "differingRegions", "characterization"],
+                      "additionalProperties": false,
+                      "properties": {
+                        "sameLength": { "type": "boolean" },
+                        "totalBytes": { "type": "integer", "minimum": 0 },
+                        "differingBytes": { "type": ["integer", "null"], "minimum": 0 },
+                        "differingRegions": { "type": ["integer", "null"], "minimum": 0 },
+                        "characterization": { "enum": ["localized", "structural", "different-length"] }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "crossChainProvenanceConsistency": {
+          "type": "array",
+          "description": "V2.8 Block 3 (C-09). For implementations already grouped by crossChainImplementationDrift's reliable metadata identity, whether caller-supplied verifiedMap/compilerVersionMap (new optional rawInput fields, parallel to sourceBytecodeMap/runtimeBytecodeMap) agree across chains. A disagreement is a provenance/integrity fact, never a vulnerability signal (same discipline as C-04). Empty when neither map is supplied - never falls back to the single primary record's own top-level verified/compilerVersion field.",
+          "items": {
+            "type": "object",
+            "required": ["verdict", "detail", "metadataIdentity", "chainIds", "implementationKeys", "disagreements"],
+            "additionalProperties": false,
+            "properties": {
+              "verdict": { "enum": ["MATCH", "MISMATCH", "UNAVAILABLE", "INCOMPLETE", "UNRESOLVED"] },
+              "detail": { "type": "string" },
+              "metadataIdentity": { "type": "string" },
+              "chainIds": { "type": "array", "items": { "type": "string" } },
+              "implementationKeys": { "type": "object", "additionalProperties": { "type": "string" } },
+              "disagreements": {
+                "type": "object",
+                "additionalProperties": true,
+                "description": "Present keys are 'verified' and/or 'compilerVersion', each mapping chainId to the disagreeing value; empty object when nothing disagrees."
+              }
             }
           }
         }
@@ -175,6 +221,16 @@
         "runtimeBytecodeMap": {
           "type": "object",
           "additionalProperties": { "type": "string" }
+        },
+        "verifiedMap": {
+          "description": "V2.8 Block 3 (C-09). Optional, keyed like runtimeBytecodeMap.",
+          "type": "object",
+          "additionalProperties": { "type": "boolean" }
+        },
+        "compilerVersionMap": {
+          "description": "V2.8 Block 3 (C-09). Optional, keyed like runtimeBytecodeMap.",
+          "type": "object",
+          "additionalProperties": { "type": "string" }
         }
       }
     }
@@ -190,6 +246,9 @@
     "R-C8: An unknown/uncataloged chain for capabilityChecks always yields UNAVAILABLE, never MATCH - absence of a capability warning must never be read as 'compatible'.",
     "R-C9: compilerVersionCheck's CBOR decoding is scoped ONLY to the short definite-length map/text-string/byte-string encodings Solidity's own metadata encoder emits - any other encoding yields INCOMPLETE, never a guessed version.",
     "R-C10: crossChainImplementationDrift groups candidates ONLY by a reliable, content-based identity (the CBOR-embedded ipfs/bzzr metadata hash) and only across DIFFERENT chains - bare contract name and address are never used to group candidates, and an implementation whose identity cannot be established never contributes a comparison (D-060).",
-    "R-C11: compilerVersionCheck only compares when verified is True; verified is not True (false, absent, or any non-boolean) yields UNAVAILABLE without inspecting compilerVersion or runtimeBytecode, mirroring sourceVsRuntime's trust gate (D-056/D-060)."
+    "R-C11: compilerVersionCheck only compares when verified is True; verified is not True (false, absent, or any non-boolean) yields UNAVAILABLE without inspecting compilerVersion or runtimeBytecode, mirroring sourceVsRuntime's trust gate (D-056/D-060).",
+    "R-C12: capabilityChecks' MCOPY/supportsCancun entry follows the exact same rules as PUSH0/supportsTransientStorage (R-C7/R-C8) - byte-level opcode walk, unknown chain always UNAVAILABLE, never MATCH.",
+    "R-C13: crossChainProvenanceConsistency only compares implementations already grouped by crossChainImplementationDrift's reliable metadata identity - it never independently re-derives or infers a cross-chain relationship from name/address, and never falls back to the single primary record's own verified/compilerVersion field for a group it does not belong to.",
+    "R-C14: divergenceProfile (crossChainImplementationDrift MISMATCH items only) is purely descriptive and MUST NEVER change the verdict or be treated as a finding by itself; 'localized' is never a claim about the actual cause (immutables, linked libraries, or a genuine change are all indistinguishable from raw bytes alone)."
   ]
 }

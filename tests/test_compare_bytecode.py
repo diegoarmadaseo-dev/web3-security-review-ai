@@ -469,6 +469,33 @@ class TopLevelCompareTests(unittest.TestCase):
         self.assertNotIn("signals", res)
         self.assertNotIn("vulnerabilities", res)
 
+    def test_verified_map_and_compiler_version_map_wired_through_compare(self):
+        # V2.8 Block 3, C-09: integration test proving the new optional
+        # rawInput fields actually reach check_cross_chain_provenance_consistency
+        # via compare(), not just the standalone function call.
+        rt = "0x" + SAMPLE_RUNTIME_CODE_HEX + SAMPLE_CBOR_HEX
+        system_graph = {"proxies": [
+            {"proxy": "onchain:/1/0xaa/P.sol#P", "status": "resolved", "implementation": "onchain:/1/0xaa/I.sol#Impl"},
+            {"proxy": "onchain:/137/0xbb/P.sol#P", "status": "resolved", "implementation": "onchain:/137/0xbb/I.sol#Impl"},
+        ]}
+        runtime_map = {"onchain:/1/0xaa/I.sol#Impl": rt, "onchain:/137/0xbb/I.sol#Impl": rt}
+        raw = make_raw_record(
+            systemGraph=system_graph,
+            runtimeBytecodeMap=runtime_map,
+            verifiedMap={"onchain:/1/0xaa/I.sol#Impl": True, "onchain:/137/0xbb/I.sol#Impl": False},
+        )
+        res = compare_bytecode.compare(raw)
+        pc = res["comparisons"]["crossChainProvenanceConsistency"]
+        self.assertEqual(len(pc), 1)
+        self.assertEqual(pc[0]["verdict"], "MISMATCH")
+        self.assertTrue(any("crossChainProvenanceConsistency[" in lim for lim in res["limitations"]))
+        self.assertEqual(res["provenance"]["verifiedMap"], "explorer")
+
+    def test_no_verified_map_or_compiler_version_map_yields_empty_list(self):
+        res = compare_bytecode.compare(make_raw_record())
+        self.assertEqual(res["comparisons"]["crossChainProvenanceConsistency"], [])
+        self.assertNotIn("verifiedMap", res["provenance"])
+
 
 class CliTests(unittest.TestCase):
     def test_cli_reading_file_and_writing_out(self):
@@ -550,6 +577,10 @@ _PUSH0_RUNTIME = "0x5f00"           # PUSH0, STOP
 _NO_PUSH0_RUNTIME = "0x60000000"    # PUSH1 0x00, STOP, STOP (no PUSH0 opcode)
 _PUSH0_AS_DATA_RUNTIME = "0x605f00"  # PUSH1 0x5f (data, not an opcode), STOP
 
+# V2.8 Block 3 (C-07)
+_MCOPY_RUNTIME = "0x5e00"           # MCOPY, STOP
+_MCOPY_AS_DATA_RUNTIME = "0x605e00"  # PUSH1 0x5e (data, not an opcode), STOP
+
 
 class CapabilityCompatibilityTests(unittest.TestCase):
     def test_push0_used_on_incompatible_chain_is_mismatch(self):
@@ -601,9 +632,11 @@ class CapabilityCompatibilityTests(unittest.TestCase):
         push0 = next(r for r in results if r["capability"] == "supportsPush0")
         self.assertEqual(push0["verdict"], "UNAVAILABLE")
 
-    def test_no_bytecode_at_all_yields_two_unavailable_entries(self):
+    def test_no_bytecode_at_all_yields_one_unavailable_entry_per_tracked_capability(self):
+        # V2.8 Block 3 (C-07): 3 tracked capabilities now (PUSH0, transient
+        # storage, MCOPY/Cancun) - was 2 before C-07 added MCOPY.
         results = compare_bytecode.check_capability_compatibility(None, None, 1)
-        self.assertEqual(len(results), 2)
+        self.assertEqual(len(results), 3)
         self.assertTrue(all(r["verdict"] == "UNAVAILABLE" for r in results))
 
     def test_broken_chains_catalog_yields_unavailable_never_crashes(self):
@@ -620,6 +653,49 @@ class CapabilityCompatibilityTests(unittest.TestCase):
         for chain_id, runtime in ((1, _PUSH0_RUNTIME), (250, _PUSH0_RUNTIME), (None, _PUSH0_RUNTIME), (1, _NO_PUSH0_RUNTIME)):
             for r in compare_bytecode.check_capability_compatibility(runtime, None, chain_id):
                 self.assertIn(r["verdict"], allowed)
+
+    # -- V2.8 Block 3, C-07: MCOPY vs supportsCancun --------------------------
+
+    def test_mcopy_used_on_incompatible_chain_is_mismatch(self):
+        results = compare_bytecode.check_capability_compatibility(_MCOPY_RUNTIME, None, 250)  # fantom: no Cancun
+        mcopy = next(r for r in results if r["capability"] == "supportsCancun")
+        self.assertEqual(mcopy["verdict"], "MISMATCH")
+        self.assertTrue(mcopy["opcodeUsed"])
+
+    def test_mcopy_used_on_compatible_chain_is_match(self):
+        results = compare_bytecode.check_capability_compatibility(_MCOPY_RUNTIME, None, 1)  # ethereum: Cancun
+        mcopy = next(r for r in results if r["capability"] == "supportsCancun")
+        self.assertEqual(mcopy["verdict"], "MATCH")
+
+    def test_mcopy_not_used_is_match_regardless_of_chain(self):
+        results = compare_bytecode.check_capability_compatibility(_NO_PUSH0_RUNTIME, None, 250)
+        mcopy = next(r for r in results if r["capability"] == "supportsCancun")
+        self.assertEqual(mcopy["verdict"], "MATCH")
+        self.assertFalse(mcopy["opcodeUsed"])
+
+    def test_mcopy_data_byte_is_never_mistaken_for_mcopy_opcode(self):
+        # Adversarial: PUSH1 0x5e pushes the literal byte 0x5e as DATA.
+        results = compare_bytecode.check_capability_compatibility(_MCOPY_AS_DATA_RUNTIME, None, 250)
+        mcopy = next(r for r in results if r["capability"] == "supportsCancun")
+        self.assertFalse(mcopy["opcodeUsed"])
+        self.assertEqual(mcopy["verdict"], "MATCH")
+
+    def test_mcopy_on_unknown_chain_is_unavailable_never_silently_compatible(self):
+        results = compare_bytecode.check_capability_compatibility(_MCOPY_RUNTIME, None, 999999999)
+        mcopy = next(r for r in results if r["capability"] == "supportsCancun")
+        self.assertEqual(mcopy["verdict"], "UNAVAILABLE")
+        self.assertFalse(mcopy.get("chainKnown", False))
+
+    def test_mcopy_and_push0_are_independently_evaluated(self):
+        # Bytecode using ONLY MCOPY (not PUSH0) on a chain that supports
+        # PUSH0 but not Cancun (fantom does neither, so use a chain with
+        # push0=true/cancun=false: polygon, chainId 137).
+        results = compare_bytecode.check_capability_compatibility(_MCOPY_RUNTIME, None, 137)
+        push0 = next(r for r in results if r["capability"] == "supportsPush0")
+        mcopy = next(r for r in results if r["capability"] == "supportsCancun")
+        self.assertEqual(push0["verdict"], "MATCH")  # PUSH0 simply not used
+        self.assertFalse(push0["opcodeUsed"])
+        self.assertEqual(mcopy["verdict"], "MISMATCH")  # MCOPY used, unsupported
 
 
 def _encode_solc_cbor(version_bytes: bytes) -> str:
@@ -842,6 +918,109 @@ class CrossChainImplementationDriftTests(unittest.TestCase):
         for r in compare_bytecode.check_cross_chain_implementation_drift(sg, rt_map):
             self.assertIn(r["verdict"], allowed)
 
+    # -- V2.8 Block 3, C-10: divergenceProfile (descriptive only) ------------
+
+    @staticmethod
+    def _substitute_bytes(hex_str, position, replacement_hex):
+        data = bytearray(bytes.fromhex(hex_str))
+        repl = bytes.fromhex(replacement_hex)
+        data[position:position + len(repl)] = repl
+        return data.hex()
+
+    def test_match_item_never_carries_a_divergence_profile(self):
+        sg = self._system_graph([
+            (1, "0xaa", "resolved", 1, "0xaa", "Impl"),
+            (137, "0xbb", "resolved", 137, "0xbb", "Impl"),
+        ])
+        rt_map = {
+            "onchain:/1/0xaa/I.sol#Impl": self._RT_WITH_IDENTITY,
+            "onchain:/137/0xbb/I.sol#Impl": self._RT_WITH_IDENTITY,
+        }
+        results = compare_bytecode.check_cross_chain_implementation_drift(sg, rt_map)
+        self.assertEqual(results[0]["verdict"], "MATCH")
+        self.assertNotIn("divergenceProfile", results[0])
+
+    def test_localized_divergence_profile_never_changes_the_mismatch_verdict(self):
+        # A single 4-byte clustered change (1 region, well under the 128-byte/
+        # 8-region thresholds) - "consistent with" a small immutable/library
+        # substitution, but the verdict is STILL MISMATCH either way.
+        localized_hex = self._substitute_bytes(SAMPLE_RUNTIME_CODE_HEX, 0, "ffffffff")
+        rt_localized = "0x" + localized_hex + SAMPLE_CBOR_HEX
+        sg = self._system_graph([
+            (1, "0xaa", "resolved", 1, "0xaa", "Impl"),
+            (137, "0xbb", "resolved", 137, "0xbb", "Impl"),
+        ])
+        rt_map = {
+            "onchain:/1/0xaa/I.sol#Impl": self._RT_WITH_IDENTITY,
+            "onchain:/137/0xbb/I.sol#Impl": rt_localized,
+        }
+        results = compare_bytecode.check_cross_chain_implementation_drift(sg, rt_map)
+        self.assertEqual(results[0]["verdict"], "MISMATCH")  # verdict unchanged
+        profile = results[0]["divergenceProfile"]
+        self.assertEqual(profile["referenceChainId"], "1")
+        per_chain_137 = profile["perChain"]["137"]
+        self.assertTrue(per_chain_137["sameLength"])
+        self.assertEqual(per_chain_137["differingBytes"], 4)
+        self.assertEqual(per_chain_137["differingRegions"], 1)
+        self.assertEqual(per_chain_137["characterization"], "localized")
+
+    def test_structural_divergence_profile_never_changes_the_mismatch_verdict(self):
+        # Scatter changes across many separate byte positions (many regions,
+        # well over the localized threshold) - verdict is STILL MISMATCH.
+        data = bytearray(bytes.fromhex(SAMPLE_RUNTIME_CODE_HEX))
+        for i in range(0, len(data), 2):
+            data[i] ^= 0xFF
+        structural_hex = bytes(data).hex()
+        rt_structural = "0x" + structural_hex + SAMPLE_CBOR_HEX
+        sg = self._system_graph([
+            (1, "0xaa", "resolved", 1, "0xaa", "Impl"),
+            (137, "0xbb", "resolved", 137, "0xbb", "Impl"),
+        ])
+        rt_map = {
+            "onchain:/1/0xaa/I.sol#Impl": self._RT_WITH_IDENTITY,
+            "onchain:/137/0xbb/I.sol#Impl": rt_structural,
+        }
+        results = compare_bytecode.check_cross_chain_implementation_drift(sg, rt_map)
+        self.assertEqual(results[0]["verdict"], "MISMATCH")  # verdict unchanged
+        per_chain_137 = results[0]["divergenceProfile"]["perChain"]["137"]
+        self.assertEqual(per_chain_137["characterization"], "structural")
+
+    def test_different_length_divergence_profile_never_changes_the_mismatch_verdict(self):
+        rt_map = {
+            "onchain:/1/0xaa/I.sol#Impl": self._RT_WITH_IDENTITY,
+            "onchain:/137/0xbb/I.sol#Impl": self._RT_WITH_IDENTITY_DIFFERENT_CODE,
+        }
+        sg = self._system_graph([
+            (1, "0xaa", "resolved", 1, "0xaa", "Impl"),
+            (137, "0xbb", "resolved", 137, "0xbb", "Impl"),
+        ])
+        results = compare_bytecode.check_cross_chain_implementation_drift(sg, rt_map)
+        self.assertEqual(results[0]["verdict"], "MISMATCH")  # verdict unchanged
+        per_chain_137 = results[0]["divergenceProfile"]["perChain"]["137"]
+        self.assertFalse(per_chain_137["sameLength"])
+        self.assertEqual(per_chain_137["characterization"], "different-length")
+        self.assertIsNone(per_chain_137["differingBytes"])
+        self.assertIsNone(per_chain_137["differingRegions"])
+
+    def test_three_chain_divergence_profile_omits_chains_matching_reference(self):
+        localized_hex = self._substitute_bytes(SAMPLE_RUNTIME_CODE_HEX, 0, "ffffffff")
+        rt_localized = "0x" + localized_hex + SAMPLE_CBOR_HEX
+        sg = self._system_graph([
+            (1, "0xaa", "resolved", 1, "0xaa", "Impl"),
+            (137, "0xbb", "resolved", 137, "0xbb", "Impl"),
+            (42161, "0xcc", "resolved", 42161, "0xcc", "Impl"),
+        ])
+        rt_map = {
+            "onchain:/1/0xaa/I.sol#Impl": self._RT_WITH_IDENTITY,        # reference
+            "onchain:/137/0xbb/I.sol#Impl": self._RT_WITH_IDENTITY,      # matches reference
+            "onchain:/42161/0xcc/I.sol#Impl": rt_localized,              # differs
+        }
+        results = compare_bytecode.check_cross_chain_implementation_drift(sg, rt_map)
+        self.assertEqual(results[0]["verdict"], "MISMATCH")
+        per_chain = results[0]["divergenceProfile"]["perChain"]
+        self.assertNotIn("137", per_chain)  # matches reference - omitted
+        self.assertIn("42161", per_chain)
+
 
 class CborMetadataIdentityHashTests(unittest.TestCase):
     def test_identity_extracted_from_ipfs_key(self):
@@ -874,6 +1053,122 @@ class CborMetadataIdentityHashTests(unittest.TestCase):
         self.assertIsNone(
             compare_bytecode._cbor_metadata_identity_hash("0x" + SAMPLE_RUNTIME_CODE_HEX + solc_only_hex)
         )
+
+
+class CrossChainProvenanceConsistencyTests(unittest.TestCase):
+    """V2.8 Block 3, C-09."""
+
+    _RT = "0x" + SAMPLE_RUNTIME_CODE_HEX + SAMPLE_CBOR_HEX  # a single shared metadata identity
+
+    def _system_graph_two_chains(self):
+        return {"proxies": [
+            {"proxy": "onchain:/1/0xaa/P.sol#P", "status": "resolved", "implementation": "onchain:/1/0xaa/I.sol#Impl"},
+            {"proxy": "onchain:/137/0xbb/P.sol#P", "status": "resolved", "implementation": "onchain:/137/0xbb/I.sol#Impl"},
+        ]}
+
+    def _runtime_map(self):
+        return {
+            "onchain:/1/0xaa/I.sol#Impl": self._RT,
+            "onchain:/137/0xbb/I.sol#Impl": self._RT,
+        }
+
+    def test_no_maps_provided_returns_empty_never_guessed_from_primary_record(self):
+        results = compare_bytecode.check_cross_chain_provenance_consistency(
+            self._system_graph_two_chains(), self._runtime_map(), None, None
+        )
+        self.assertEqual(results, [])
+
+    def test_agreeing_verified_and_compiler_version_is_match(self):
+        verified_map = {"onchain:/1/0xaa/I.sol#Impl": True, "onchain:/137/0xbb/I.sol#Impl": True}
+        compiler_map = {
+            "onchain:/1/0xaa/I.sol#Impl": "v0.8.20+commit.a1b79de6",
+            "onchain:/137/0xbb/I.sol#Impl": "0.8.20",
+        }
+        results = compare_bytecode.check_cross_chain_provenance_consistency(
+            self._system_graph_two_chains(), self._runtime_map(), verified_map, compiler_map
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["verdict"], "MATCH")
+        self.assertEqual(results[0]["disagreements"], {})
+
+    def test_disagreeing_verified_is_mismatch_never_a_security_finding_wording(self):
+        # Adversarial: one chain's explorer says verified, the other says not.
+        verified_map = {"onchain:/1/0xaa/I.sol#Impl": True, "onchain:/137/0xbb/I.sol#Impl": False}
+        results = compare_bytecode.check_cross_chain_provenance_consistency(
+            self._system_graph_two_chains(), self._runtime_map(), verified_map, None
+        )
+        self.assertEqual(results[0]["verdict"], "MISMATCH")
+        self.assertIn("verified", results[0]["disagreements"])
+        detail_lower = results[0]["detail"].lower()
+        self.assertIn("never a vulnerability signal", detail_lower)
+        for banned in ("attack", "malicious", "vulnerability found", "exploit"):
+            self.assertNotIn(banned, detail_lower)
+
+    def test_disagreeing_compiler_version_is_mismatch(self):
+        compiler_map = {
+            "onchain:/1/0xaa/I.sol#Impl": "0.8.20",
+            "onchain:/137/0xbb/I.sol#Impl": "0.8.19",
+        }
+        results = compare_bytecode.check_cross_chain_provenance_consistency(
+            self._system_graph_two_chains(), self._runtime_map(), None, compiler_map
+        )
+        self.assertEqual(results[0]["verdict"], "MISMATCH")
+        self.assertIn("compilerVersion", results[0]["disagreements"])
+
+    def test_maps_present_but_no_entries_for_group_keys_is_unavailable(self):
+        results = compare_bytecode.check_cross_chain_provenance_consistency(
+            self._system_graph_two_chains(), self._runtime_map(),
+            {"onchain:/unrelated/key": True}, None,
+        )
+        self.assertEqual(results[0]["verdict"], "UNAVAILABLE")
+
+    def test_non_boolean_verified_value_is_ignored_not_miscounted(self):
+        # Adversarial: a malformed map value ("true" as a string) must never
+        # be coerced into a boolean comparison - same discipline as D-056.
+        verified_map = {"onchain:/1/0xaa/I.sol#Impl": True, "onchain:/137/0xbb/I.sol#Impl": "true"}
+        results = compare_bytecode.check_cross_chain_provenance_consistency(
+            self._system_graph_two_chains(), self._runtime_map(), verified_map, None
+        )
+        # Only chain 1's value is usable (a lone value can't "disagree" with itself).
+        self.assertEqual(results[0]["verdict"], "MATCH")
+
+    def test_unrelated_same_name_contracts_without_shared_identity_produce_no_entry(self):
+        # Reuses C-03's exact grouping - proves no independent bare-name path
+        # was reintroduced for this check either.
+        sg = {"proxies": [
+            {"proxy": "onchain:/1/0xaa/P.sol#P", "status": "resolved", "implementation": "onchain:/1/0xaa/Real.sol#Token"},
+            {"proxy": "onchain:/137/0xzz/Q.sol#Q", "status": "resolved", "implementation": "onchain:/137/0xzz/Unrelated.sol#Token"},
+        ]}
+        rt_map = {
+            "onchain:/1/0xaa/Real.sol#Token": self._RT,
+            "onchain:/137/0xzz/Unrelated.sol#Token": "0x6099",  # no CBOR metadata - no shared identity
+        }
+        verified_map = {"onchain:/1/0xaa/Real.sol#Token": True, "onchain:/137/0xzz/Unrelated.sol#Token": False}
+        results = compare_bytecode.check_cross_chain_provenance_consistency(sg, rt_map, verified_map, None)
+        self.assertEqual(results, [])
+
+    def test_verdicts_stay_within_allowed_set(self):
+        allowed = {"MATCH", "MISMATCH", "UNAVAILABLE", "INCOMPLETE", "UNRESOLVED"}
+        verified_map = {"onchain:/1/0xaa/I.sol#Impl": True, "onchain:/137/0xbb/I.sol#Impl": False}
+        results = compare_bytecode.check_cross_chain_provenance_consistency(
+            self._system_graph_two_chains(), self._runtime_map(), verified_map, None
+        )
+        for r in results:
+            self.assertIn(r["verdict"], allowed)
+
+    def test_malformed_non_dict_maps_never_crash(self):
+        # Adversarial: a list or string where a dict was expected must
+        # degrade to "nothing to check", never raise.
+        for bad_map in (["not", "a", "dict"], "not-a-dict", 42, True):
+            with self.subTest(bad_map=bad_map):
+                results = compare_bytecode.check_cross_chain_provenance_consistency(
+                    self._system_graph_two_chains(), self._runtime_map(), bad_map, None
+                )
+                self.assertEqual(results, [])
+                results2 = compare_bytecode.check_cross_chain_provenance_consistency(
+                    self._system_graph_two_chains(), self._runtime_map(), None, bad_map
+                )
+                self.assertEqual(results2, [])
 
 
 class ComparisonsSchemaDriftTests(unittest.TestCase):

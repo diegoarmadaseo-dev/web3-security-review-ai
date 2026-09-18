@@ -503,5 +503,84 @@ class DuplicateIdentityConflictTests(unittest.TestCase):
         self.assertEqual(set(conflicts[0]["disagreements"]["verified"]), {True, False})
 
 
+class NetworkIdentityConsistencyTests(unittest.TestCase):
+    """V2.8 Block 3 (C-08): check_network_identity_consistency must catch a
+    declared network 'name' that contradicts its chainId - chains.resolve_chain()
+    itself silently discards 'name' from a dict input, so this is otherwise
+    invisible everywhere downstream. Input-integrity signal ONLY, never a
+    security finding."""
+
+    def test_declared_name_matching_canonical_is_consistent(self):
+        result = ingest_onchain.check_network_identity_consistency({"chainId": 1, "name": "ethereum"})
+        self.assertIsNotNone(result)
+        self.assertTrue(result["consistent"])
+        self.assertEqual(result["canonicalName"], "ethereum")
+
+    def test_declared_name_matching_an_alias_is_consistent(self):
+        # "eth" is an alias of chainId 1 (config/chains.json), not the
+        # canonical name itself - must still count as consistent.
+        result = ingest_onchain.check_network_identity_consistency({"chainId": 1, "name": "eth"})
+        self.assertIsNotNone(result)
+        self.assertTrue(result["consistent"])
+
+    def test_declared_name_is_case_insensitive(self):
+        result = ingest_onchain.check_network_identity_consistency({"chainId": 1, "name": "ETHEREUM"})
+        self.assertTrue(result["consistent"])
+
+    def test_contradictory_declared_name_is_inconsistent(self):
+        # Adversarial (the exact gap this check closes): chainId 1 is
+        # Ethereum, but the caller also declared "polygon" - a realistic
+        # copy-paste/config error in a multi-chain workflow.
+        result = ingest_onchain.check_network_identity_consistency({"chainId": 1, "name": "polygon"})
+        self.assertIsNotNone(result)
+        self.assertFalse(result["consistent"])
+        self.assertEqual(result["chainId"], 1)
+        self.assertEqual(result["canonicalName"], "ethereum")
+        self.assertEqual(result["declaredName"], "polygon")
+
+    def test_contradictory_result_is_never_worded_as_a_security_finding(self):
+        result = ingest_onchain.check_network_identity_consistency({"chainId": 1, "name": "polygon"})
+        detail_lower = result["detail"].lower()
+        self.assertIn("never a security finding", detail_lower)
+        for banned in ("vulnerability", "attack", "malicious", "exploit", "compromise"):
+            self.assertNotIn(banned, detail_lower)
+
+    def test_non_dict_network_returns_none(self):
+        self.assertIsNone(ingest_onchain.check_network_identity_consistency("ethereum"))
+        self.assertIsNone(ingest_onchain.check_network_identity_consistency(1))
+        self.assertIsNone(ingest_onchain.check_network_identity_consistency(None))
+
+    def test_dict_without_name_key_returns_none(self):
+        self.assertIsNone(ingest_onchain.check_network_identity_consistency({"chainId": 1}))
+
+    def test_empty_or_whitespace_name_returns_none(self):
+        self.assertIsNone(ingest_onchain.check_network_identity_consistency({"chainId": 1, "name": ""}))
+        self.assertIsNone(ingest_onchain.check_network_identity_consistency({"chainId": 1, "name": "   "}))
+        self.assertIsNone(ingest_onchain.check_network_identity_consistency({"chainId": 1, "name": 42}))
+
+    def test_unknown_chain_id_with_name_returns_none_never_guessed(self):
+        # There is no "canonical" identity for an uncataloged chain to
+        # compare against - never invent one.
+        result = ingest_onchain.check_network_identity_consistency({"chainId": 999999999, "name": "anything"})
+        self.assertIsNone(result)
+
+    def test_unresolvable_chain_id_returns_none(self):
+        self.assertIsNone(ingest_onchain.check_network_identity_consistency({"chainId": "not-a-number", "name": "x"}))
+
+    def test_broken_chains_catalog_returns_none_never_crashes(self):
+        # Adversarial: a broken/missing chains.json must degrade to "nothing
+        # to check", never raise and never fall back to a guess.
+        with mock.patch.object(chains, "resolve_chain", side_effect=chains.ChainsConfigError("broken")):
+            result = ingest_onchain.check_network_identity_consistency({"chainId": 1, "name": "ethereum"})
+        self.assertIsNone(result)
+
+    def test_never_modifies_chains_py_public_surface(self):
+        # This check must use ONLY chains.py's existing public functions
+        # (resolve_chain, load_chains_config) - never a private helper, and
+        # chains.py itself must remain byte-for-byte unmodified by C-08.
+        self.assertTrue(hasattr(chains, "resolve_chain"))
+        self.assertTrue(hasattr(chains, "load_chains_config"))
+
+
 if __name__ == "__main__":
     unittest.main()

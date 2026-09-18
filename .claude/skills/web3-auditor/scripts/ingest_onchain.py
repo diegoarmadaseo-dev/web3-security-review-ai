@@ -276,6 +276,74 @@ def find_contradictory_duplicate_identities(raw_records: List[Dict[str, Any]]) -
     return conflicts
 
 
+def check_network_identity_consistency(raw_network: Any) -> Optional[Dict[str, Any]]:
+    """V2.8 Block 3, C-08.  When the raw network field is a dict supplying
+    BOTH a chainId AND a "name" string, cross-check the supplied name
+    against the catalog's canonical name/aliases for that chainId.
+
+    chains.resolve_chain() itself only ever reads "chainId" from a dict
+    form and silently discards any other key - so a caller that ALSO
+    includes a (possibly contradictory) "name" for its own bookkeeping
+    would otherwise have that mismatch go completely unnoticed everywhere
+    downstream. This is exactly the kind of config/copy-paste error that
+    is realistic in a multi-chain workflow (e.g. a per-chain template
+    where the chainId was updated but the name label was not).
+
+    Returns None (nothing to check - never guessed) when raw_network is
+    not a dict, carries no usable "name" string, or resolves to a chainId
+    the catalog does not know (isKnown=False) - there is nothing reliable
+    to compare an unknown chain's "canonical" name against. Uses ONLY
+    chains.py's existing PUBLIC resolve_chain()/load_chains_config() - it
+    never imports a private helper and never modifies chains.py itself.
+
+    Input-integrity signal ONLY, NEVER a security finding: a mismatched
+    name is far more likely a copy-paste/config error in the caller's own
+    tooling than an attack, and this function has no code path, and its
+    detail text uses no wording, that asserts otherwise."""
+    if not isinstance(raw_network, dict):
+        return None
+    declared_name = raw_network.get("name")
+    if not isinstance(declared_name, str) or not declared_name.strip():
+        return None
+
+    import chains
+    try:
+        resolved_chain_id, canonical_name, _err = chains.resolve_chain(raw_network)
+    except chains.ChainsConfigError:
+        return None  # broken/missing catalog - nothing can be verified, never guessed
+    if resolved_chain_id is None or canonical_name is None:
+        return None  # chainId unresolvable, or unknown to the catalog - not this check's concern
+
+    try:
+        catalog = chains.load_chains_config()
+    except chains.ChainsConfigError:
+        return None
+
+    accepted_identifiers = {canonical_name}
+    for entry in catalog.get("chains", []):
+        if entry.get("chainId") == resolved_chain_id:
+            accepted_identifiers.update(entry.get("aliases", []) or [])
+            break
+
+    declared_normalized = declared_name.strip().lower()
+    consistent = declared_normalized in accepted_identifiers
+    return {
+        "chainId": resolved_chain_id,
+        "canonicalName": canonical_name,
+        "declaredName": declared_name,
+        "consistent": consistent,
+        "detail": (
+            "declared network name %r matches the catalog identity for chainId %d"
+            % (declared_name, resolved_chain_id)
+        ) if consistent else (
+            "declared network name %r does not match the catalog identity for chainId %d "
+            "(canonical: %r) - an input-integrity signal such as a config/copy-paste "
+            "mismatch, never a security finding"
+            % (declared_name, resolved_chain_id, canonical_name)
+        ),
+    }
+
+
 def ingest(raw: Dict[str, Any]) -> Dict[str, Any]:
     _require(isinstance(raw, dict), "input must be a JSON object")
     _require("address" in raw, "input.address is required")

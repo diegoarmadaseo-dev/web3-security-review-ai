@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Deterministic bytecode comparison for deployed contracts (V2.7/V2.8 Block 2,
-docs/decisiones.md D-057/D-059).
+"""Deterministic bytecode comparison for deployed contracts (V2.7/V2.8 Blocks 2-3,
+docs/decisiones.md D-057/D-059/D-060/D-061).
 
 Compares:
   1. sourceVsRuntime   - source-compiled bytecode vs deployed runtime bytecode
@@ -9,17 +9,23 @@ Compares:
   3. proxyComparisons  - for each proxy in systemGraph.proxies[], compares
                          the implementation's source vs runtime bytecode;
                          unresolved proxies stay UNRESOLVED, never guessed
-  4. capabilityChecks  - whether PUSH0/transient-storage opcodes actually
-                         used in the bytecode are supported by the target
-                         chain's catalog capabilities (chains.py, V2.8)
+  4. capabilityChecks  - whether PUSH0/transient-storage/MCOPY opcodes
+                         actually used in the bytecode are supported by the
+                         target chain's catalog capabilities (chains.py)
   5. compilerVersionCheck - explorer-reported compilerVersion vs the solc
                          version byte-encoded in the runtime bytecode's own
-                         CBOR metadata trailer
+                         CBOR metadata trailer; gated on verified (D-060)
   6. crossChainImplementationDrift - when 2+ resolved proxies on DIFFERENT
                          chains delegate to implementations that share a
                          reliable, content-based identity (the CBOR-embedded
                          source metadata hash, never bare name or address),
-                         compares their runtime bytecode
+                         compares their runtime bytecode; a MISMATCH also
+                         carries a purely descriptive divergenceProfile
+                         (V2.8 Block 3, C-10 - never changes the verdict)
+  7. crossChainProvenanceConsistency - for implementations already grouped
+                         by #6's identity, whether their caller-supplied
+                         verifiedMap/compilerVersionMap agree across chains
+                         (V2.8 Block 3, C-09)
 
 Input: a JSON object that EXTENDS the V2.6.1 ingest record produced by
 scripts/ingest_onchain.py with optional extra fields (see rawInput definition
@@ -101,10 +107,11 @@ _UNLINKED_PLACEHOLDER_RE = re.compile(r"__[\$a-zA-Z0-9_]{1,40}__")
 # Does NOT match: bytes (dynamic), string, tuple, any array type.
 _STATIC_ABI_TYPE_RE = re.compile(r"^(u?int\d*|bytes\d+|address|bool)$")
 
-# EVM opcodes gated by chains.py's tracked capability flags (V2.8 Block 2).
+# EVM opcodes gated by chains.py's tracked capability flags (V2.8 Block 2/3).
 _OPCODE_PUSH0 = 0x5F        # EIP-3855
 _OPCODE_TLOAD = 0x5C        # EIP-1153
 _OPCODE_TSTORE = 0x5D       # EIP-1153
+_OPCODE_MCOPY = 0x5E        # EIP-5656 (Cancun)
 _PUSH1, _PUSH32 = 0x60, 0x7F
 
 
@@ -215,6 +222,7 @@ def check_capability_compatibility(
     capability_specs = [
         ("supportsPush0", "PUSH0", frozenset([_OPCODE_PUSH0])),
         ("supportsTransientStorage", "TLOAD/TSTORE", frozenset([_OPCODE_TLOAD, _OPCODE_TSTORE])),
+        ("supportsCancun", "MCOPY", frozenset([_OPCODE_MCOPY])),
     ]
 
     if not hex_candidates:
@@ -960,6 +968,93 @@ def _cbor_metadata_identity_hash(runtime_bytecode: Optional[str]) -> Optional[st
     return None
 
 
+def _group_resolved_proxies_by_identity(
+    system_graph: Optional[Dict[str, Any]],
+    runtime_bytecode_map: Optional[Dict[str, str]],
+) -> Dict[str, Dict[str, str]]:
+    """Shared grouping step for check_cross_chain_implementation_drift (C-03)
+    and check_cross_chain_provenance_consistency (V2.8 Block 3, C-09) - both
+    need the EXACT same "2+ resolved proxies on different chains sharing a
+    reliable metadata identity" grouping, so it is computed once here rather
+    than re-derived twice.  Returns {identityHash: {chainId: implKey}}; an
+    implementation whose identity cannot be established never appears in
+    any group (see _cbor_metadata_identity_hash - never guessed from name
+    or address)."""
+    if system_graph is None or not runtime_bytecode_map:
+        return {}
+    proxies = system_graph.get("proxies")
+    if not isinstance(proxies, list):
+        return {}
+
+    groups: Dict[str, Dict[str, str]] = {}
+    for entry in proxies:
+        if not isinstance(entry, dict) or entry.get("status") != "resolved":
+            continue
+        impl_key = entry.get("implementation")
+        chain_id = _extract_chain_id_from_key(impl_key)
+        if chain_id is None:
+            continue
+        identity = _cbor_metadata_identity_hash(runtime_bytecode_map.get(impl_key))
+        if identity is None:
+            continue
+        groups.setdefault(identity, {})[chain_id] = impl_key
+    return groups
+
+
+# V2.8 Block 3, C-10: purely descriptive byte-diff characterization of an
+# ALREADY-DECIDED MISMATCH.  Thresholds are generous, named constants, never
+# used to change a verdict - see _byte_divergence_profile's own docstring.
+_DIVERGENCE_LOCALIZED_MAX_BYTES = 128      # ~4 32-byte slots (immutables/library addresses)
+_DIVERGENCE_LOCALIZED_MAX_REGIONS = 8
+
+
+def _byte_divergence_profile(hex_a: str, hex_b: str) -> Dict[str, Any]:
+    """Purely descriptive byte-level characterization of two ALREADY-DIFFERENT
+    normalized (CBOR-stripped) bytecode hex strings.  Never asserts a cause -
+    an immutable value, a linked library address, and a genuine functional
+    change are all indistinguishable from raw bytes alone - and NEVER
+    changes a MATCH/MISMATCH verdict or constitutes a finding by itself;
+    MISMATCH_NOTE/R-C2 already govern how every verdict in this script must
+    be interpreted, and this is no exception.  'localized' means few, small,
+    clustered differing byte-ranges (consistent with, but never confirmed
+    as, a handful of immutable/library-address substitutions); 'structural'
+    means the differences are larger or more widespread; different-length
+    inputs are their own bucket ('different-length'), never guessed into
+    either of the other two."""
+    len_a, len_b = len(hex_a) // 2, len(hex_b) // 2
+    if len_a != len_b:
+        return {
+            "sameLength": False,
+            "totalBytes": max(len_a, len_b),
+            "differingBytes": None,
+            "differingRegions": None,
+            "characterization": "different-length",
+        }
+    bytes_a, bytes_b = bytes.fromhex(hex_a), bytes.fromhex(hex_b)
+    differing_bytes = 0
+    differing_regions = 0
+    in_region = False
+    for byte_a, byte_b in zip(bytes_a, bytes_b):
+        if byte_a != byte_b:
+            differing_bytes += 1
+            if not in_region:
+                differing_regions += 1
+                in_region = True
+        else:
+            in_region = False
+    if differing_bytes <= _DIVERGENCE_LOCALIZED_MAX_BYTES and differing_regions <= _DIVERGENCE_LOCALIZED_MAX_REGIONS:
+        characterization = "localized"
+    else:
+        characterization = "structural"
+    return {
+        "sameLength": True,
+        "totalBytes": len_a,
+        "differingBytes": differing_bytes,
+        "differingRegions": differing_regions,
+        "characterization": characterization,
+    }
+
+
 def check_cross_chain_implementation_drift(
     system_graph: Optional[Dict[str, Any]],
     runtime_bytecode_map: Optional[Dict[str, str]],
@@ -980,25 +1075,14 @@ def check_cross_chain_implementation_drift(
     contributes to any group - no relationship is ever inferred from name
     or address alone, and no comparison is emitted for it.  Never compares
     within the same chain (compare_source_vs_runtime already covers that)
-    and never fires for a single-chain deployment."""
-    if system_graph is None or not runtime_bytecode_map:
-        return []
-    proxies = system_graph.get("proxies")
-    if not isinstance(proxies, list):
-        return []
+    and never fires for a single-chain deployment.
 
-    groups: Dict[str, Dict[str, str]] = {}
-    for entry in proxies:
-        if not isinstance(entry, dict) or entry.get("status") != "resolved":
-            continue
-        impl_key = entry.get("implementation")
-        chain_id = _extract_chain_id_from_key(impl_key)
-        if chain_id is None:
-            continue
-        identity = _cbor_metadata_identity_hash(runtime_bytecode_map.get(impl_key))
-        if identity is None:
-            continue
-        groups.setdefault(identity, {})[chain_id] = impl_key
+    V2.8 Block 3 (C-10): a MISMATCH additionally carries a purely
+    descriptive 'divergenceProfile' (see _byte_divergence_profile) comparing
+    every other chain's bytecode against the first (lowest chainId) as
+    reference - a chain whose bytecode matches the reference is simply
+    omitted from it.  This NEVER changes the verdict itself."""
+    groups = _group_resolved_proxies_by_identity(system_graph, runtime_bytecode_map)
 
     results: List[Dict[str, Any]] = []
     for identity in sorted(groups):
@@ -1021,12 +1105,112 @@ def check_cross_chain_implementation_drift(
                 extra={"metadataIdentity": identity, "chainIds": chain_ids, "implementationKeys": implementation_keys},
             ))
         else:
+            reference_cid = chain_ids[0]
+            reference_hex = normalized[reference_cid]
+            divergence_profile = {
+                "referenceChainId": reference_cid,
+                "perChain": {
+                    cid: _byte_divergence_profile(reference_hex, normalized[cid])
+                    for cid in chain_ids[1:]
+                    if normalized[cid] != reference_hex
+                },
+            }
             results.append(_verdict(
                 "MISMATCH",
                 "implementations sharing verified metadata identity %s have DIFFERENT bytecode "
                 "(after CBOR normalization) across chains %s - multi-chain rollout appears out of sync"
                 % (identity, ", ".join(chain_ids)),
-                extra={"metadataIdentity": identity, "chainIds": chain_ids, "implementationKeys": implementation_keys},
+                extra={
+                    "metadataIdentity": identity, "chainIds": chain_ids,
+                    "implementationKeys": implementation_keys,
+                    "divergenceProfile": divergence_profile,
+                },
+            ))
+    return results
+
+
+def check_cross_chain_provenance_consistency(
+    system_graph: Optional[Dict[str, Any]],
+    runtime_bytecode_map: Optional[Dict[str, str]],
+    verified_map: Optional[Dict[str, bool]],
+    compiler_version_map: Optional[Dict[str, str]],
+) -> List[Dict[str, Any]]:
+    """V2.8 Block 3, C-09.  For implementations already proven to share a
+    reliable cross-chain identity (reuses C-03's exact grouping via
+    _group_resolved_proxies_by_identity - never re-derived), check whether
+    their caller-supplied verifiedMap/compilerVersionMap agree across
+    chains.  A disagreement is a provenance/integrity fact - different
+    explorers (or the same explorer at different times) disagreeing about
+    the same underlying compiled artifact - NEVER a vulnerability signal,
+    same discipline as C-04's duplicate-identity conflicts (never chooses a
+    side).
+
+    verifiedMap/compilerVersionMap are NEW optional inputs, parallel to
+    sourceBytecodeMap/runtimeBytecodeMap (D-057's own precedent for adding
+    a per-key map without touching systemGraph).  Without them, nothing can
+    be checked and no entry is produced - this NEVER falls back to the
+    single primary record's own top-level verified/compilerVersion field,
+    which describes only the one address being analyzed, never the whole
+    cross-chain group.  A malformed (non-dict) map is treated exactly like
+    an absent one - never guessed, never crashes."""
+    verified_map = verified_map if isinstance(verified_map, dict) else None
+    compiler_version_map = compiler_version_map if isinstance(compiler_version_map, dict) else None
+    if not verified_map and not compiler_version_map:
+        return []
+    groups = _group_resolved_proxies_by_identity(system_graph, runtime_bytecode_map)
+
+    results: List[Dict[str, Any]] = []
+    for identity in sorted(groups):
+        by_chain = groups[identity]
+        if len(by_chain) < 2:
+            continue
+        chain_ids = sorted(by_chain, key=int)
+        implementation_keys = {cid: by_chain[cid] for cid in chain_ids}
+
+        verified_values: Dict[str, bool] = {}
+        for cid in chain_ids:
+            value = (verified_map or {}).get(by_chain[cid])
+            if isinstance(value, bool):
+                verified_values[cid] = value
+
+        compiler_values: Dict[str, str] = {}
+        for cid in chain_ids:
+            raw_version = (compiler_version_map or {}).get(by_chain[cid])
+            if isinstance(raw_version, str):
+                match = re.search(r"(\d+)\.(\d+)\.(\d+)", raw_version)
+                if match:
+                    compiler_values[cid] = "%s.%s.%s" % match.groups()
+
+        disagreements: Dict[str, Dict[str, Any]] = {}
+        if len(set(verified_values.values())) > 1:
+            disagreements["verified"] = dict(verified_values)
+        if len(set(compiler_values.values())) > 1:
+            disagreements["compilerVersion"] = dict(compiler_values)
+
+        extra = {"metadataIdentity": identity, "chainIds": chain_ids, "implementationKeys": implementation_keys}
+        if disagreements:
+            results.append(_verdict(
+                "MISMATCH",
+                "implementations sharing verified metadata identity %s disagree on %s across "
+                "chains %s - a provenance/integrity fact about explorer-reported metadata, "
+                "never a vulnerability signal"
+                % (identity, " and ".join(sorted(disagreements)), ", ".join(chain_ids)),
+                extra={**extra, "disagreements": disagreements},
+            ))
+        elif verified_values or compiler_values:
+            results.append(_verdict(
+                "MATCH",
+                "implementations sharing verified metadata identity %s agree on all checked "
+                "provenance field(s) across chains %s" % (identity, ", ".join(chain_ids)),
+                extra={**extra, "disagreements": {}},
+            ))
+        else:
+            results.append(_verdict(
+                "UNAVAILABLE",
+                "implementations sharing verified metadata identity %s found across chains %s, "
+                "but verifiedMap/compilerVersionMap provide no comparable data for them"
+                % (identity, ", ".join(chain_ids)),
+                extra={**extra, "disagreements": {}},
             ))
     return results
 
@@ -1042,6 +1226,8 @@ def compare(raw: Dict[str, Any]) -> Dict[str, Any]:
       Core V2.6.1 fields : address, network, verified, hasCode
       New V2.7 fields    : runtimeBytecode, deploymentBytecode, sourceBytecode,
                            abi, systemGraph, sourceBytecodeMap, runtimeBytecodeMap
+      New V2.8 Block 3   : verifiedMap, compilerVersionMap (optional, keyed like
+                           runtimeBytecodeMap - feed check_cross_chain_provenance_consistency)
 
     Returns a structured result with verdicts, limitations[], provenance{},
     and a fixed note restating the no-finding rule.
@@ -1075,6 +1261,8 @@ def compare(raw: Dict[str, Any]) -> Dict[str, Any]:
     source_map = raw.get("sourceBytecodeMap")
     runtime_map = raw.get("runtimeBytecodeMap")
     compiler_version = raw.get("compilerVersion")
+    verified_map = raw.get("verifiedMap")
+    compiler_version_map = raw.get("compilerVersionMap")
     chain_id = network.get("chainId") if isinstance(network, dict) else None
 
     # Detect empty runtimeBytecode field
@@ -1128,14 +1316,25 @@ def compare(raw: Dict[str, Any]) -> Dict[str, Any]:
         verified=verified,
     )
 
-    # 6. Cross-chain implementation drift (C-03)
+    # 6. Cross-chain implementation drift (C-03), incl. divergenceProfile (C-10)
     comparisons["crossChainImplementationDrift"] = check_cross_chain_implementation_drift(
         system_graph=system_graph,
         runtime_bytecode_map=runtime_map,
     )
 
+    # 7. Cross-chain provenance consistency for C-03 identity-linked implementations (C-09)
+    comparisons["crossChainProvenanceConsistency"] = check_cross_chain_provenance_consistency(
+        system_graph=system_graph,
+        runtime_bytecode_map=runtime_map,
+        verified_map=verified_map,
+        compiler_version_map=compiler_version_map,
+    )
+
     # Propagate non-MATCH verdicts to limitations[] for the analysis step
-    _LIST_SHAPED_COMPARISONS = ("proxyComparisons", "capabilityChecks", "crossChainImplementationDrift")
+    _LIST_SHAPED_COMPARISONS = (
+        "proxyComparisons", "capabilityChecks",
+        "crossChainImplementationDrift", "crossChainProvenanceConsistency",
+    )
     for comp_name, verdict_obj in comparisons.items():
         if comp_name in _LIST_SHAPED_COMPARISONS:
             continue
@@ -1177,6 +1376,16 @@ def compare(raw: Dict[str, Any]) -> Dict[str, Any]:
                 % (drift_item.get("metadataIdentity", "?"), v, drift_item.get("detail", ""))
             )
 
+    for provenance_item in comparisons["crossChainProvenanceConsistency"]:
+        if not isinstance(provenance_item, dict):
+            continue
+        v = provenance_item.get("verdict")
+        if v in ("MISMATCH", "INCOMPLETE"):
+            limitations.append(
+                "crossChainProvenanceConsistency[%s]: %s — %s"
+                % (provenance_item.get("metadataIdentity", "?"), v, provenance_item.get("detail", ""))
+            )
+
     # Provenance: per-field origin, same pattern as ingest_onchain.py
     provenance: Dict[str, str] = {}
     if raw_runtime is not None:
@@ -1195,6 +1404,10 @@ def compare(raw: Dict[str, Any]) -> Dict[str, Any]:
         provenance["runtimeBytecodeMap"] = "on-chain"
     if compiler_version is not None:
         provenance["compilerVersion"] = "explorer"
+    if verified_map is not None:
+        provenance["verifiedMap"] = "explorer"
+    if compiler_version_map is not None:
+        provenance["compilerVersionMap"] = "explorer"
 
     return {
         "compareVersion": COMPARE_VERSION,
