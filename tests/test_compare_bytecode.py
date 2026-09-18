@@ -1169,6 +1169,314 @@ class CrossChainProvenanceConsistencyTests(unittest.TestCase):
                     self._system_graph_two_chains(), self._runtime_map(), None, bad_map
                 )
                 self.assertEqual(results2, [])
+                results3 = compare_bytecode.check_cross_chain_provenance_consistency(
+                    self._system_graph_two_chains(), self._runtime_map(), None, None, bad_map
+                )
+                self.assertEqual(results3, [])
+
+    def test_all_items_carry_chainsknown(self):
+        verified_map = {"onchain:/1/0xaa/I.sol#Impl": True, "onchain:/137/0xbb/I.sol#Impl": True}
+        results = compare_bytecode.check_cross_chain_provenance_consistency(
+            self._system_graph_two_chains(), self._runtime_map(), verified_map, None
+        )
+        self.assertEqual(results[0]["chainsKnown"], {"1": True, "137": True})
+
+    # -- V2.8 Block 4, C-12: contractName consistency -------------------------
+
+    def test_agreeing_contract_name_is_match(self):
+        name_map = {"onchain:/1/0xaa/I.sol#Impl": "Vault", "onchain:/137/0xbb/I.sol#Impl": "Vault"}
+        results = compare_bytecode.check_cross_chain_provenance_consistency(
+            self._system_graph_two_chains(), self._runtime_map(), None, None, name_map
+        )
+        self.assertEqual(results[0]["verdict"], "MATCH")
+        self.assertEqual(results[0]["disagreements"], {})
+
+    def test_disagreeing_contract_name_is_mismatch_integrity_only_wording(self):
+        # Adversarial: same proven-identical compiled artifact, but the
+        # explorer reports DIFFERENT contract names per chain - a labeling
+        # inconsistency, never a vulnerability claim (Diego's explicit C-12
+        # constraint).
+        name_map = {"onchain:/1/0xaa/I.sol#Impl": "VaultV1", "onchain:/137/0xbb/I.sol#Impl": "VaultV2Proxy"}
+        results = compare_bytecode.check_cross_chain_provenance_consistency(
+            self._system_graph_two_chains(), self._runtime_map(), None, None, name_map
+        )
+        self.assertEqual(results[0]["verdict"], "MISMATCH")
+        self.assertEqual(results[0]["disagreements"]["contractName"], {"1": "VaultV1", "137": "VaultV2Proxy"})
+        detail_lower = results[0]["detail"].lower()
+        self.assertIn("never a vulnerability signal", detail_lower)
+        for banned in ("attack", "malicious", "vulnerability found", "exploit", "deceptive", "suspicious"):
+            self.assertNotIn(banned, detail_lower)
+
+    def test_contract_name_disagreement_combines_with_other_fields(self):
+        # verified agrees, but contractName disagrees - overall verdict must
+        # still be MISMATCH, and only the actually-disagreeing field(s) are listed.
+        verified_map = {"onchain:/1/0xaa/I.sol#Impl": True, "onchain:/137/0xbb/I.sol#Impl": True}
+        name_map = {"onchain:/1/0xaa/I.sol#Impl": "Vault", "onchain:/137/0xbb/I.sol#Impl": "NotVault"}
+        results = compare_bytecode.check_cross_chain_provenance_consistency(
+            self._system_graph_two_chains(), self._runtime_map(), verified_map, None, name_map
+        )
+        self.assertEqual(results[0]["verdict"], "MISMATCH")
+        self.assertEqual(set(results[0]["disagreements"].keys()), {"contractName"})
+
+    def test_empty_or_whitespace_contract_name_is_ignored_not_miscounted(self):
+        name_map = {"onchain:/1/0xaa/I.sol#Impl": "Vault", "onchain:/137/0xbb/I.sol#Impl": "   "}
+        results = compare_bytecode.check_cross_chain_provenance_consistency(
+            self._system_graph_two_chains(), self._runtime_map(), None, None, name_map
+        )
+        self.assertEqual(results[0]["verdict"], "MATCH")  # lone usable value can't disagree
+
+    def test_only_contract_name_map_supplied_still_works_standalone(self):
+        name_map = {"onchain:/1/0xaa/I.sol#Impl": "Vault", "onchain:/137/0xbb/I.sol#Impl": "Vault"}
+        results = compare_bytecode.check_cross_chain_provenance_consistency(
+            self._system_graph_two_chains(), self._runtime_map(), None, None, contract_name_map=name_map
+        )
+        self.assertEqual(len(results), 1)
+
+
+class CrossChainProxyDriftTests(unittest.TestCase):
+    """V2.8 Block 4, C-11: same mechanism as CrossChainImplementationDriftTests,
+    grouped on the proxy key instead of the implementation key."""
+
+    _RT = "0x" + SAMPLE_RUNTIME_CODE_HEX + SAMPLE_CBOR_HEX
+    _RT_DIFF = "0x" + SAMPLE_RUNTIME_CODE_HEX + "ff" + SAMPLE_CBOR_HEX
+
+    def _system_graph(self, pairs):
+        # pairs: list of (chain, proxy_addr, status, impl_chain, impl_addr)
+        proxies = []
+        for chain, proxy_addr, status, impl_chain, impl_addr in pairs:
+            proxies.append({
+                "proxy": "onchain:/%s/%s/P.sol#Proxy" % (chain, proxy_addr),
+                "status": status,
+                "implementation": (
+                    "onchain:/%s/%s/I.sol#Impl" % (impl_chain, impl_addr) if status == "resolved" else None
+                ),
+            })
+        return {"proxies": proxies}
+
+    def test_shared_proxy_identity_identical_bytecode_is_match(self):
+        sg = self._system_graph([(1, "0xaa", "resolved", 1, "0xii"), (137, "0xbb", "resolved", 137, "0xjj")])
+        rt_map = {
+            "onchain:/1/0xaa/P.sol#Proxy": self._RT,
+            "onchain:/137/0xbb/P.sol#Proxy": self._RT,
+        }
+        results = compare_bytecode.check_cross_chain_proxy_drift(sg, rt_map)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["verdict"], "MATCH")
+        self.assertEqual(set(results[0]["proxyKeys"].values()),
+                          {"onchain:/1/0xaa/P.sol#Proxy", "onchain:/137/0xbb/P.sol#Proxy"})
+
+    def test_shared_proxy_identity_different_bytecode_is_mismatch_with_divergence_profile(self):
+        # Adversarial: same proxy "template" identity, but the deployed
+        # proxy bytecode itself differs across chains - proxies are
+        # expected STABLE, so this is a meaningful drift signal.
+        sg = self._system_graph([(1, "0xaa", "resolved", 1, "0xii"), (137, "0xbb", "resolved", 137, "0xjj")])
+        rt_map = {
+            "onchain:/1/0xaa/P.sol#Proxy": self._RT,
+            "onchain:/137/0xbb/P.sol#Proxy": self._RT_DIFF,
+        }
+        results = compare_bytecode.check_cross_chain_proxy_drift(sg, rt_map)
+        self.assertEqual(results[0]["verdict"], "MISMATCH")
+        self.assertIn("divergenceProfile", results[0])
+
+    def test_match_item_never_carries_a_divergence_profile(self):
+        sg = self._system_graph([(1, "0xaa", "resolved", 1, "0xii"), (137, "0xbb", "resolved", 137, "0xjj")])
+        rt_map = {"onchain:/1/0xaa/P.sol#Proxy": self._RT, "onchain:/137/0xbb/P.sol#Proxy": self._RT}
+        results = compare_bytecode.check_cross_chain_proxy_drift(sg, rt_map)
+        self.assertNotIn("divergenceProfile", results[0])
+
+    def test_implementation_bytecode_is_never_used_for_proxy_grouping(self):
+        # Adversarial: only the IMPLEMENTATION keys carry a shared identity
+        # in runtimeBytecodeMap; the PROXY keys have no CBOR metadata at
+        # all - proxy drift must find NOTHING (proves proxy grouping never
+        # falls back to implementation data).
+        sg = self._system_graph([(1, "0xaa", "resolved", 1, "0xii"), (137, "0xbb", "resolved", 137, "0xjj")])
+        rt_map = {
+            "onchain:/1/0xaa/P.sol#Proxy": "0x6001",       # no CBOR metadata
+            "onchain:/137/0xbb/P.sol#Proxy": "0x6001",     # no CBOR metadata
+            "onchain:/1/0xii/I.sol#Impl": self._RT,        # implementations DO share identity
+            "onchain:/137/0xjj/I.sol#Impl": self._RT,
+        }
+        self.assertEqual(compare_bytecode.check_cross_chain_proxy_drift(sg, rt_map), [])
+
+    def test_missing_proxy_identity_yields_no_drift(self):
+        sg = self._system_graph([(1, "0xaa", "resolved", 1, "0xii"), (137, "0xbb", "resolved", 137, "0xjj")])
+        rt_map = {"onchain:/1/0xaa/P.sol#Proxy": self._RT}  # chain 137 absent
+        self.assertEqual(compare_bytecode.check_cross_chain_proxy_drift(sg, rt_map), [])
+
+    def test_single_chain_produces_no_entry(self):
+        sg = self._system_graph([(1, "0xaa", "resolved", 1, "0xii")])
+        rt_map = {"onchain:/1/0xaa/P.sol#Proxy": self._RT}
+        self.assertEqual(compare_bytecode.check_cross_chain_proxy_drift(sg, rt_map), [])
+
+    def test_unresolved_proxy_is_excluded(self):
+        sg = self._system_graph([(1, "0xaa", "resolved", 1, "0xii"), (137, "0xbb", "unresolved", None, None)])
+        rt_map = {"onchain:/1/0xaa/P.sol#Proxy": self._RT}
+        self.assertEqual(compare_bytecode.check_cross_chain_proxy_drift(sg, rt_map), [])
+
+    def test_verdicts_stay_within_the_five_allowed(self):
+        allowed = {"MATCH", "MISMATCH", "UNAVAILABLE", "INCOMPLETE", "UNRESOLVED"}
+        sg = self._system_graph([(1, "0xaa", "resolved", 1, "0xii"), (137, "0xbb", "resolved", 137, "0xjj")])
+        rt_map = {"onchain:/1/0xaa/P.sol#Proxy": self._RT, "onchain:/137/0xbb/P.sol#Proxy": self._RT}
+        for r in compare_bytecode.check_cross_chain_proxy_drift(sg, rt_map):
+            self.assertIn(r["verdict"], allowed)
+
+
+class ChainsKnownTransparencyTests(unittest.TestCase):
+    """V2.8 Block 4, C-14: descriptive-only chainsKnown flag on C-03/C-09/C-11."""
+
+    _RT = "0x" + SAMPLE_RUNTIME_CODE_HEX + SAMPLE_CBOR_HEX
+
+    def _system_graph(self, chain_a, chain_b):
+        return {"proxies": [
+            {"proxy": "onchain:/%s/0xaa/P.sol#P" % chain_a, "status": "resolved", "implementation": "onchain:/%s/0xaa/I.sol#Impl" % chain_a},
+            {"proxy": "onchain:/%s/0xbb/P.sol#P" % chain_b, "status": "resolved", "implementation": "onchain:/%s/0xbb/I.sol#Impl" % chain_b},
+        ]}
+
+    def _runtime_map(self, chain_a, chain_b):
+        return {
+            "onchain:/%s/0xaa/I.sol#Impl" % chain_a: self._RT,
+            "onchain:/%s/0xbb/I.sol#Impl" % chain_b: self._RT,
+        }
+
+    def test_both_known_chains_are_flagged_true(self):
+        sg = self._system_graph(1, 137)  # both known real chains
+        results = compare_bytecode.check_cross_chain_implementation_drift(sg, self._runtime_map(1, 137))
+        self.assertEqual(results[0]["chainsKnown"], {"1": True, "137": True})
+
+    def test_unknown_chain_is_flagged_false_never_guessed_true(self):
+        sg = self._system_graph(1, 999999999)
+        results = compare_bytecode.check_cross_chain_implementation_drift(sg, self._runtime_map(1, 999999999))
+        self.assertEqual(results[0]["chainsKnown"], {"1": True, "999999999": False})
+
+    def test_unknown_chain_does_not_block_or_change_the_comparison(self):
+        # The MATCH verdict itself must be unaffected by chainsKnown - it is
+        # purely descriptive (Diego's explicit C-14 constraint).
+        sg = self._system_graph(1, 999999999)
+        results = compare_bytecode.check_cross_chain_implementation_drift(sg, self._runtime_map(1, 999999999))
+        self.assertEqual(results[0]["verdict"], "MATCH")
+
+    def test_broken_chains_catalog_degrades_to_false_never_crashes(self):
+        import chains
+        sg = self._system_graph(1, 137)
+        with mock.patch.object(chains, "get_chain_capabilities", side_effect=chains.ChainsConfigError("broken")):
+            results = compare_bytecode.check_cross_chain_implementation_drift(sg, self._runtime_map(1, 137))
+        self.assertEqual(results[0]["chainsKnown"], {"1": False, "137": False})
+        self.assertEqual(results[0]["verdict"], "MATCH")  # comparison itself still succeeds
+
+    def test_present_on_provenance_consistency_items_too(self):
+        sg = self._system_graph(1, 999999999)
+        results = compare_bytecode.check_cross_chain_provenance_consistency(
+            sg, self._runtime_map(1, 999999999),
+            {"onchain:/1/0xaa/I.sol#Impl": True, "onchain:/999999999/0xbb/I.sol#Impl": True},
+            None,
+        )
+        self.assertEqual(results[0]["chainsKnown"], {"1": True, "999999999": False})
+
+    def test_present_on_proxy_drift_items_too(self):
+        sg = {"proxies": [
+            {"proxy": "onchain:/1/0xaa/P.sol#Proxy", "status": "resolved", "implementation": "onchain:/1/0xaa/I.sol#Impl"},
+            {"proxy": "onchain:/999999999/0xbb/P.sol#Proxy", "status": "resolved", "implementation": "onchain:/999999999/0xbb/I.sol#Impl"},
+        ]}
+        rt_map = {"onchain:/1/0xaa/P.sol#Proxy": self._RT, "onchain:/999999999/0xbb/P.sol#Proxy": self._RT}
+        results = compare_bytecode.check_cross_chain_proxy_drift(sg, rt_map)
+        self.assertEqual(results[0]["chainsKnown"], {"1": True, "999999999": False})
+
+
+class CrossChainCoverageSummaryTests(unittest.TestCase):
+    """V2.8 Block 4, C-13: purely descriptive aggregation."""
+
+    _RT = "0x" + SAMPLE_RUNTIME_CODE_HEX + SAMPLE_CBOR_HEX
+
+    def test_no_system_graph_is_all_zero(self):
+        summary = compare_bytecode.compute_cross_chain_coverage_summary(None, None)
+        self.assertEqual(summary["resolvedProxyCount"], 0)
+        self.assertEqual(summary["implementationIdentity"]["withIdentityCount"], 0)
+        self.assertEqual(summary["proxyIdentity"]["withIdentityCount"], 0)
+
+    def test_resolved_proxy_count_matches_actual_resolved_entries(self):
+        sg = {"proxies": [
+            {"proxy": "onchain:/1/0xaa/P.sol#P", "status": "resolved", "implementation": "onchain:/1/0xaa/I.sol#Impl"},
+            {"proxy": "onchain:/137/0xbb/P.sol#P", "status": "unresolved", "implementation": None},
+        ]}
+        summary = compare_bytecode.compute_cross_chain_coverage_summary(sg, {})
+        self.assertEqual(summary["resolvedProxyCount"], 1)
+
+    def test_resolved_proxy_without_identity_is_counted_as_without(self):
+        sg = {"proxies": [
+            {"proxy": "onchain:/1/0xaa/P.sol#P", "status": "resolved", "implementation": "onchain:/1/0xaa/I.sol#Impl"},
+        ]}
+        rt_map = {"onchain:/1/0xaa/I.sol#Impl": "0x6001"}  # no CBOR metadata -> no identity
+        summary = compare_bytecode.compute_cross_chain_coverage_summary(sg, rt_map)
+        self.assertEqual(summary["implementationIdentity"]["withIdentityCount"], 0)
+        self.assertEqual(summary["implementationIdentity"]["withoutIdentityCount"], 1)
+        self.assertEqual(summary["implementationIdentity"]["groupCount"], 0)
+
+    def test_single_chain_identity_counts_but_is_not_comparable(self):
+        sg = {"proxies": [
+            {"proxy": "onchain:/1/0xaa/P.sol#P", "status": "resolved", "implementation": "onchain:/1/0xaa/I.sol#Impl"},
+        ]}
+        rt_map = {"onchain:/1/0xaa/I.sol#Impl": self._RT}
+        summary = compare_bytecode.compute_cross_chain_coverage_summary(sg, rt_map)
+        self.assertEqual(summary["implementationIdentity"]["withIdentityCount"], 1)
+        self.assertEqual(summary["implementationIdentity"]["groupCount"], 1)
+        self.assertEqual(summary["implementationIdentity"]["comparableGroupCount"], 0)
+
+    def test_two_chain_shared_identity_is_comparable(self):
+        sg = {"proxies": [
+            {"proxy": "onchain:/1/0xaa/P.sol#P", "status": "resolved", "implementation": "onchain:/1/0xaa/I.sol#Impl"},
+            {"proxy": "onchain:/137/0xbb/P.sol#P", "status": "resolved", "implementation": "onchain:/137/0xbb/I.sol#Impl"},
+        ]}
+        rt_map = {"onchain:/1/0xaa/I.sol#Impl": self._RT, "onchain:/137/0xbb/I.sol#Impl": self._RT}
+        summary = compare_bytecode.compute_cross_chain_coverage_summary(sg, rt_map)
+        self.assertEqual(summary["implementationIdentity"]["withIdentityCount"], 2)
+        self.assertEqual(summary["implementationIdentity"]["comparableGroupCount"], 1)
+
+    def test_implementation_and_proxy_identity_buckets_are_independent(self):
+        # Adversarial: proxies share an identity but implementations don't -
+        # the two buckets must report DIFFERENT counts, never conflated.
+        sg = {"proxies": [
+            {"proxy": "onchain:/1/0xaa/P.sol#Proxy", "status": "resolved", "implementation": "onchain:/1/0xaa/I.sol#Impl"},
+            {"proxy": "onchain:/137/0xbb/P.sol#Proxy", "status": "resolved", "implementation": "onchain:/137/0xbb/I.sol#Impl"},
+        ]}
+        rt_map = {
+            "onchain:/1/0xaa/P.sol#Proxy": self._RT,
+            "onchain:/137/0xbb/P.sol#Proxy": self._RT,        # proxies share identity
+            "onchain:/1/0xaa/I.sol#Impl": self._RT,
+            "onchain:/137/0xbb/I.sol#Impl": "0x6099",          # implementation has NO identity
+        }
+        summary = compare_bytecode.compute_cross_chain_coverage_summary(sg, rt_map)
+        self.assertEqual(summary["proxyIdentity"]["comparableGroupCount"], 1)
+        self.assertEqual(summary["implementationIdentity"]["withIdentityCount"], 1)
+        self.assertEqual(summary["implementationIdentity"]["comparableGroupCount"], 0)
+
+    def test_never_affects_other_comparisons(self):
+        # C-13 is pure aggregation - computing it must not mutate or affect
+        # crossChainImplementationDrift's own independent result.
+        sg = {"proxies": [
+            {"proxy": "onchain:/1/0xaa/P.sol#P", "status": "resolved", "implementation": "onchain:/1/0xaa/I.sol#Impl"},
+            {"proxy": "onchain:/137/0xbb/P.sol#P", "status": "resolved", "implementation": "onchain:/137/0xbb/I.sol#Impl"},
+        ]}
+        rt_map = {"onchain:/1/0xaa/I.sol#Impl": self._RT, "onchain:/137/0xbb/I.sol#Impl": self._RT}
+        drift_before = compare_bytecode.check_cross_chain_implementation_drift(sg, rt_map)
+        compare_bytecode.compute_cross_chain_coverage_summary(sg, rt_map)
+        drift_after = compare_bytecode.check_cross_chain_implementation_drift(sg, rt_map)
+        self.assertEqual(drift_before, drift_after)
+
+    def test_non_dict_runtime_map_never_crashes(self):
+        sg = {"proxies": [{"proxy": "onchain:/1/0xaa/P.sol#P", "status": "resolved", "implementation": "onchain:/1/0xaa/I.sol#Impl"}]}
+        summary = compare_bytecode.compute_cross_chain_coverage_summary(sg, None)
+        self.assertEqual(summary["resolvedProxyCount"], 1)
+        self.assertEqual(summary["implementationIdentity"]["withIdentityCount"], 0)
+
+    def test_malformed_non_dict_runtime_map_never_crashes(self):
+        # Adversarial: a list where a dict was expected must degrade to "no
+        # identity data available", never raise.
+        sg = {"proxies": [{"proxy": "onchain:/1/0xaa/P.sol#P", "status": "resolved", "implementation": "onchain:/1/0xaa/I.sol#Impl"}]}
+        for bad_map in (["not", "a", "dict"], "not-a-dict", 42):
+            with self.subTest(bad_map=bad_map):
+                summary = compare_bytecode.compute_cross_chain_coverage_summary(sg, bad_map)
+                self.assertEqual(summary["resolvedProxyCount"], 1)
+                self.assertEqual(summary["implementationIdentity"]["withIdentityCount"], 0)
 
 
 class ComparisonsSchemaDriftTests(unittest.TestCase):

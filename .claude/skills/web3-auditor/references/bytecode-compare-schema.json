@@ -35,7 +35,7 @@
     },
     "comparisons": {
       "type": "object",
-      "required": ["sourceVsRuntime", "constructorVsRuntime", "proxyComparisons", "capabilityChecks", "compilerVersionCheck", "crossChainImplementationDrift", "crossChainProvenanceConsistency"],
+      "required": ["sourceVsRuntime", "constructorVsRuntime", "proxyComparisons", "capabilityChecks", "compilerVersionCheck", "crossChainImplementationDrift", "crossChainProvenanceConsistency", "crossChainProxyDrift", "crossChainCoverageSummary"],
       "additionalProperties": false,
       "properties": {
         "sourceVsRuntime": {
@@ -122,10 +122,10 @@
         },
         "crossChainImplementationDrift": {
           "type": "array",
-          "description": "V2.8 Block 2 (C-03), corrected in D-060, extended in D-061 (C-10). When 2+ RESOLVED proxies on DIFFERENT chains delegate to implementations that share a reliable, content-based identity (the CBOR-embedded source metadata hash - ipfs/bzzr - Solidity's own compiler emits; reuses C-02's decoder), compares their runtime bytecode after CBOR normalization. Bare contract name and address are NEVER used to group candidates (D-060: bare-name grouping was removed after it was found to false-group unrelated same-named contracts). An implementation whose metadata identity cannot be established contributes no comparison. Empty for single-chain deployments or when no reliable identity exists. A MISMATCH item additionally carries 'divergenceProfile' (C-10): a PURELY DESCRIPTIVE byte-diff characterization against a reference chain - it NEVER changes the verdict and NEVER constitutes a finding by itself (R-C2 still governs interpretation).",
+          "description": "V2.8 Block 2 (C-03), corrected in D-060, extended in D-061 (C-10/C-14). When 2+ RESOLVED proxies on DIFFERENT chains delegate to implementations that share a reliable, content-based identity (the CBOR-embedded source metadata hash - ipfs/bzzr - Solidity's own compiler emits; reuses C-02's decoder), compares their runtime bytecode after CBOR normalization. Bare contract name and address are NEVER used to group candidates (D-060: bare-name grouping was removed after it was found to false-group unrelated same-named contracts). An implementation whose metadata identity cannot be established contributes no comparison. Empty for single-chain deployments or when no reliable identity exists. A MISMATCH item additionally carries 'divergenceProfile' (C-10): a PURELY DESCRIPTIVE byte-diff characterization against a reference chain - it NEVER changes the verdict and NEVER constitutes a finding by itself (R-C2 still governs interpretation). Every item carries 'chainsKnown' (C-14), also purely descriptive.",
           "items": {
             "type": "object",
-            "required": ["verdict", "detail", "metadataIdentity", "chainIds", "implementationKeys"],
+            "required": ["verdict", "detail", "metadataIdentity", "chainIds", "implementationKeys", "chainsKnown"],
             "additionalProperties": false,
             "properties": {
               "verdict": { "enum": ["MATCH", "MISMATCH", "UNAVAILABLE", "INCOMPLETE", "UNRESOLVED"] },
@@ -133,6 +133,11 @@
               "metadataIdentity": { "type": "string" },
               "chainIds": { "type": "array", "items": { "type": "string" } },
               "implementationKeys": { "type": "object", "additionalProperties": { "type": "string" } },
+              "chainsKnown": {
+                "type": "object",
+                "description": "C-14. chainId -> whether it is in chains.py's known catalog. Descriptive only - never blocks or changes the comparison.",
+                "additionalProperties": { "type": "boolean" }
+              },
               "divergenceProfile": {
                 "type": "object",
                 "description": "C-10, MISMATCH items only. Descriptive only - never a verdict, never a finding.",
@@ -163,10 +168,10 @@
         },
         "crossChainProvenanceConsistency": {
           "type": "array",
-          "description": "V2.8 Block 3 (C-09). For implementations already grouped by crossChainImplementationDrift's reliable metadata identity, whether caller-supplied verifiedMap/compilerVersionMap (new optional rawInput fields, parallel to sourceBytecodeMap/runtimeBytecodeMap) agree across chains. A disagreement is a provenance/integrity fact, never a vulnerability signal (same discipline as C-04). Empty when neither map is supplied - never falls back to the single primary record's own top-level verified/compilerVersion field.",
+          "description": "V2.8 Block 3 (C-09), extended in Block 4 (C-12/C-14). For implementations already grouped by crossChainImplementationDrift's reliable metadata identity, whether caller-supplied verifiedMap/compilerVersionMap/contractNameMap (optional rawInput fields, parallel to sourceBytecodeMap/runtimeBytecodeMap) agree across chains. A disagreement is a provenance/integrity fact, never a vulnerability signal (same discipline as C-04) - contractName disagreement in particular is integrity metadata only, never itself evidence of anything malicious. Empty when none of the three maps is supplied - never falls back to the single primary record's own top-level verified/compilerVersion/contractName field.",
           "items": {
             "type": "object",
-            "required": ["verdict", "detail", "metadataIdentity", "chainIds", "implementationKeys", "disagreements"],
+            "required": ["verdict", "detail", "metadataIdentity", "chainIds", "implementationKeys", "disagreements", "chainsKnown"],
             "additionalProperties": false,
             "properties": {
               "verdict": { "enum": ["MATCH", "MISMATCH", "UNAVAILABLE", "INCOMPLETE", "UNRESOLVED"] },
@@ -177,9 +182,70 @@
               "disagreements": {
                 "type": "object",
                 "additionalProperties": true,
-                "description": "Present keys are 'verified' and/or 'compilerVersion', each mapping chainId to the disagreeing value; empty object when nothing disagrees."
+                "description": "Present keys are 'verified', 'compilerVersion', and/or 'contractName' (C-12), each mapping chainId to the disagreeing value; empty object when nothing disagrees."
+              },
+              "chainsKnown": {
+                "type": "object",
+                "description": "C-14. chainId -> whether it is in chains.py's known catalog. Descriptive only.",
+                "additionalProperties": { "type": "boolean" }
               }
             }
+          }
+        },
+        "crossChainProxyDrift": {
+          "type": "array",
+          "description": "V2.8 Block 4 (C-11). Same mechanism as crossChainImplementationDrift (C-03), grouped on the PROXY's own key/bytecode instead of the implementation's - proxies are expected to be structurally stable across a multi-chain rollout, so drift here is at least as strong a signal. Never a vulnerability signal. Carries the same divergenceProfile (C-10) and chainsKnown (C-14) fields as crossChainImplementationDrift.",
+          "items": {
+            "type": "object",
+            "required": ["verdict", "detail", "metadataIdentity", "chainIds", "proxyKeys", "chainsKnown"],
+            "additionalProperties": false,
+            "properties": {
+              "verdict": { "enum": ["MATCH", "MISMATCH", "UNAVAILABLE", "INCOMPLETE", "UNRESOLVED"] },
+              "detail": { "type": "string" },
+              "metadataIdentity": { "type": "string" },
+              "chainIds": { "type": "array", "items": { "type": "string" } },
+              "proxyKeys": { "type": "object", "additionalProperties": { "type": "string" } },
+              "chainsKnown": {
+                "type": "object",
+                "description": "C-14. chainId -> whether it is in chains.py's known catalog. Descriptive only.",
+                "additionalProperties": { "type": "boolean" }
+              },
+              "divergenceProfile": {
+                "type": "object",
+                "description": "C-10, MISMATCH items only. Descriptive only - never a verdict, never a finding.",
+                "required": ["referenceChainId", "perChain"],
+                "additionalProperties": false,
+                "properties": {
+                  "referenceChainId": { "type": "string" },
+                  "perChain": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "object",
+                      "required": ["sameLength", "totalBytes", "differingBytes", "differingRegions", "characterization"],
+                      "additionalProperties": false,
+                      "properties": {
+                        "sameLength": { "type": "boolean" },
+                        "totalBytes": { "type": "integer", "minimum": 0 },
+                        "differingBytes": { "type": ["integer", "null"], "minimum": 0 },
+                        "differingRegions": { "type": ["integer", "null"], "minimum": 0 },
+                        "characterization": { "enum": ["localized", "structural", "different-length"] }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "crossChainCoverageSummary": {
+          "type": "object",
+          "description": "V2.8 Block 4 (C-13). Purely descriptive aggregation over the SAME resolved-proxy population crossChainImplementationDrift/crossChainProxyDrift already group - adds no new detection logic and never affects any verdict. Surfaces how many resolved proxies/implementations had no reliable identity to compare with (previously invisible).",
+          "required": ["resolvedProxyCount", "implementationIdentity", "proxyIdentity"],
+          "additionalProperties": false,
+          "properties": {
+            "resolvedProxyCount": { "type": "integer", "minimum": 0 },
+            "implementationIdentity": { "$ref": "#/definitions/coverageBucket" },
+            "proxyIdentity": { "$ref": "#/definitions/coverageBucket" }
           }
         }
       }
@@ -219,6 +285,7 @@
           "additionalProperties": { "type": "string" }
         },
         "runtimeBytecodeMap": {
+          "description": "Keyed by systemGraph key. May contain implementation keys (C-03/C-09/C-02's proxy comparisons) AND/OR proxy keys (V2.8 Block 4, C-11) - the same map serves both, no separate field.",
           "type": "object",
           "additionalProperties": { "type": "string" }
         },
@@ -231,7 +298,24 @@
           "description": "V2.8 Block 3 (C-09). Optional, keyed like runtimeBytecodeMap.",
           "type": "object",
           "additionalProperties": { "type": "string" }
+        },
+        "contractNameMap": {
+          "description": "V2.8 Block 4 (C-12). Optional, keyed like runtimeBytecodeMap.",
+          "type": "object",
+          "additionalProperties": { "type": "string" }
         }
+      }
+    },
+    "coverageBucket": {
+      "description": "C-13 per-target-type coverage counts. withIdentityCount + withoutIdentityCount == the parent resolvedProxyCount.",
+      "type": "object",
+      "required": ["withIdentityCount", "withoutIdentityCount", "groupCount", "comparableGroupCount"],
+      "additionalProperties": false,
+      "properties": {
+        "withIdentityCount": { "type": "integer", "minimum": 0 },
+        "withoutIdentityCount": { "type": "integer", "minimum": 0 },
+        "groupCount": { "type": "integer", "minimum": 0 },
+        "comparableGroupCount": { "type": "integer", "minimum": 0 }
       }
     }
   },
@@ -249,6 +333,10 @@
     "R-C11: compilerVersionCheck only compares when verified is True; verified is not True (false, absent, or any non-boolean) yields UNAVAILABLE without inspecting compilerVersion or runtimeBytecode, mirroring sourceVsRuntime's trust gate (D-056/D-060).",
     "R-C12: capabilityChecks' MCOPY/supportsCancun entry follows the exact same rules as PUSH0/supportsTransientStorage (R-C7/R-C8) - byte-level opcode walk, unknown chain always UNAVAILABLE, never MATCH.",
     "R-C13: crossChainProvenanceConsistency only compares implementations already grouped by crossChainImplementationDrift's reliable metadata identity - it never independently re-derives or infers a cross-chain relationship from name/address, and never falls back to the single primary record's own verified/compilerVersion field for a group it does not belong to.",
-    "R-C14: divergenceProfile (crossChainImplementationDrift MISMATCH items only) is purely descriptive and MUST NEVER change the verdict or be treated as a finding by itself; 'localized' is never a claim about the actual cause (immutables, linked libraries, or a genuine change are all indistinguishable from raw bytes alone)."
+    "R-C14: divergenceProfile (crossChainImplementationDrift MISMATCH items only) is purely descriptive and MUST NEVER change the verdict or be treated as a finding by itself; 'localized' is never a claim about the actual cause (immutables, linked libraries, or a genuine change are all indistinguishable from raw bytes alone).",
+    "R-C15: crossChainProxyDrift uses the identical mechanism and verdict rules as crossChainImplementationDrift (R-C10/R-C14), grouped on the proxy key instead of the implementation key - never a vulnerability signal.",
+    "R-C16: contractName disagreement in crossChainProvenanceConsistency is integrity metadata only - it MUST NEVER be worded or treated as a vulnerability/security claim.",
+    "R-C17: crossChainCoverageSummary is purely descriptive aggregation with no verdict field and MUST NEVER affect any comparison's outcome - it only counts, never explains why an entry lacks an identity.",
+    "R-C18: chainsKnown (on crossChainImplementationDrift/crossChainProvenanceConsistency/crossChainProxyDrift items) is purely descriptive and MUST NEVER block or alter a comparison - an unknown chain's bytecode/metadata is still compared identically; a broken chains.json catalog degrades every entry to false rather than aborting the comparison."
   ]
 }
