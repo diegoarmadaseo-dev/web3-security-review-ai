@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Deterministic bytecode comparison for deployed contracts (V2.7,
-docs/decisiones.md D-057).
+"""Deterministic bytecode comparison for deployed contracts (V2.7/V2.8 Block 2,
+docs/decisiones.md D-057/D-059).
 
 Compares:
   1. sourceVsRuntime   - source-compiled bytecode vs deployed runtime bytecode
@@ -9,6 +9,17 @@ Compares:
   3. proxyComparisons  - for each proxy in systemGraph.proxies[], compares
                          the implementation's source vs runtime bytecode;
                          unresolved proxies stay UNRESOLVED, never guessed
+  4. capabilityChecks  - whether PUSH0/transient-storage opcodes actually
+                         used in the bytecode are supported by the target
+                         chain's catalog capabilities (chains.py, V2.8)
+  5. compilerVersionCheck - explorer-reported compilerVersion vs the solc
+                         version byte-encoded in the runtime bytecode's own
+                         CBOR metadata trailer
+  6. crossChainImplementationDrift - when 2+ resolved proxies on DIFFERENT
+                         chains delegate to implementations that share a
+                         reliable, content-based identity (the CBOR-embedded
+                         source metadata hash, never bare name or address),
+                         compares their runtime bytecode
 
 Input: a JSON object that EXTENDS the V2.6.1 ingest record produced by
 scripts/ingest_onchain.py with optional extra fields (see rawInput definition
@@ -90,6 +101,12 @@ _UNLINKED_PLACEHOLDER_RE = re.compile(r"__[\$a-zA-Z0-9_]{1,40}__")
 # Does NOT match: bytes (dynamic), string, tuple, any array type.
 _STATIC_ABI_TYPE_RE = re.compile(r"^(u?int\d*|bytes\d+|address|bool)$")
 
+# EVM opcodes gated by chains.py's tracked capability flags (V2.8 Block 2).
+_OPCODE_PUSH0 = 0x5F        # EIP-3855
+_OPCODE_TLOAD = 0x5C        # EIP-1153
+_OPCODE_TSTORE = 0x5D       # EIP-1153
+_PUSH1, _PUSH32 = 0x60, 0x7F
+
 
 # ---------------------------------------------------------------------------
 # Exception
@@ -136,6 +153,145 @@ def normalize_hex(raw: Any, field_name: str) -> Tuple[Optional[str], Optional[st
 def has_unlinked_libraries(hex_str: str) -> bool:
     """True if hex_str contains unlinked library placeholder patterns."""
     return bool(_UNLINKED_PLACEHOLDER_RE.search(hex_str))
+
+
+# ---------------------------------------------------------------------------
+# Opcode capability checks (V2.8 Block 2, C-01/C-05)
+# ---------------------------------------------------------------------------
+
+def _walk_opcodes(data: bytes) -> "set":
+    """Linear single-pass scan of EVM bytecode that treats PUSH-data bytes as
+    data, never as instructions - a naive substring/byte search would
+    false-positive whenever a PUSH argument happens to equal an opcode byte.
+    Does not validate JUMPDEST reachability or any other control-flow
+    property; only opcode presence is needed here."""
+    seen = set()
+    i, n = 0, len(data)
+    while i < n:
+        op = data[i]
+        seen.add(op)
+        if _PUSH1 <= op <= _PUSH32:
+            i += 1 + (op - _PUSH1 + 1)
+        else:
+            i += 1
+    return seen
+
+
+def check_capability_compatibility(
+    runtime_bytecode: Optional[str],
+    deployment_bytecode: Optional[str],
+    chain_id: Optional[int],
+) -> List[Dict[str, Any]]:
+    """For each EVM-version-gated opcode chains.py's catalog tracks (PUSH0,
+    transient storage), check whether it is actually used in the available
+    bytecode and, if so, whether the target chain's catalog capability
+    supports it.  Never infers a vulnerability - an incompatibility is a
+    deployability/technical fact, reported the same way a bytecode MISMATCH
+    is (R-C2's rule applies here too).  An unknown chain (isKnown=False) or
+    a broken chains.json maps to UNAVAILABLE with an explicit detail stating
+    that capability compatibility cannot be assessed - this is this
+    function's equivalent of report-schema.json's NOT_ASSESSED concept, but
+    reuses the existing UNAVAILABLE verdict rather than adding a 6th verdict
+    token (D-060 corrective fix: this substitution is deliberate and was
+    explicitly confirmed, never a silent change - compare_bytecode.py has a
+    hard "exactly five verdicts" constraint that predates this feature).
+    "opcode used, capability compatibility cannot be assessed" is
+    fundamentally different from "opcode used, compatible" and must never
+    be conflated.
+
+    Only emits one entry per tracked capability that is used or checkable;
+    if BOTH bytecode fields are absent, still emits one UNAVAILABLE entry
+    per capability - never silently skips (same discipline as proxyComparisons,
+    which returns [] only when there is genuinely nothing to check, i.e. no
+    proxies at all)."""
+    hex_candidates = []
+    for field_name, hex_str in (("runtimeBytecode", runtime_bytecode), ("deploymentBytecode", deployment_bytecode)):
+        if hex_str is None:
+            continue
+        norm, err = normalize_hex(hex_str, field_name)
+        if norm:
+            hex_candidates.append(norm)
+
+    capability_specs = [
+        ("supportsPush0", "PUSH0", frozenset([_OPCODE_PUSH0])),
+        ("supportsTransientStorage", "TLOAD/TSTORE", frozenset([_OPCODE_TLOAD, _OPCODE_TSTORE])),
+    ]
+
+    if not hex_candidates:
+        return [
+            _verdict(
+                "UNAVAILABLE",
+                "no runtimeBytecode or deploymentBytecode available to scan for %s usage" % opcode_label,
+                extra={"capability": cap_key},
+            )
+            for cap_key, opcode_label, _ in capability_specs
+        ]
+
+    used_opcodes: "set" = set()
+    for hex_str in hex_candidates:
+        try:
+            used_opcodes |= _walk_opcodes(bytes.fromhex(hex_str))
+        except ValueError:
+            continue
+
+    chain_meta: Optional[Dict[str, Any]] = None
+    chain_meta_error: Optional[str] = None
+    if isinstance(chain_id, int) and not isinstance(chain_id, bool):
+        try:
+            import chains as _chains
+            chain_meta = _chains.get_chain_capabilities(chain_id)
+        except Exception as exc:  # noqa: BLE001 - catalog/lookup failure must never abort the whole comparison
+            chain_meta_error = str(exc)
+
+    results: List[Dict[str, Any]] = []
+    for cap_key, opcode_label, opcode_bytes in capability_specs:
+        is_used = bool(used_opcodes & opcode_bytes)
+        if not is_used:
+            results.append(_verdict(
+                "MATCH",
+                "%s not used in the scanned bytecode; no chain-compatibility concern" % opcode_label,
+                extra={"capability": cap_key, "opcodeUsed": False},
+            ))
+            continue
+        if chain_id is None or not isinstance(chain_id, int) or isinstance(chain_id, bool):
+            results.append(_verdict(
+                "UNAVAILABLE",
+                "%s is used, but no valid chainId was available to check compatibility" % opcode_label,
+                extra={"capability": cap_key, "opcodeUsed": True},
+            ))
+            continue
+        if chain_meta_error is not None:
+            results.append(_verdict(
+                "UNAVAILABLE",
+                "%s is used, but chain capabilities could not be loaded (%s); "
+                "capability compatibility cannot be assessed" % (opcode_label, chain_meta_error),
+                extra={"capability": cap_key, "opcodeUsed": True, "chainId": chain_id},
+            ))
+            continue
+        if chain_meta is None or not chain_meta.get("isKnown"):
+            results.append(_verdict(
+                "UNAVAILABLE",
+                "%s is used, but chainId %r is not in the known chain catalog; "
+                "capability compatibility cannot be assessed" % (opcode_label, chain_id),
+                extra={"capability": cap_key, "opcodeUsed": True, "chainId": chain_id, "chainKnown": False},
+            ))
+            continue
+        supported = bool(chain_meta.get("capabilities", {}).get(cap_key))
+        chain_name = chain_meta.get("name") or ("chain %s" % chain_id)
+        if supported:
+            results.append(_verdict(
+                "MATCH",
+                "%s is used and %s (chainId %d) supports it" % (opcode_label, chain_name, chain_id),
+                extra={"capability": cap_key, "opcodeUsed": True, "chainId": chain_id, "chainKnown": True},
+            ))
+        else:
+            results.append(_verdict(
+                "MISMATCH",
+                "%s is used, but %s (chainId %d) does not support it - the contract as "
+                "compiled cannot run as intended on this chain" % (opcode_label, chain_name, chain_id),
+                extra={"capability": cap_key, "opcodeUsed": True, "chainId": chain_id, "chainKnown": True},
+            ))
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +351,155 @@ def _normalize_bytecode_hex(hex_str: str) -> Tuple[str, bool, str]:
     data = bytes.fromhex(hex_str)
     stripped, was_stripped, detail = strip_cbor_metadata(data)
     return stripped.hex(), was_stripped, detail
+
+
+# ---------------------------------------------------------------------------
+# CBOR solc-version decoding (V2.8 Block 2, C-02) - NOT a general CBOR parser.
+# Scoped ONLY to the shapes Solidity's own metadata encoder emits: a
+# definite-length fixmap (already located by strip_cbor_metadata) of short
+# text-string keys to short byte-string or text-string values. Any encoding
+# outside this narrow scope returns None rather than guessing.
+# ---------------------------------------------------------------------------
+
+def _read_cbor_bytes_or_text(cbor_body: bytes, pos: int) -> Optional[Tuple[Any, int]]:
+    """Read one CBOR byte-string (major type 2) or text-string (major type 3)
+    item starting at pos.  Supports exactly two length encodings - short form
+    (length 0..23 embedded in the initial byte: 0x40..0x57 / 0x60..0x77) and
+    1-byte-length-follows form (length 24..255: 0x58 / 0x78) - which together
+    cover every value Solidity's own metadata encoder actually emits (short
+    "solc" version bytes, longer ipfs/bzzr1 hash byte strings, always well
+    under 255 bytes).  Returns (value, new_pos) or None for any other
+    encoding (2-byte+ length, indefinite length, other major types) - never
+    guessed."""
+    marker = cbor_body[pos]
+    is_bytes = 0x40 <= marker <= 0x5B
+    is_text = 0x60 <= marker <= 0x7B
+    if not (is_bytes or is_text):
+        return None
+    base = 0x40 if is_bytes else 0x60
+    minor = marker - base
+    if minor <= 0x17:  # 0..23: short form, length embedded directly
+        length = minor
+        pos += 1
+    elif minor == 0x18:  # 1-byte length follows (covers 24..255)
+        pos += 1
+        length = cbor_body[pos]
+        pos += 1
+    else:
+        return None  # 2-byte+ length or indefinite-length - out of scope
+    raw = cbor_body[pos:pos + length]
+    if len(raw) != length:
+        return None
+    pos += length
+    value: Any = raw.decode("utf-8") if is_text else raw
+    return value, pos
+
+
+def _decode_cbor_solc_metadata(cbor_body: bytes) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Decode a Solidity-emitted CBOR fixmap body (the bytes between the map
+    marker and the trailing 2-byte length word). Returns (dict_or_None, detail).
+    Keys are always short text strings (solc never emits a long key name);
+    values (the ipfs/bzzr1 hash, the solc version bytes) may use either
+    length form - see _read_cbor_bytes_or_text."""
+    try:
+        pos = 0
+        first = cbor_body[pos]
+        if not (0xA0 <= first <= 0xB7):
+            return None, "not a definite-length fixmap (0x%02x)" % first
+        n_entries = first - 0xA0
+        pos += 1
+        result: Dict[str, Any] = {}
+        for _ in range(n_entries):
+            key_byte = cbor_body[pos]
+            if not (0x60 <= key_byte <= 0x77):
+                return None, "unsupported CBOR key encoding (not a short text string)"
+            key_len = key_byte - 0x60
+            pos += 1
+            key = cbor_body[pos:pos + key_len].decode("utf-8")
+            pos += key_len
+            read = _read_cbor_bytes_or_text(cbor_body, pos)
+            if read is None:
+                return None, "unsupported CBOR value encoding for key %r" % key
+            value, pos = read
+            result[key] = value
+        return result, "decoded %d top-level key(s)" % n_entries
+    except (IndexError, UnicodeDecodeError):
+        return None, "CBOR structure truncated or malformed"
+
+
+def _solc_version_from_metadata(meta: Dict[str, Any]) -> Optional[str]:
+    """Solidity's 'solc' metadata key is 3 raw bytes (major, minor, patch) in
+    the common case, e.g. b'\\x00\\x08\\x14' -> '0.8.20'.  Returns None
+    (never guesses) when the value is not exactly 3 bytes."""
+    value = meta.get("solc")
+    if isinstance(value, (bytes, bytearray)) and len(value) == 3:
+        return "%d.%d.%d" % (value[0], value[1], value[2])
+    return None
+
+
+def check_compiler_version_consistency(
+    reported_compiler_version: Optional[str],
+    runtime_bytecode: Optional[str],
+    verified: bool,
+) -> Dict[str, Any]:
+    """Compare the explorer-reported compilerVersion against the version
+    byte-encoded in the runtime bytecode's own CBOR metadata trailer
+    (reusing strip_cbor_metadata's existing boundary detection, never
+    duplicating it).  A disagreement is a data-integrity/provenance fact -
+    stale or wrong explorer metadata - NEVER a vulnerability signal.
+
+    D-060 corrective fix: gates on verified first, exactly like
+    compare_source_vs_runtime (D-056) - an unverified record's
+    explorer-reported compilerVersion is just as untrustworthy as its
+    sourceBytecode and must never be compared as if it were reliable."""
+    if not verified:
+        return _verdict(
+            "UNAVAILABLE",
+            "source is not verified; compilerVersion cannot be trusted for comparison",
+        )
+    if not reported_compiler_version or not isinstance(reported_compiler_version, str):
+        return _verdict("UNAVAILABLE", "compilerVersion not provided in input; nothing to cross-check")
+    if not runtime_bytecode:
+        return _verdict("UNAVAILABLE", "runtimeBytecode not provided; cannot locate embedded CBOR metadata")
+
+    rt_hex, rt_err = normalize_hex(runtime_bytecode, "runtimeBytecode")
+    if rt_err or not rt_hex:
+        return _verdict("UNAVAILABLE", "runtimeBytecode invalid or empty: %s" % (rt_err or "empty"))
+
+    data = bytes.fromhex(rt_hex)
+    stripped, was_stripped, strip_detail = strip_cbor_metadata(data)
+    if not was_stripped:
+        return _verdict("INCOMPLETE", "no CBOR metadata block found in runtimeBytecode: %s" % strip_detail)
+
+    cbor_body = data[len(stripped):len(data) - 2]
+    meta, decode_detail = _decode_cbor_solc_metadata(cbor_body)
+    if meta is None:
+        return _verdict("INCOMPLETE", "CBOR metadata found but could not be decoded: %s" % decode_detail)
+
+    embedded_version = _solc_version_from_metadata(meta)
+    if embedded_version is None:
+        return _verdict("INCOMPLETE", "CBOR metadata decoded but contains no recognizable 'solc' version field")
+
+    reported_match = re.search(r"(\d+)\.(\d+)\.(\d+)", reported_compiler_version)
+    if not reported_match:
+        return _verdict(
+            "INCOMPLETE",
+            "reported compilerVersion %r has no recognizable X.Y.Z version" % reported_compiler_version,
+        )
+    reported_normalized = "%s.%s.%s" % reported_match.groups()
+
+    if reported_normalized == embedded_version:
+        return _verdict(
+            "MATCH",
+            "reported compilerVersion (%s) matches version embedded in bytecode metadata" % reported_normalized,
+            extra={"reportedVersion": reported_normalized, "embeddedVersion": embedded_version},
+        )
+    return _verdict(
+        "MISMATCH",
+        "reported compilerVersion (%s) does NOT match version embedded in bytecode metadata (%s) - "
+        "explorer metadata may be stale or incorrect" % (reported_normalized, embedded_version),
+        extra={"reportedVersion": reported_normalized, "embeddedVersion": embedded_version},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -604,6 +909,129 @@ def compare_proxy_vs_implementation(
 
 
 # ---------------------------------------------------------------------------
+# Cross-chain implementation drift (V2.8 Block 2, C-03)
+# ---------------------------------------------------------------------------
+
+def _extract_chain_id_from_key(key: Optional[str]) -> Optional[str]:
+    """Independent re-derivation of preprocess.py's onchain-key chain-id
+    extraction (preprocess.py's _onchain_chain_id is a private helper and is
+    never imported across modules - same rationale diff_reports.py already
+    documents for its own independent re-derivations)."""
+    if not isinstance(key, str) or not key.startswith("onchain:/"):
+        return None
+    stripped = key[9:]
+    if stripped.startswith("/"):
+        stripped = stripped[1:]
+    parts = stripped.split("/", 1)
+    if parts and parts[0].isdigit():
+        return parts[0]
+    return None
+
+
+def _cbor_metadata_identity_hash(runtime_bytecode: Optional[str]) -> Optional[str]:
+    """Extract a reliable, content-based cross-chain identity from runtime
+    bytecode's own CBOR metadata trailer (reuses check_compiler_version_
+    consistency's existing CBOR boundary detection and decoder - never a
+    second parser).  Returns the hex-encoded 'ipfs' (or, for older solc,
+    'bzzr1'/'bzzr0') hash Solidity's own compiler embeds as a content
+    fingerprint of the exact source + compiler settings that produced this
+    bytecode - two deployments sharing this hash are provably compiled from
+    the same source, unlike a bare contract name or an address, which prove
+    nothing on their own.  Returns None (no identity - never guessed) when
+    bytecode is absent/invalid, CBOR metadata is absent or undecodable, or
+    the decoded metadata carries none of these keys."""
+    if not runtime_bytecode:
+        return None
+    rt_hex, rt_err = normalize_hex(runtime_bytecode, "runtimeBytecode")
+    if rt_err or not rt_hex:
+        return None
+    data = bytes.fromhex(rt_hex)
+    stripped, was_stripped, _ = strip_cbor_metadata(data)
+    if not was_stripped:
+        return None
+    cbor_body = data[len(stripped):len(data) - 2]
+    meta, _ = _decode_cbor_solc_metadata(cbor_body)
+    if meta is None:
+        return None
+    for key in ("ipfs", "bzzr1", "bzzr0"):
+        value = meta.get(key)
+        if isinstance(value, (bytes, bytearray)) and len(value) > 0:
+            return "%s:%s" % (key, value.hex())
+    return None
+
+
+def check_cross_chain_implementation_drift(
+    system_graph: Optional[Dict[str, Any]],
+    runtime_bytecode_map: Optional[Dict[str, str]],
+) -> List[Dict[str, Any]]:
+    """When 2+ RESOLVED proxies on DIFFERENT chains delegate to
+    implementations that share a reliable, content-based identity (the
+    CBOR-embedded source metadata hash - see _cbor_metadata_identity_hash),
+    compare their runtime bytecodes after CBOR normalization.  A drift is a
+    technical fact (a multi-chain rollout is out of sync) - NEVER a
+    vulnerability signal.
+
+    D-060 corrective fix: this function previously grouped candidates by
+    bare contract name alone, which could false-group two entirely
+    unrelated contracts that merely share a common name (audit finding).
+    Bare-name (and address) grouping has been REMOVED entirely.  An
+    implementation whose metadata identity cannot be established (bytecode
+    missing, CBOR metadata absent/undecodable, or no ipfs/bzzr key) never
+    contributes to any group - no relationship is ever inferred from name
+    or address alone, and no comparison is emitted for it.  Never compares
+    within the same chain (compare_source_vs_runtime already covers that)
+    and never fires for a single-chain deployment."""
+    if system_graph is None or not runtime_bytecode_map:
+        return []
+    proxies = system_graph.get("proxies")
+    if not isinstance(proxies, list):
+        return []
+
+    groups: Dict[str, Dict[str, str]] = {}
+    for entry in proxies:
+        if not isinstance(entry, dict) or entry.get("status") != "resolved":
+            continue
+        impl_key = entry.get("implementation")
+        chain_id = _extract_chain_id_from_key(impl_key)
+        if chain_id is None:
+            continue
+        identity = _cbor_metadata_identity_hash(runtime_bytecode_map.get(impl_key))
+        if identity is None:
+            continue
+        groups.setdefault(identity, {})[chain_id] = impl_key
+
+    results: List[Dict[str, Any]] = []
+    for identity in sorted(groups):
+        by_chain = groups[identity]
+        if len(by_chain) < 2:
+            continue
+        chain_ids = sorted(by_chain, key=int)
+        normalized: Dict[str, str] = {}
+        for cid in chain_ids:
+            norm_hex, _ = normalize_hex(runtime_bytecode_map[by_chain[cid]], "runtimeBytecode")
+            normalized[cid], _, _ = _normalize_bytecode_hex(norm_hex)
+        distinct = set(normalized.values())
+        implementation_keys = {cid: by_chain[cid] for cid in chain_ids}
+        if len(distinct) == 1:
+            results.append(_verdict(
+                "MATCH",
+                "implementations sharing verified metadata identity %s are byte-identical "
+                "(after CBOR normalization) across chains %s"
+                % (identity, ", ".join(chain_ids)),
+                extra={"metadataIdentity": identity, "chainIds": chain_ids, "implementationKeys": implementation_keys},
+            ))
+        else:
+            results.append(_verdict(
+                "MISMATCH",
+                "implementations sharing verified metadata identity %s have DIFFERENT bytecode "
+                "(after CBOR normalization) across chains %s - multi-chain rollout appears out of sync"
+                % (identity, ", ".join(chain_ids)),
+                extra={"metadataIdentity": identity, "chainIds": chain_ids, "implementationKeys": implementation_keys},
+            ))
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Top-level compare function
 # ---------------------------------------------------------------------------
 
@@ -646,6 +1074,8 @@ def compare(raw: Dict[str, Any]) -> Dict[str, Any]:
     system_graph = raw.get("systemGraph")
     source_map = raw.get("sourceBytecodeMap")
     runtime_map = raw.get("runtimeBytecodeMap")
+    compiler_version = raw.get("compilerVersion")
+    chain_id = network.get("chainId") if isinstance(network, dict) else None
 
     # Detect empty runtimeBytecode field
     if raw_runtime is not None:
@@ -684,9 +1114,30 @@ def compare(raw: Dict[str, Any]) -> Dict[str, Any]:
         runtime_bytecode_map=runtime_map,
     )
 
+    # 4. Opcode capability checks (V2.8 Block 2, C-01/C-05)
+    comparisons["capabilityChecks"] = check_capability_compatibility(
+        runtime_bytecode=raw_runtime,
+        deployment_bytecode=raw_deployment,
+        chain_id=chain_id,
+    )
+
+    # 5. Explorer compilerVersion vs CBOR-embedded solc version (C-02)
+    comparisons["compilerVersionCheck"] = check_compiler_version_consistency(
+        reported_compiler_version=compiler_version,
+        runtime_bytecode=raw_runtime,
+        verified=verified,
+    )
+
+    # 6. Cross-chain implementation drift (C-03)
+    comparisons["crossChainImplementationDrift"] = check_cross_chain_implementation_drift(
+        system_graph=system_graph,
+        runtime_bytecode_map=runtime_map,
+    )
+
     # Propagate non-MATCH verdicts to limitations[] for the analysis step
+    _LIST_SHAPED_COMPARISONS = ("proxyComparisons", "capabilityChecks", "crossChainImplementationDrift")
     for comp_name, verdict_obj in comparisons.items():
-        if comp_name == "proxyComparisons":
+        if comp_name in _LIST_SHAPED_COMPARISONS:
             continue
         if not isinstance(verdict_obj, dict):
             continue
@@ -706,6 +1157,26 @@ def compare(raw: Dict[str, Any]) -> Dict[str, Any]:
                 % (proxy_item.get("proxyKey", "?"), v, proxy_item.get("detail", ""))
             )
 
+    for cap_item in comparisons["capabilityChecks"]:
+        if not isinstance(cap_item, dict):
+            continue
+        v = cap_item.get("verdict")
+        if v in ("MISMATCH", "INCOMPLETE"):
+            limitations.append(
+                "capabilityChecks[%s]: %s — %s"
+                % (cap_item.get("capability", "?"), v, cap_item.get("detail", ""))
+            )
+
+    for drift_item in comparisons["crossChainImplementationDrift"]:
+        if not isinstance(drift_item, dict):
+            continue
+        v = drift_item.get("verdict")
+        if v in ("MISMATCH", "INCOMPLETE"):
+            limitations.append(
+                "crossChainImplementationDrift[%s]: %s — %s"
+                % (drift_item.get("metadataIdentity", "?"), v, drift_item.get("detail", ""))
+            )
+
     # Provenance: per-field origin, same pattern as ingest_onchain.py
     provenance: Dict[str, str] = {}
     if raw_runtime is not None:
@@ -722,6 +1193,8 @@ def compare(raw: Dict[str, Any]) -> Dict[str, Any]:
         provenance["sourceBytecodeMap"] = "explorer-or-compiler"
     if runtime_map is not None:
         provenance["runtimeBytecodeMap"] = "on-chain"
+    if compiler_version is not None:
+        provenance["compilerVersion"] = "explorer"
 
     return {
         "compareVersion": COMPARE_VERSION,

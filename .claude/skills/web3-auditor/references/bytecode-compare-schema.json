@@ -35,7 +35,7 @@
     },
     "comparisons": {
       "type": "object",
-      "required": ["sourceVsRuntime", "constructorVsRuntime", "proxyComparisons"],
+      "required": ["sourceVsRuntime", "constructorVsRuntime", "proxyComparisons", "capabilityChecks", "compilerVersionCheck", "crossChainImplementationDrift"],
       "additionalProperties": false,
       "properties": {
         "sourceVsRuntime": {
@@ -90,6 +90,51 @@
               "runtimeCborDetail": { "type": "string" }
             }
           }
+        },
+        "capabilityChecks": {
+          "type": "array",
+          "description": "V2.8 Block 2 (C-01/C-05). One entry per chains.py-tracked EVM capability (supportsPush0, supportsTransientStorage): whether the opcode is actually used in the scanned bytecode and, if so, whether the target chain's catalog supports it. UNAVAILABLE covers both 'no bytecode to scan' and 'chain unknown/uncataloged' - the latter is this script's equivalent of NOT_ASSESSED (compatibility could not be evaluated, never assumed compatible).",
+          "items": {
+            "type": "object",
+            "required": ["verdict", "detail", "capability"],
+            "additionalProperties": false,
+            "properties": {
+              "verdict": { "enum": ["MATCH", "MISMATCH", "UNAVAILABLE", "INCOMPLETE", "UNRESOLVED"] },
+              "detail": { "type": "string" },
+              "capability": { "enum": ["supportsPush0", "supportsTransientStorage"] },
+              "opcodeUsed": { "type": "boolean" },
+              "chainId": { "type": "integer" },
+              "chainKnown": { "type": "boolean" }
+            }
+          }
+        },
+        "compilerVersionCheck": {
+          "type": "object",
+          "description": "V2.8 Block 2 (C-02). Explorer-reported compilerVersion vs the solc version byte-encoded in runtimeBytecode's own CBOR metadata trailer (reuses the existing CBOR boundary detection; a scoped decoder, not a general CBOR parser). Gated on verified (D-060): verified is not True yields UNAVAILABLE, mirroring sourceVsRuntime's trust gate (D-056) - an unverified record's explorer-reported compilerVersion is never compared as if trustworthy. A MISMATCH is a data-integrity/provenance fact about explorer metadata, never a vulnerability signal.",
+          "required": ["verdict", "detail"],
+          "additionalProperties": false,
+          "properties": {
+            "verdict": { "enum": ["MATCH", "MISMATCH", "UNAVAILABLE", "INCOMPLETE", "UNRESOLVED"] },
+            "detail": { "type": "string" },
+            "reportedVersion": { "type": "string" },
+            "embeddedVersion": { "type": "string" }
+          }
+        },
+        "crossChainImplementationDrift": {
+          "type": "array",
+          "description": "V2.8 Block 2 (C-03), corrected in D-060. When 2+ RESOLVED proxies on DIFFERENT chains delegate to implementations that share a reliable, content-based identity (the CBOR-embedded source metadata hash - ipfs/bzzr - Solidity's own compiler emits; reuses C-02's decoder), compares their runtime bytecode after CBOR normalization. Bare contract name and address are NEVER used to group candidates (D-060: bare-name grouping was removed after it was found to false-group unrelated same-named contracts). An implementation whose metadata identity cannot be established contributes no comparison. Empty for single-chain deployments or when no reliable identity exists.",
+          "items": {
+            "type": "object",
+            "required": ["verdict", "detail", "metadataIdentity", "chainIds", "implementationKeys"],
+            "additionalProperties": false,
+            "properties": {
+              "verdict": { "enum": ["MATCH", "MISMATCH", "UNAVAILABLE", "INCOMPLETE", "UNRESOLVED"] },
+              "detail": { "type": "string" },
+              "metadataIdentity": { "type": "string" },
+              "chainIds": { "type": "array", "items": { "type": "string" } },
+              "implementationKeys": { "type": "object", "additionalProperties": { "type": "string" } }
+            }
+          }
         }
       }
     },
@@ -117,6 +162,7 @@
         "network": { "description": "Chain id, network name, or object." },
         "verified": { "type": "boolean" },
         "hasCode": { "type": "boolean" },
+        "compilerVersion": { "type": "string" },
         "sourceBytecode": { "type": "string" },
         "runtimeBytecode": { "type": "string" },
         "deploymentBytecode": { "type": "string" },
@@ -139,6 +185,11 @@
     "R-C3: CBOR metadata stripping is deterministic, stdlib-only, requiring len >= 4, declared length > 0 and < len - 2, and fixmap marker 0xa0..0xb7.",
     "R-C4: Constructor args separated via runtime prefix or elementary static ABI types; non-elementary types or missing data yield INCOMPLETE without guessing lengths.",
     "R-C5: Proxy comparisons read systemGraph.proxies[]; unresolved proxies stay UNRESOLVED; proxy != implementation is not a mismatch by itself.",
-    "R-C6: Zero network/RPC calls; stdlib only; never modifies preprocess.py, score.py, registry.py, detectors/, or systemGraph."
+    "R-C6: Zero network/RPC calls; stdlib only; never modifies preprocess.py, score.py, registry.py, detectors/, or systemGraph.",
+    "R-C7: capabilityChecks scans bytecode for actual opcode presence (a linear opcode walk that correctly skips PUSH-data bytes, never a substring search) - never inferred from source text or compiler version alone.",
+    "R-C8: An unknown/uncataloged chain for capabilityChecks always yields UNAVAILABLE, never MATCH - absence of a capability warning must never be read as 'compatible'.",
+    "R-C9: compilerVersionCheck's CBOR decoding is scoped ONLY to the short definite-length map/text-string/byte-string encodings Solidity's own metadata encoder emits - any other encoding yields INCOMPLETE, never a guessed version.",
+    "R-C10: crossChainImplementationDrift groups candidates ONLY by a reliable, content-based identity (the CBOR-embedded ipfs/bzzr metadata hash) and only across DIFFERENT chains - bare contract name and address are never used to group candidates, and an implementation whose identity cannot be established never contributes a comparison (D-060).",
+    "R-C11: compilerVersionCheck only compares when verified is True; verified is not True (false, absent, or any non-boolean) yields UNAVAILABLE without inspecting compilerVersion or runtimeBytecode, mirroring sourceVsRuntime's trust gate (D-056/D-060)."
   ]
 }

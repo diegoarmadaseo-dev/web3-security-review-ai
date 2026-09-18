@@ -227,6 +227,55 @@ def build_bundle(virtual_prefix: str, source_files: List[Dict[str, Any]]) -> Tup
     return "".join(parts), len(accepted), skipped
 
 
+def find_contradictory_duplicate_identities(raw_records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Given multiple raw ingestion inputs meant to be combined into one
+    multi-contract analysis bundle, detect when two or more records claim
+    the SAME (chainId, address) identity but disagree on fields that
+    identity should determine (verified, contractName, compilerVersion).
+
+    Never silently picks a side and never mutates or combines the records
+    itself - every conflict is reported, the caller (the workflow that
+    assembles the combined bundle) decides what to do with it. Same
+    discipline build_bundle already applies one level down for duplicate
+    source file paths within a single ingestion (V2.6.1, D-055): a
+    collision is always recorded with a reason, never silently resolved.
+
+    Records whose own (address, network) cannot be resolved are skipped
+    here entirely - that is ingest()'s own INVALID_ADDRESS/UNRECOGNIZED_NETWORK
+    concern, not a duplicate-identity concern."""
+    by_identity: Dict[Tuple[int, str], List[Dict[str, Any]]] = {}
+    for idx, raw in enumerate(raw_records):
+        if not isinstance(raw, dict):
+            continue
+        address, _addr_err = normalize_address(raw.get("address"))
+        chain_id, _name, _net_err = normalize_network(raw.get("network"))
+        if address is None or chain_id is None:
+            continue
+        by_identity.setdefault((chain_id, address), []).append({"index": idx, "raw": raw})
+
+    conflicts: List[Dict[str, Any]] = []
+    for (chain_id, address), records in by_identity.items():
+        if len(records) < 2:
+            continue
+        disagreements: Dict[str, List[Any]] = {}
+        for field in ("verified", "contractName", "compilerVersion"):
+            distinct: List[Any] = []
+            for r in records:
+                value = r["raw"].get(field)
+                if value not in distinct:
+                    distinct.append(value)
+            if len(distinct) > 1:
+                disagreements[field] = distinct
+        if disagreements:
+            conflicts.append({
+                "chainId": chain_id,
+                "address": address,
+                "recordIndices": [r["index"] for r in records],
+                "disagreements": disagreements,
+            })
+    return conflicts
+
+
 def ingest(raw: Dict[str, Any]) -> Dict[str, Any]:
     _require(isinstance(raw, dict), "input must be a JSON object")
     _require("address" in raw, "input.address is required")

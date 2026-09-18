@@ -4,7 +4,7 @@
   "title": "Version Comparison / Security Diff - 'preprocess' mode output",
   "description": "Reference shape for scripts/diff_reports.py's `preprocess` mode: a purely structural diff between two raw preprocess.py JSON outputs (Step 3 only - no AI-authored findings involved at all), for a V1/V2 pair the user/workflow has explicitly declared - diff_reports.py never infers that relationship itself. Like report-schema.json, this document is the authoritative human/AI-facing reference; it is not executed by a JSON Schema library at runtime (see docs/decisiones.md D-054).",
   "type": "object",
-  "required": ["diffVersion", "mode", "v1Meta", "v2Meta", "sameInput", "contractsAdded", "contractsRemoved", "contractsMatched", "functionSurfaceDelta", "systemGraphDelta", "note", "modifierScopeNote", "renameNote"],
+  "required": ["diffVersion", "mode", "v1Meta", "v2Meta", "sameInput", "contractsAdded", "contractsRemoved", "contractsMatched", "functionSurfaceDelta", "systemGraphDelta", "chainContext", "note", "modifierScopeNote", "renameNote"],
   "additionalProperties": false,
   "properties": {
     "diffVersion": { "type": "string" },
@@ -23,7 +23,20 @@
       "description": "Keyed by matched contract `key`. Only matched contracts are reported - an added/removed contract's own functions are implicitly all-added/all-removed and are not individually enumerated a second time.",
       "additionalProperties": { "$ref": "#/definitions/contractSurfaceDelta" }
     },
-    "systemGraphDelta": { "$ref": "#/definitions/systemGraphDelta" }
+    "systemGraphDelta": { "$ref": "#/definitions/systemGraphDelta" },
+    "chainContext": {
+      "type": "object",
+      "description": "V2.8 Block 2 (C-06): for every onchain-sourced (V2.6.1) contract `key` appearing in contractsAdded/Removed/Matched, its {chainId, address} identity - so a reader never has to parse it back out of the key string to tell two chains' contracts apart. Always present; empty ({}) when no key in this diff is onchain-sourced.",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["chainId", "address"],
+        "additionalProperties": false,
+        "properties": {
+          "chainId": { "type": "integer", "minimum": 1 },
+          "address": { "type": "string" }
+        }
+      }
+    }
   },
   "definitions": {
     "functionIdentity": {

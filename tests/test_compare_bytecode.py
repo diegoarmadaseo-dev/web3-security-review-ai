@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / ".claude" / "skills" / "web3-auditor" / "scripts"
@@ -539,6 +540,348 @@ class SchemaDriftTests(unittest.TestCase):
 
         verdicts_found.update([v1, v2, v3, v4, v5])
         self.assertEqual(verdicts_found, allowed)
+
+
+# ---------------------------------------------------------------------------
+# V2.8 Block 2
+# ---------------------------------------------------------------------------
+
+_PUSH0_RUNTIME = "0x5f00"           # PUSH0, STOP
+_NO_PUSH0_RUNTIME = "0x60000000"    # PUSH1 0x00, STOP, STOP (no PUSH0 opcode)
+_PUSH0_AS_DATA_RUNTIME = "0x605f00"  # PUSH1 0x5f (data, not an opcode), STOP
+
+
+class CapabilityCompatibilityTests(unittest.TestCase):
+    def test_push0_used_on_incompatible_chain_is_mismatch(self):
+        results = compare_bytecode.check_capability_compatibility(_PUSH0_RUNTIME, None, 250)  # fantom
+        push0 = next(r for r in results if r["capability"] == "supportsPush0")
+        self.assertEqual(push0["verdict"], "MISMATCH")
+        self.assertTrue(push0["opcodeUsed"])
+
+    def test_push0_used_on_compatible_chain_is_match(self):
+        results = compare_bytecode.check_capability_compatibility(_PUSH0_RUNTIME, None, 1)  # ethereum
+        push0 = next(r for r in results if r["capability"] == "supportsPush0")
+        self.assertEqual(push0["verdict"], "MATCH")
+
+    def test_push0_not_used_is_match_regardless_of_chain(self):
+        # Negative control: absence of the opcode is trivially fine even on
+        # a chain that does not support it.
+        results = compare_bytecode.check_capability_compatibility(_NO_PUSH0_RUNTIME, None, 250)
+        push0 = next(r for r in results if r["capability"] == "supportsPush0")
+        self.assertEqual(push0["verdict"], "MATCH")
+        self.assertFalse(push0["opcodeUsed"])
+
+    def test_push_data_byte_is_never_mistaken_for_push0_opcode(self):
+        # Adversarial: PUSH1 0x5f pushes the literal byte 0x5f as DATA - a
+        # naive substring/byte search would false-positive here.
+        results = compare_bytecode.check_capability_compatibility(_PUSH0_AS_DATA_RUNTIME, None, 250)
+        push0 = next(r for r in results if r["capability"] == "supportsPush0")
+        self.assertFalse(push0["opcodeUsed"])
+        self.assertEqual(push0["verdict"], "MATCH")
+
+    def test_tload_and_tstore_both_detected_as_transient_storage(self):
+        for opcode_hex in ("5c", "5d"):  # TLOAD, TSTORE
+            with self.subTest(opcode=opcode_hex):
+                runtime = "0x" + opcode_hex + "00"
+                results = compare_bytecode.check_capability_compatibility(runtime, None, 250)  # fantom: unsupported
+                ts = next(r for r in results if r["capability"] == "supportsTransientStorage")
+                self.assertEqual(ts["verdict"], "MISMATCH")
+
+    def test_unknown_chain_is_unavailable_never_silently_compatible(self):
+        # Adversarial (unknown chains, required): absence of a warning must
+        # never be misread as "compatible" - this is this script's
+        # NOT_ASSESSED equivalent.
+        results = compare_bytecode.check_capability_compatibility(_PUSH0_RUNTIME, None, 999999999)
+        push0 = next(r for r in results if r["capability"] == "supportsPush0")
+        self.assertEqual(push0["verdict"], "UNAVAILABLE")
+        self.assertFalse(push0.get("chainKnown", False))
+
+    def test_no_chain_id_is_unavailable(self):
+        results = compare_bytecode.check_capability_compatibility(_PUSH0_RUNTIME, None, None)
+        push0 = next(r for r in results if r["capability"] == "supportsPush0")
+        self.assertEqual(push0["verdict"], "UNAVAILABLE")
+
+    def test_no_bytecode_at_all_yields_two_unavailable_entries(self):
+        results = compare_bytecode.check_capability_compatibility(None, None, 1)
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(r["verdict"] == "UNAVAILABLE" for r in results))
+
+    def test_broken_chains_catalog_yields_unavailable_never_crashes(self):
+        # Adversarial: a broken chains.json must degrade to UNAVAILABLE, not
+        # raise and abort the whole comparison.
+        import chains
+        with mock.patch.object(chains, "get_chain_capabilities", side_effect=chains.ChainsConfigError("broken")):
+            results = compare_bytecode.check_capability_compatibility(_PUSH0_RUNTIME, None, 1)
+        push0 = next(r for r in results if r["capability"] == "supportsPush0")
+        self.assertEqual(push0["verdict"], "UNAVAILABLE")
+
+    def test_verdicts_stay_within_the_five_allowed(self):
+        allowed = {"MATCH", "MISMATCH", "UNAVAILABLE", "INCOMPLETE", "UNRESOLVED"}
+        for chain_id, runtime in ((1, _PUSH0_RUNTIME), (250, _PUSH0_RUNTIME), (None, _PUSH0_RUNTIME), (1, _NO_PUSH0_RUNTIME)):
+            for r in compare_bytecode.check_capability_compatibility(runtime, None, chain_id):
+                self.assertIn(r["verdict"], allowed)
+
+
+def _encode_solc_cbor(version_bytes: bytes) -> str:
+    """Minimal single-key {"solc": <3 bytes>} CBOR fixmap, hex-encoded,
+    WITHOUT the trailing 2-byte length word (caller appends it, matching
+    strip_cbor_metadata's own contract)."""
+    key = b"solc"
+    body = bytes([0xA1, 0x60 + len(key)]) + key + bytes([0x40 + len(version_bytes)]) + version_bytes
+    return body.hex()
+
+
+class CompilerVersionConsistencyTests(unittest.TestCase):
+    def test_matching_versions_is_match(self):
+        runtime = "0x" + SAMPLE_RUNTIME_CODE_HEX + SAMPLE_CBOR_HEX
+        result = compare_bytecode.check_compiler_version_consistency(
+            "v0.8.20+commit.a1b79de6", runtime, verified=True
+        )
+        self.assertEqual(result["verdict"], "MATCH")
+        self.assertEqual(result["embeddedVersion"], "0.8.20")
+
+    def test_mismatched_versions_is_mismatch(self):
+        # Adversarial (misleading metadata, required): explorer claims a
+        # DIFFERENT version than what is actually embedded in the bytecode.
+        runtime = "0x" + SAMPLE_RUNTIME_CODE_HEX + SAMPLE_CBOR_HEX
+        result = compare_bytecode.check_compiler_version_consistency(
+            "v0.8.19+commit.7dd6d404", runtime, verified=True
+        )
+        self.assertEqual(result["verdict"], "MISMATCH")
+        self.assertEqual(result["reportedVersion"], "0.8.19")
+        self.assertEqual(result["embeddedVersion"], "0.8.20")
+
+    def test_long_form_cbor_value_length_is_decoded_correctly(self):
+        # The realistic case: an "ipfs" hash long enough (34 bytes) to
+        # require CBOR's 1-byte-length-follows encoding (0x58), which a
+        # short-form-only decoder would reject as unsupported. Reuses this
+        # file's own SAMPLE_CBOR_HEX fixture, which already has this shape.
+        meta_body = bytes.fromhex(SAMPLE_CBOR_MAP_HEX)
+        decoded, detail = compare_bytecode._decode_cbor_solc_metadata(meta_body)
+        self.assertIsNotNone(decoded, detail)
+        self.assertEqual(compare_bytecode._solc_version_from_metadata(decoded), "0.8.20")
+
+    def test_no_compiler_version_provided_is_unavailable(self):
+        runtime = "0x" + SAMPLE_RUNTIME_CODE_HEX + SAMPLE_CBOR_HEX
+        result = compare_bytecode.check_compiler_version_consistency(None, runtime, verified=True)
+        self.assertEqual(result["verdict"], "UNAVAILABLE")
+
+    def test_no_runtime_bytecode_is_unavailable(self):
+        result = compare_bytecode.check_compiler_version_consistency("v0.8.20", None, verified=True)
+        self.assertEqual(result["verdict"], "UNAVAILABLE")
+
+    def test_no_cbor_metadata_present_is_incomplete_never_guessed(self):
+        result = compare_bytecode.check_compiler_version_consistency(
+            "v0.8.20", "0x" + SAMPLE_RUNTIME_CODE_HEX, verified=True
+        )
+        self.assertEqual(result["verdict"], "INCOMPLETE")
+
+    def test_malformed_truncated_cbor_never_crashes(self):
+        # Adversarial: a CBOR region that looks like a fixmap but is cut off
+        # mid-value must degrade to INCOMPLETE, never raise.
+        truncated_body = bytes.fromhex(_encode_solc_cbor(b"\x00\x08"))  # claims 3 bytes, only 2 present
+        truncated_hex = truncated_body.hex() + ("%04x" % len(truncated_body))
+        result = compare_bytecode.check_compiler_version_consistency(
+            "v0.8.20", "0x" + SAMPLE_RUNTIME_CODE_HEX + truncated_hex, verified=True
+        )
+        self.assertIn(result["verdict"], ("INCOMPLETE", "UNAVAILABLE"))
+
+    def test_reported_version_without_semver_is_incomplete(self):
+        runtime = "0x" + SAMPLE_RUNTIME_CODE_HEX + SAMPLE_CBOR_HEX
+        result = compare_bytecode.check_compiler_version_consistency("nightly-build", runtime, verified=True)
+        self.assertEqual(result["verdict"], "INCOMPLETE")
+
+    def test_verdicts_stay_within_the_five_allowed(self):
+        allowed = {"MATCH", "MISMATCH", "UNAVAILABLE", "INCOMPLETE", "UNRESOLVED"}
+        runtime = "0x" + SAMPLE_RUNTIME_CODE_HEX + SAMPLE_CBOR_HEX
+        for version in (None, "v0.8.20", "v0.8.19", "garbage"):
+            r = compare_bytecode.check_compiler_version_consistency(version, runtime, verified=True)
+            self.assertIn(r["verdict"], allowed)
+
+    def test_unverified_yields_unavailable_even_with_matching_version(self):
+        # D-060 corrective fix (Critical Item 3): a coincidentally- or
+        # maliciously-matching compilerVersion on an UNVERIFIED record must
+        # never be reported as a confirmed MATCH.
+        runtime = "0x" + SAMPLE_RUNTIME_CODE_HEX + SAMPLE_CBOR_HEX
+        result = compare_bytecode.check_compiler_version_consistency(
+            "v0.8.20+commit.a1b79de6", runtime, verified=False
+        )
+        self.assertEqual(result["verdict"], "UNAVAILABLE")
+
+    def test_full_compare_gates_compiler_version_check_on_verified_field(self):
+        # Same coercion matrix as D-056's VerifiedFieldCoercionTests
+        # (ingest_onchain.py): false (bool), "false"/"true" (string), 1
+        # (int) must ALL be treated as NOT verified - only literal True
+        # (identity check) may produce a MATCH/MISMATCH verdict.
+        runtime = "0x" + SAMPLE_RUNTIME_CODE_HEX + SAMPLE_CBOR_HEX
+        for non_true_verified in (False, "false", "true", 1, None):
+            with self.subTest(verified=non_true_verified):
+                raw = make_raw_record(
+                    verified=non_true_verified,
+                    runtimeBytecode=runtime,
+                    compilerVersion="v0.8.20+commit.a1b79de6",
+                )
+                result = compare_bytecode.compare(raw)
+                self.assertEqual(result["comparisons"]["compilerVersionCheck"]["verdict"], "UNAVAILABLE")
+        raw_true = make_raw_record(
+            verified=True, runtimeBytecode=runtime, compilerVersion="v0.8.20+commit.a1b79de6"
+        )
+        self.assertEqual(
+            compare_bytecode.compare(raw_true)["comparisons"]["compilerVersionCheck"]["verdict"], "MATCH"
+        )
+
+
+class CrossChainImplementationDriftTests(unittest.TestCase):
+    """D-060 corrective fix: identity is now the CBOR-embedded source
+    metadata hash (ipfs/bzzr), never bare contract name or address."""
+
+    _RT_WITH_IDENTITY = "0x" + SAMPLE_RUNTIME_CODE_HEX + SAMPLE_CBOR_HEX
+    _RT_WITH_IDENTITY_DIFFERENT_CODE = "0x" + SAMPLE_RUNTIME_CODE_HEX + "ff" + SAMPLE_CBOR_HEX
+
+    def _system_graph(self, resolved_pairs):
+        proxies = []
+        for chain_id, addr, status, impl_chain, impl_addr, impl_name in resolved_pairs:
+            entry = {
+                "proxy": "onchain:/%s/%s/P.sol#P" % (chain_id, addr),
+                "status": status,
+                "implementation": (
+                    "onchain:/%s/%s/I.sol#%s" % (impl_chain, impl_addr, impl_name)
+                    if status == "resolved" else None
+                ),
+            }
+            proxies.append(entry)
+        return {"proxies": proxies}
+
+    def test_shared_metadata_identity_identical_bytecode_is_match(self):
+        sg = self._system_graph([
+            (1, "0xaa", "resolved", 1, "0xaa", "Impl"),
+            (137, "0xbb", "resolved", 137, "0xbb", "Impl"),
+        ])
+        rt_map = {
+            "onchain:/1/0xaa/I.sol#Impl": self._RT_WITH_IDENTITY,
+            "onchain:/137/0xbb/I.sol#Impl": self._RT_WITH_IDENTITY,
+        }
+        results = compare_bytecode.check_cross_chain_implementation_drift(sg, rt_map)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["verdict"], "MATCH")
+        self.assertTrue(results[0]["metadataIdentity"].startswith("ipfs:"))
+        self.assertEqual(set(results[0]["chainIds"]), {"1", "137"})
+
+    def test_shared_metadata_identity_different_bytecode_is_mismatch(self):
+        # Adversarial test 2 (D-060): a RELIABLE identity (matching CBOR
+        # metadata hash) exists on both chains, but the actual runtime
+        # bytecode differs - a genuine drifted rollout, not a guess.
+        sg = self._system_graph([
+            (1, "0xaa", "resolved", 1, "0xaa", "Impl"),
+            (137, "0xbb", "resolved", 137, "0xbb", "Impl"),
+        ])
+        rt_map = {
+            "onchain:/1/0xaa/I.sol#Impl": self._RT_WITH_IDENTITY,
+            "onchain:/137/0xbb/I.sol#Impl": self._RT_WITH_IDENTITY_DIFFERENT_CODE,
+        }
+        results = compare_bytecode.check_cross_chain_implementation_drift(sg, rt_map)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["verdict"], "MISMATCH")
+
+    def test_unrelated_same_name_contracts_without_shared_identity_produce_no_drift(self):
+        # Adversarial test 1 (D-060 / audit finding): two UNRELATED
+        # contracts that merely share the bare name "Impl" across chains,
+        # with no shared CBOR metadata identity, must NEVER be reported as
+        # a drifted rollout - this is the exact false-match the final audit
+        # confirmed under the old bare-name grouping.
+        sg = self._system_graph([
+            (1, "0xaa", "resolved", 1, "0xaa", "Impl"),
+            (137, "0xbb", "resolved", 137, "0xbb", "Impl"),
+        ])
+        rt_map = {
+            "onchain:/1/0xaa/I.sol#Impl": self._RT_WITH_IDENTITY,  # has an "ipfs" identity
+            "onchain:/137/0xbb/I.sol#Impl": "0x6099",  # no CBOR metadata at all - genuinely unrelated
+        }
+        self.assertEqual(compare_bytecode.check_cross_chain_implementation_drift(sg, rt_map), [])
+
+    def test_missing_identity_on_one_chain_yields_no_drift(self):
+        # Adversarial test 3 (D-060): one chain's implementation carries no
+        # decodable metadata identity at all (absent from the map entirely)
+        # -> excluded from grouping, never guessed, never a false UNAVAILABLE.
+        sg = self._system_graph([
+            (1, "0xaa", "resolved", 1, "0xaa", "Impl"),
+            (137, "0xbb", "resolved", 137, "0xbb", "Impl"),
+        ])
+        rt_map = {"onchain:/1/0xaa/I.sol#Impl": self._RT_WITH_IDENTITY}  # chain 137 entirely absent
+        self.assertEqual(compare_bytecode.check_cross_chain_implementation_drift(sg, rt_map), [])
+
+    def test_single_chain_deployment_produces_no_entry(self):
+        sg = self._system_graph([(1, "0xaa", "resolved", 1, "0xaa", "Impl")])
+        rt_map = {"onchain:/1/0xaa/I.sol#Impl": self._RT_WITH_IDENTITY}
+        self.assertEqual(compare_bytecode.check_cross_chain_implementation_drift(sg, rt_map), [])
+
+    def test_unresolved_proxy_is_excluded_never_guessed_into_a_group(self):
+        # Adversarial (chain isolation, required): an unresolved proxy on a
+        # second chain must never be paired with a resolved one elsewhere.
+        sg = self._system_graph([
+            (1, "0xaa", "resolved", 1, "0xaa", "Impl"),
+            (137, "0xbb", "unresolved", None, None, None),
+        ])
+        rt_map = {"onchain:/1/0xaa/I.sol#Impl": self._RT_WITH_IDENTITY}
+        self.assertEqual(compare_bytecode.check_cross_chain_implementation_drift(sg, rt_map), [])
+
+    def test_no_system_graph_or_no_map_returns_empty(self):
+        self.assertEqual(compare_bytecode.check_cross_chain_implementation_drift(None, {"x": "0x00"}), [])
+        self.assertEqual(compare_bytecode.check_cross_chain_implementation_drift({"proxies": []}, None), [])
+
+    def test_verdicts_stay_within_the_five_allowed(self):
+        allowed = {"MATCH", "MISMATCH", "UNAVAILABLE", "INCOMPLETE", "UNRESOLVED"}
+        sg = self._system_graph([
+            (1, "0xaa", "resolved", 1, "0xaa", "Impl"),
+            (137, "0xbb", "resolved", 137, "0xbb", "Impl"),
+        ])
+        rt_map = {
+            "onchain:/1/0xaa/I.sol#Impl": self._RT_WITH_IDENTITY,
+            "onchain:/137/0xbb/I.sol#Impl": self._RT_WITH_IDENTITY,
+        }
+        for r in compare_bytecode.check_cross_chain_implementation_drift(sg, rt_map):
+            self.assertIn(r["verdict"], allowed)
+
+
+class CborMetadataIdentityHashTests(unittest.TestCase):
+    def test_identity_extracted_from_ipfs_key(self):
+        identity = compare_bytecode._cbor_metadata_identity_hash(
+            "0x" + SAMPLE_RUNTIME_CODE_HEX + SAMPLE_CBOR_HEX
+        )
+        self.assertIsNotNone(identity)
+        self.assertTrue(identity.startswith("ipfs:"))
+
+    def test_same_bytecode_yields_same_identity(self):
+        rt = "0x" + SAMPLE_RUNTIME_CODE_HEX + SAMPLE_CBOR_HEX
+        self.assertEqual(
+            compare_bytecode._cbor_metadata_identity_hash(rt),
+            compare_bytecode._cbor_metadata_identity_hash(rt),
+        )
+
+    def test_no_bytecode_yields_no_identity(self):
+        self.assertIsNone(compare_bytecode._cbor_metadata_identity_hash(None))
+        self.assertIsNone(compare_bytecode._cbor_metadata_identity_hash(""))
+
+    def test_bytecode_without_cbor_metadata_yields_no_identity(self):
+        self.assertIsNone(compare_bytecode._cbor_metadata_identity_hash("0x" + SAMPLE_RUNTIME_CODE_HEX))
+
+    def test_metadata_without_ipfs_or_bzzr_key_yields_no_identity(self):
+        # Only a "solc" key present - a compiler version alone is far too
+        # weak a signal to serve as a cross-chain identity (many unrelated
+        # contracts share a compiler version).
+        solc_only_body = bytes.fromhex(_encode_solc_cbor(b"\x00\x08\x14"))
+        solc_only_hex = solc_only_body.hex() + ("%04x" % len(solc_only_body))
+        self.assertIsNone(
+            compare_bytecode._cbor_metadata_identity_hash("0x" + SAMPLE_RUNTIME_CODE_HEX + solc_only_hex)
+        )
+
+
+class ComparisonsSchemaDriftTests(unittest.TestCase):
+    def test_comparisons_keys_match_schema_required(self):
+        schema = json.loads((REFERENCES_DIR / "bytecode-compare-schema.json").read_text(encoding="utf-8"))
+        required = set(schema["properties"]["comparisons"]["required"])
+        result = compare_bytecode.compare(make_raw_record())
+        self.assertEqual(required, set(result["comparisons"].keys()))
 
 
 if __name__ == "__main__":

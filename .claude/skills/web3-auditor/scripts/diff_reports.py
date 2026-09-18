@@ -325,6 +325,24 @@ def diff_state_variables(c1: Dict[str, Any], c2: Dict[str, Any]) -> Dict[str, An
     return {"stateVariablesAdded": added, "stateVariablesRemoved": removed, "stateVariablesChanged": changed}
 
 
+def _onchain_identity(key: str) -> Optional[Dict[str, Any]]:
+    """For an onchain-sourced contract key ('onchain:/<chainId>/<address>/...',
+    V2.6.1), return {"chainId": int, "address": str}. Independent re-derivation
+    of preprocess.py's own onchain key convention (preprocess.py's own helper
+    is private and is never imported across modules - same rationale as every
+    other independent re-derivation already in this file). Returns None for a
+    local (non-onchain) key - V2.8 Block 2, C-06."""
+    if not isinstance(key, str) or not key.startswith("onchain:/"):
+        return None
+    stripped = key[9:]
+    if stripped.startswith("/"):
+        stripped = stripped[1:]
+    parts = stripped.split("/", 2)
+    if len(parts) < 2 or not parts[0].isdigit():
+        return None
+    return {"chainId": int(parts[0]), "address": parts[1]}
+
+
 def diff_contracts(v1_contracts: List[Dict[str, Any]], v2_contracts: List[Dict[str, Any]]) -> Dict[str, Any]:
     v1_by_key = {c["key"]: c for c in v1_contracts if c.get("key")}
     v2_by_key = {c["key"]: c for c in v2_contracts if c.get("key")}
@@ -339,7 +357,26 @@ def diff_contracts(v1_contracts: List[Dict[str, Any]], v2_contracts: List[Dict[s
         entry.update(diff_state_variables(c1, c2))
         function_surface_delta[key] = entry
 
-    return {"contractsAdded": added, "contractsRemoved": removed, "contractsMatched": matched, "functionSurfaceDelta": function_surface_delta}
+    # V2.8 Block 2 (C-06): surface chain/address identity for onchain-sourced
+    # keys explicitly, instead of leaving a reader to parse it back out of a
+    # long "onchain:/<chainId>/<address>/..." string themselves - prevents a
+    # human/AI diff reviewer from misreading two different chains' contracts
+    # as the same one. Always present (possibly empty) so this dict's own
+    # key set never depends on whether the diff happens to involve onchain
+    # contracts - keeps the schema's additionalProperties:false contract simple.
+    chain_context: Dict[str, Any] = {}
+    for key in added + removed + matched:
+        identity = _onchain_identity(key)
+        if identity is not None:
+            chain_context[key] = identity
+
+    return {
+        "contractsAdded": added,
+        "contractsRemoved": removed,
+        "contractsMatched": matched,
+        "functionSurfaceDelta": function_surface_delta,
+        "chainContext": chain_context,
+    }
 
 
 def _edge_id(edge: Dict[str, Any]) -> Tuple[str, str, str, str, str]:

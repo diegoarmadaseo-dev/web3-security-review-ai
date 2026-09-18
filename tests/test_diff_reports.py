@@ -409,5 +409,51 @@ class SchemaDriftTests(unittest.TestCase):
         self.assertEqual(set(schema["required"]), set(result.keys()))
 
 
+class ChainContextTests(unittest.TestCase):
+    """V2.8 Block 2 (C-06): onchain-sourced contract keys in a preprocess
+    diff must carry an explicit {chainId, address} identity, so a reviewer
+    never has to parse it back out of the raw key string themselves."""
+
+    ADDR = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+    def test_onchain_key_gets_chain_context(self):
+        key = "onchain:/1/%s/Vault.sol#Vault" % self.ADDR
+        v1 = make_preprocess([])
+        v2 = make_preprocess([make_contract(key)])
+        result = diff_reports.diff_preprocess(v1, v2)
+        self.assertEqual(result["chainContext"], {key: {"chainId": 1, "address": self.ADDR}})
+        self.assertIn(key, result["contractsAdded"])
+
+    def test_local_key_never_appears_in_chain_context(self):
+        # Negative control: a purely local contract must never be assigned
+        # a fabricated chain identity.
+        v1 = make_preprocess([])
+        v2 = make_preprocess([make_contract("Vault.sol#Vault")])
+        result = diff_reports.diff_preprocess(v1, v2)
+        self.assertEqual(result["chainContext"], {})
+
+    def test_chain_context_always_present_even_when_empty(self):
+        v1 = make_preprocess([make_contract("A.sol#A")])
+        result = diff_reports.diff_preprocess(v1, v1)
+        self.assertIn("chainContext", result)
+        self.assertEqual(result["chainContext"], {})
+
+    def test_two_chains_never_conflated_in_chain_context(self):
+        # Adversarial (chain isolation): same address, two different chains,
+        # each must carry its OWN correct chainId - never mixed up.
+        key1 = "onchain:/1/%s/Vault.sol#Vault" % self.ADDR
+        key137 = "onchain:/137/%s/Vault.sol#Vault" % self.ADDR
+        v1 = make_preprocess([])
+        v2 = make_preprocess([make_contract(key1), make_contract(key137)])
+        result = diff_reports.diff_preprocess(v1, v2)
+        self.assertEqual(result["chainContext"][key1]["chainId"], 1)
+        self.assertEqual(result["chainContext"][key137]["chainId"], 137)
+
+    def test_malformed_onchain_looking_key_is_skipped_not_crashed(self):
+        self.assertIsNone(diff_reports._onchain_identity("onchain:/not-a-number/addr/Vault.sol#Vault"))
+        self.assertIsNone(diff_reports._onchain_identity("Vault.sol#Vault"))
+        self.assertIsNone(diff_reports._onchain_identity(None))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -89,8 +89,44 @@ def _category_label(category: str) -> str:
     return "%s (%s)" % (category, name) if name else category
 
 
+def _onchain_location_prefix(file_path: str) -> Optional[str]:
+    """For an onchain-sourced location ('onchain:/<chainId>/<address>/...',
+    V2.6.1), return a short '[chain <name-or-id> - 0xabcd...ef01]' prefix so
+    a reader scanning a report never mistakes two different chains' findings
+    for the same contract just because the file#contract#function suffix
+    looks similar (V2.8 Block 2, C-06). Returns None for local paths - never
+    affects a non-onchain finding's rendering.
+
+    Broad exception handling is intentional and safe HERE ONLY: this is a
+    display label, never an identity or trust decision (contrast with
+    ingest_onchain.py's normalize_network, D-058, where broad catching would
+    have hidden a real correctness bug). Worst case on any lookup failure is
+    a plain chainId shown instead of its friendly name - never wrong data,
+    never a crash of the whole report."""
+    if not file_path.startswith("onchain:/"):
+        return None
+    stripped = file_path[9:]
+    if stripped.startswith("/"):
+        stripped = stripped[1:]
+    parts = stripped.split("/", 2)
+    if len(parts) < 2 or not parts[0].isdigit():
+        return None
+    chain_id_str, address = parts[0], parts[1]
+    chain_label = chain_id_str
+    try:
+        import chains as _chains
+        meta = _chains.get_chain_capabilities(int(chain_id_str))
+        if meta.get("isKnown") and meta.get("name"):
+            chain_label = "%s (%s)" % (meta["name"], chain_id_str)
+    except Exception:
+        pass
+    short_addr = ("%s...%s" % (address[:6], address[-4:])) if len(address) > 12 else address
+    return "[chain %s - %s]" % (chain_label, short_addr)
+
+
 def _location_text(loc: Dict[str, Any]) -> str:
-    parts = [str(loc.get("file", ""))]
+    file_field = str(loc.get("file", ""))
+    parts = [file_field]
     if loc.get("contract"):
         parts.append(str(loc["contract"]))
     if loc.get("function"):
@@ -101,7 +137,8 @@ def _location_text(loc: Dict[str, Any]) -> str:
         if loc.get("lineEnd") and loc["lineEnd"] != loc["lineStart"]:
             line_text = "lines %s-%s" % (loc["lineStart"], loc["lineEnd"])
         text = "%s (%s)" % (text, line_text)
-    return text
+    prefix = _onchain_location_prefix(file_field)
+    return "%s %s" % (prefix, text) if prefix else text
 
 
 def _sorted_findings(findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

@@ -420,5 +420,88 @@ class SchemaDriftTests(unittest.TestCase):
         self.assertTrue(produced.issubset(declared), produced - declared)
 
 
+class DuplicateIdentityConflictTests(unittest.TestCase):
+    """V2.8 Block 2 (C-04): find_contradictory_duplicate_identities must
+    detect two records claiming the same (chainId, address) with
+    disagreeing fields, and must never pick a side or guess which is
+    'correct' - only report."""
+
+    def test_contradictory_verified_field_is_detected(self):
+        records = [
+            {"address": ADDR_MIXED, "network": "ethereum", "verified": True, "contractName": "Vault"},
+            {"address": ADDR_LOWER, "network": 1, "verified": False, "contractName": "Vault"},
+        ]
+        conflicts = ingest_onchain.find_contradictory_duplicate_identities(records)
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0]["chainId"], 1)
+        self.assertEqual(conflicts[0]["address"], ADDR_LOWER)
+        self.assertEqual(conflicts[0]["disagreements"]["verified"], [True, False])
+        self.assertEqual(conflicts[0]["recordIndices"], [0, 1])
+
+    def test_contradictory_contract_name_is_detected(self):
+        records = [
+            {"address": ADDR_MIXED, "network": "ethereum", "verified": True, "contractName": "Vault"},
+            {"address": ADDR_MIXED, "network": "ethereum", "verified": True, "contractName": "NotVault"},
+        ]
+        conflicts = ingest_onchain.find_contradictory_duplicate_identities(records)
+        self.assertEqual(conflicts[0]["disagreements"]["contractName"], ["Vault", "NotVault"])
+
+    def test_multiple_disagreeing_fields_all_reported(self):
+        records = [
+            {"address": ADDR_MIXED, "network": "ethereum", "verified": True, "contractName": "A", "compilerVersion": "0.8.19"},
+            {"address": ADDR_MIXED, "network": "ethereum", "verified": False, "contractName": "B", "compilerVersion": "0.8.20"},
+        ]
+        conflicts = ingest_onchain.find_contradictory_duplicate_identities(records)
+        self.assertEqual(set(conflicts[0]["disagreements"].keys()), {"verified", "contractName", "compilerVersion"})
+
+    def test_identical_duplicate_is_not_a_conflict(self):
+        rec = {"address": ADDR_MIXED, "network": "ethereum", "verified": True, "contractName": "Vault"}
+        conflicts = ingest_onchain.find_contradictory_duplicate_identities([dict(rec), dict(rec)])
+        self.assertEqual(conflicts, [])
+
+    def test_different_addresses_are_never_flagged(self):
+        records = [
+            {"address": ADDR_MIXED, "network": "ethereum", "verified": True, "contractName": "A"},
+            {"address": "0x2222222222222222222222222222222222222222", "network": "ethereum", "verified": False, "contractName": "B"},
+        ]
+        self.assertEqual(ingest_onchain.find_contradictory_duplicate_identities(records), [])
+
+    def test_same_address_on_a_different_chain_is_never_flagged(self):
+        # Adversarial (chain isolation, required): identical address, but a
+        # DIFFERENT chain is a completely different identity - must never be
+        # treated as the same (chainId, address) pair.
+        records = [
+            {"address": ADDR_MIXED, "network": "ethereum", "verified": True, "contractName": "A"},
+            {"address": ADDR_MIXED, "network": "polygon", "verified": False, "contractName": "Completely Different"},
+        ]
+        self.assertEqual(ingest_onchain.find_contradictory_duplicate_identities(records), [])
+
+    def test_unresolvable_identity_is_skipped_not_crashed(self):
+        # Adversarial: malformed address/network in one or more records must
+        # never raise - those records are simply not this function's concern.
+        records = [
+            {"address": "not-an-address", "network": "ethereum", "verified": True},
+            {"address": ADDR_MIXED, "network": "made-up-chain", "verified": False},
+            {"address": ADDR_MIXED, "network": "ethereum", "verified": True, "contractName": "Vault"},
+        ]
+        conflicts = ingest_onchain.find_contradictory_duplicate_identities(records)
+        self.assertEqual(conflicts, [])  # only one resolvable record -> no duplicate possible
+
+    def test_non_dict_records_are_skipped_not_crashed(self):
+        records = ["not-a-dict", None, {"address": ADDR_MIXED, "network": "ethereum", "verified": True}]
+        conflicts = ingest_onchain.find_contradictory_duplicate_identities(records)
+        self.assertEqual(conflicts, [])
+
+    def test_three_or_more_records_same_identity_all_indices_reported(self):
+        records = [
+            {"address": ADDR_MIXED, "network": "ethereum", "verified": True},
+            {"address": ADDR_MIXED, "network": "ethereum", "verified": False},
+            {"address": ADDR_MIXED, "network": "ethereum", "verified": True},
+        ]
+        conflicts = ingest_onchain.find_contradictory_duplicate_identities(records)
+        self.assertEqual(conflicts[0]["recordIndices"], [0, 1, 2])
+        self.assertEqual(set(conflicts[0]["disagreements"]["verified"]), {True, False})
+
+
 if __name__ == "__main__":
     unittest.main()

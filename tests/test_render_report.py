@@ -284,5 +284,54 @@ class CLITests(unittest.TestCase):
         self.assertIn("<!doctype html>", out)
 
 
+class OnchainLocationPrefixTests(unittest.TestCase):
+    """V2.8 Block 2 (C-06): an onchain-sourced location must surface its
+    chain identity prominently, so a reader scanning a report never
+    mistakes two different chains' findings for the same contract."""
+
+    ADDR = "0xabcdef0123456789012345678901234567890123"
+
+    def test_onchain_location_gets_a_chain_prefix(self):
+        loc = {"file": "onchain:/1/%s/Vault.sol" % self.ADDR, "contract": "Vault", "function": "withdraw", "lineStart": 12}
+        text = render_report._location_text(loc)
+        self.assertTrue(text.startswith("[chain ethereum (1)"))
+        # Full original text is still present - purely additive, nothing removed.
+        self.assertIn("onchain:/1/%s/Vault.sol#Vault#withdraw (line 12)" % self.ADDR, text)
+
+    def test_local_location_gets_no_prefix(self):
+        # Negative control: a non-onchain finding's rendering must be
+        # byte-for-byte unaffected by this change.
+        loc = {"file": "Vault.sol", "contract": "Vault", "function": "withdraw", "lineStart": 12}
+        text = render_report._location_text(loc)
+        self.assertFalse(text.startswith("[chain"))
+        self.assertEqual(text, "Vault.sol#Vault#withdraw (line 12)")
+
+    def test_unknown_chain_falls_back_to_numeric_id(self):
+        loc = {"file": "onchain:/999999999/%s/Vault.sol" % self.ADDR, "contract": "Vault"}
+        text = render_report._location_text(loc)
+        self.assertTrue(text.startswith("[chain 999999999"))
+
+    def test_two_different_chains_render_visibly_differently(self):
+        # The core risk this fixes: same file#contract#function suffix,
+        # different chains - must not look identical at a glance.
+        loc1 = {"file": "onchain:/1/%s/Vault.sol" % self.ADDR, "contract": "Vault"}
+        loc2 = {"file": "onchain:/137/%s/Vault.sol" % self.ADDR, "contract": "Vault"}
+        text1, text2 = render_report._location_text(loc1), render_report._location_text(loc2)
+        self.assertNotEqual(text1.split("]")[0], text2.split("]")[0])
+
+    def test_broken_chain_lookup_never_crashes_rendering(self):
+        # Adversarial: this is a display-only helper - any lookup failure
+        # must degrade to the bare chainId, never raise.
+        import chains
+        with mock.patch.object(chains, "get_chain_capabilities", side_effect=RuntimeError("boom")):
+            loc = {"file": "onchain:/1/%s/Vault.sol" % self.ADDR, "contract": "Vault"}
+            text = render_report._location_text(loc)
+        self.assertTrue(text.startswith("[chain 1"))
+
+    def test_malformed_onchain_path_returns_none_prefix_not_a_crash(self):
+        self.assertIsNone(render_report._onchain_location_prefix("onchain:/not-a-number/0xabc/Vault.sol"))
+        self.assertIsNone(render_report._onchain_location_prefix("onchain:/"))
+
+
 if __name__ == "__main__":
     unittest.main()
