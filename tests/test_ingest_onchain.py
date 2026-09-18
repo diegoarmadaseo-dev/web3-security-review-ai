@@ -12,12 +12,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / ".claude" / "skills" / "web3-auditor" / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
+import chains  # noqa: E402
 import ingest_onchain  # noqa: E402
 import preprocess  # noqa: E402
 
@@ -99,6 +101,24 @@ class NetworkNormalizationTests(unittest.TestCase):
         chain_id, name, error = ingest_onchain.normalize_network(True)
         self.assertIsNone(chain_id)
         self.assertIsNotNone(error)
+
+
+class NormalizeNetworkExceptionHandlingTests(unittest.TestCase):
+    """normalize_network must fall back to the legacy table ONLY on
+    chains.ChainsConfigError (a broken/missing/malformed chains.json) -
+    regression coverage for the V2.8 first-block repair (D-058): the
+    original `except Exception: pass` would have silently swallowed ANY
+    bug in chains.py too, masking real defects instead of surfacing them."""
+
+    def test_chains_config_error_falls_back_to_legacy_table(self):
+        with mock.patch.object(chains, "resolve_chain", side_effect=chains.ChainsConfigError("broken catalog")):
+            chain_id, name, error = ingest_onchain.normalize_network("ethereum")
+        self.assertEqual((chain_id, name, error), (1, "ethereum", None))
+
+    def test_unexpected_exception_is_never_swallowed(self):
+        with mock.patch.object(chains, "resolve_chain", side_effect=RuntimeError("unexpected bug")):
+            with self.assertRaises(RuntimeError):
+                ingest_onchain.normalize_network("ethereum")
 
 
 class SourceFileSafetyTests(unittest.TestCase):

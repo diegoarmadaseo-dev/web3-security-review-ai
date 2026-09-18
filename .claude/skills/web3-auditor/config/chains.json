@@ -1,0 +1,138 @@
+{
+  "$schema": "../references/chains-schema.json",
+  "catalogVersion": "2026.1",
+  "chains": [
+    {
+      "chainId": 1,
+      "name": "ethereum",
+      "aliases": ["mainnet", "eth"],
+      "type": "l1",
+      "evmVersion": "cancun",
+      "capabilities": {
+        "supportsPush0": true,
+        "supportsTransientStorage": true,
+        "supportsCancun": true
+      }
+    },
+    {
+      "chainId": 5,
+      "name": "goerli",
+      "aliases": [],
+      "type": "testnet",
+      "evmVersion": "shanghai",
+      "capabilities": {
+        "supportsPush0": true,
+        "supportsTransientStorage": false,
+        "supportsCancun": false
+      }
+    },
+    {
+      "chainId": 10,
+      "name": "optimism",
+      "aliases": ["op"],
+      "type": "rollup-optimistic",
+      "evmVersion": "canyon",
+      "capabilities": {
+        "supportsPush0": true,
+        "supportsTransientStorage": false,
+        "supportsCancun": false
+      }
+    },
+    {
+      "chainId": 56,
+      "name": "bsc",
+      "aliases": ["binance", "bnb"],
+      "type": "sidechain",
+      "evmVersion": "shanghai",
+      "capabilities": {
+        "supportsPush0": true,
+        "supportsTransientStorage": false,
+        "supportsCancun": false
+      }
+    },
+    {
+      "chainId": 100,
+      "name": "gnosis",
+      "aliases": ["xdai"],
+      "type": "sidechain",
+      "evmVersion": "shanghai",
+      "capabilities": {
+        "supportsPush0": true,
+        "supportsTransientStorage": false,
+        "supportsCancun": false
+      }
+    },
+    {
+      "chainId": 137,
+      "name": "polygon",
+      "aliases": ["matic"],
+      "type": "sidechain",
+      "evmVersion": "shanghai",
+      "capabilities": {
+        "supportsPush0": true,
+        "supportsTransientStorage": false,
+        "supportsCancun": false
+      }
+    },
+    {
+      "chainId": 250,
+      "name": "fantom",
+      "aliases": ["ftm"],
+      "type": "sidechain",
+      "evmVersion": "paris",
+      "capabilities": {
+        "supportsPush0": false,
+        "supportsTransientStorage": false,
+        "supportsCancun": false
+      }
+    },
+    {
+      "chainId": 8453,
+      "name": "base",
+      "aliases": [],
+      "type": "rollup-optimistic",
+      "evmVersion": "canyon",
+      "capabilities": {
+        "supportsPush0": true,
+        "supportsTransientStorage": false,
+        "supportsCancun": false
+      }
+    },
+    {
+      "chainId": 42161,
+      "name": "arbitrum",
+      "aliases": ["arb"],
+      "type": "rollup-optimistic",
+      "evmVersion": "arb-os",
+      "capabilities": {
+        "supportsPush0": true,
+        "supportsTransientStorage": false,
+        "supportsCancun": false
+      }
+    },
+    {
+      "chainId": 43114,
+      "name": "avalanche",
+      "aliases": ["avax"],
+      "type": "sidechain",
+      "evmVersion": "shanghai",
+      "capabilities": {
+        "supportsPush0": true,
+        "supportsTransientStorage": false,
+        "supportsCancun": false
+      }
+    },
+    {
+      "chainId": 11155111,
+      "name": "sepolia",
+      "aliases": [],
+      "type": "testnet",
+      "evmVersion": "cancun",
+      "capabilities": {
+        "supportsPush0": true,
+        "supportsTransientStorage": true,
+        "supportsCancun": true
+      }
+    }
+  ]
+}

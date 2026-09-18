@@ -129,7 +129,16 @@ def normalize_address(raw: Any) -> Tuple[Optional[str], Optional[str]]:
 
 
 def normalize_network(raw: Any) -> Tuple[Optional[int], Optional[str], Optional[str]]:
-    """Returns (chainId, name_or_None, error_reason_or_None)."""
+    """Returns (chainId, name_or_None, error_reason_or_None). (V2.8: uses chains.py)"""
+    import chains
+    try:
+        return chains.resolve_chain(raw)
+    except chains.ChainsConfigError:
+        # Only a broken/missing/malformed chains.json falls back to the
+        # legacy hardcoded table below - any OTHER exception (a real bug in
+        # chains.py) must propagate, never be silently swallowed.
+        pass
+
     if isinstance(raw, dict):
         raw = raw.get("chainId")
     if isinstance(raw, bool):

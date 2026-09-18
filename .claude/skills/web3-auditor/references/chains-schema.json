@@ -1,0 +1,83 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "web3-security-review-ai/chains-schema.json",
+  "title": "EVM Chain Catalog and Capabilities (V2.8)",
+  "description": "Reference schema for config/chains.json. Defines the canonical EVM chains catalog, chain metadata, aliases, and hardware/compiler capabilities without coupling detectors to network names (docs/decisiones.md D-058).",
+  "type": "object",
+  "required": ["catalogVersion", "chains"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "JSON schema reference URI."
+    },
+    "catalogVersion": {
+      "type": "string",
+      "description": "Version of the chains catalog schema/data."
+    },
+    "chains": {
+      "type": "array",
+      "description": "List of recognized EVM chain definitions. chainId must be unique.",
+      "items": {
+        "type": "object",
+        "required": ["chainId", "name", "type", "evmVersion", "capabilities"],
+        "additionalProperties": false,
+        "properties": {
+          "chainId": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Canonical EIP-155 integer chain ID. Primary identity."
+          },
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z0-9-]+$",
+            "description": "Canonical lowercase network name."
+          },
+          "aliases": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z0-9-]+$"
+            },
+            "description": "Alternative names/aliases resolving to this chainId."
+          },
+          "type": {
+            "type": "string",
+            "enum": ["l1", "rollup-optimistic", "rollup-zk", "sidechain", "testnet", "appchain"],
+            "description": "Architecture category of the EVM chain."
+          },
+          "evmVersion": {
+            "type": "string",
+            "description": "Default or active EVM specification target (e.g. cancun, shanghai, paris)."
+          },
+          "capabilities": {
+            "type": "object",
+            "description": "Feature and opcode availability flags for this chain.",
+            "required": ["supportsPush0", "supportsTransientStorage"],
+            "additionalProperties": false,
+            "properties": {
+              "supportsPush0": {
+                "type": "boolean",
+                "description": "True if PUSH0 opcode (Shanghai+) is natively supported."
+              },
+              "supportsTransientStorage": {
+                "type": "boolean",
+                "description": "True if TSTORE/TLOAD opcodes (Cancun+) are supported."
+              },
+              "supportsCancun": {
+                "type": "boolean",
+                "description": "True if full Cancun EVM specification is active."
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "businessRules": [
+    "R-K1: chainId (numeric integer) is the single canonical identity of an EVM network.",
+    "R-K2: Detectors must check capabilities flags (e.g. supportsPush0), never branch on network name strings.",
+    "R-K3: Unknown chains (not in catalog) are represented with isKnown=False and empty capabilities without guessing.",
+    "R-K4: Same contract address on different chainIds must never collide or cross-contaminate systemGraph or analysis."
+  ]
+}

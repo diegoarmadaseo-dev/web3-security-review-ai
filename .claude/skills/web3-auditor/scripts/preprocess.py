@@ -1535,6 +1535,23 @@ def _contract_name_index(contracts_out: List[Dict[str, Any]]) -> Dict[str, List[
     return index
 
 
+def _onchain_chain_id(path_or_key: str) -> Optional[str]:
+    """Extract chainId string from onchain virtual path or contract key (V2.8).
+    Examples:
+      'onchain:/1/0xabc.../Foo.sol#Foo' -> '1'
+      'onchain://1/0xabc.../Foo.sol' -> '1'
+    Returns None for local filesystem paths.
+    """
+    if path_or_key.startswith("onchain:/"):
+        stripped = path_or_key[9:]
+        if stripped.startswith("/"):
+            stripped = stripped[1:]
+        parts = stripped.split("/", 1)
+        if parts and parts[0].isdigit():
+            return parts[0]
+    return None
+
+
 def compute_system_graph(
     contracts_out: List[Dict[str, Any]],
     all_calls: List[Dict[str, Any]],
@@ -1554,8 +1571,11 @@ def compute_system_graph(
     for c in contracts_out:
         if not c.get("key"):
             continue
+        c_chain = _onchain_chain_id(c["key"])
         for base in c.get("basesResolved", []):
             candidates = name_index.get(base["name"], [])
+            if c_chain is not None:
+                candidates = [cand for cand in candidates if _onchain_chain_id(cand) == c_chain]
             if len(candidates) == 1:
                 edges.append({"kind": "inherits", "from": c["key"], "to": candidates[0]})
 
@@ -1563,8 +1583,12 @@ def compute_system_graph(
         from_key = key_by_file_name.get((call.get("file"), call.get("contract")))
         callee_type = call.get("calleeType")
         to_candidates = name_index.get(callee_type, []) if callee_type else []
-        if from_key and len(to_candidates) == 1:
-            edges.append({"kind": "calls", "from": from_key, "to": to_candidates[0], "function": call.get("function"), "line": call.get("line"), "method": call.get("method")})
+        if from_key:
+            from_chain = _onchain_chain_id(from_key)
+            if from_chain is not None:
+                to_candidates = [cand for cand in to_candidates if _onchain_chain_id(cand) == from_chain]
+            if len(to_candidates) == 1:
+                edges.append({"kind": "calls", "from": from_key, "to": to_candidates[0], "function": call.get("function"), "line": call.get("line"), "method": call.get("method")})
 
     proxy_signals = [s for s in all_signals if s["family"] == "proxy-pattern"]
     delegatecall_signals = [s for s in all_signals if s["family"] == "delegatecall"]
@@ -1573,6 +1597,7 @@ def compute_system_graph(
         proxy_key = key_by_file_name.get((ps["file"], ps["contract"]))
         if not proxy_key:
             continue
+        proxy_chain = _onchain_chain_id(proxy_key)
         site_candidates = [d for d in delegatecall_signals if d["file"] == ps["file"] and d["contract"] == ps["contract"]]
         fallback_hits = [d for d in site_candidates if d["details"].get("inFallback")]
         chosen = fallback_hits or site_candidates
@@ -1584,6 +1609,8 @@ def compute_system_graph(
             sv = state_vars_by_key.get(proxy_key, {}).get(target) if target else None
             user_type = sv.get("userType") if sv else None
             impl_candidates = name_index.get(user_type, []) if user_type else []
+            if proxy_chain is not None:
+                impl_candidates = [cand for cand in impl_candidates if _onchain_chain_id(cand) == proxy_chain]
             if not target:
                 entry["reason"] = "delegatecall target is not a simple identifier (e.g. an inline expression or raw assembly slot)"
             elif not sv:
