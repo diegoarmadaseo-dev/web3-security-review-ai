@@ -1,0 +1,97 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "web3-security-review-ai/pr-gate-schema.json",
+  "title": "Provider-Agnostic PR/CI Security Gate (V2.10)",
+  "description": "Reference shapes for scripts/pr_gate.py's two output modes (docs/decisiones.md D-065). This script NEVER makes a network call, NEVER holds credentials, and NEVER posts a comment/annotation/commit status itself - it is provider-agnostic by construction (nothing here names a specific Git hosting provider). It reuses ingest_onchain.build_bundle() and diff_reports.diff_reports()/score.compute_stable_key UNCHANGED.",
+  "oneOf": [
+    { "$ref": "#/definitions/ingestResult" },
+    { "$ref": "#/definitions/gateResult" }
+  ],
+  "definitions": {
+    "ingestResult": {
+      "type": "object",
+      "description": "G1. Output of ingest_pr_changed_files() / CLI mode 'ingest'.",
+      "required": ["prGateVersion", "refLabel", "bundle", "acceptedFileCount", "skippedFiles"],
+      "additionalProperties": false,
+      "properties": {
+        "prGateVersion": { "type": "string" },
+        "refLabel": { "type": "string", "description": "Opaque caller-supplied label (e.g. 'base'/'head' or a real SHA) - never parsed or validated as a real git ref." },
+        "bundle": { "type": ["string", "null"], "description": "preprocess.py-ready multi-file bundle text, or null when zero files were accepted (e.g. an empty PR)." },
+        "acceptedFileCount": { "type": "integer", "minimum": 0 },
+        "skippedFiles": {
+          "type": "array",
+          "description": "Reused verbatim from ingest_onchain.build_bundle() - malicious paths, duplicates, and bundle-marker-injection attempts are recorded here, never silently dropped.",
+          "items": {
+            "type": "object",
+            "required": ["path", "reason"],
+            "additionalProperties": false,
+            "properties": {
+              "path": { "type": ["string", "null"] },
+              "reason": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "gateResult": {
+      "type": "object",
+      "description": "G2+G3+G4. Output of evaluate_pr_gate() / CLI mode 'gate'.",
+      "required": ["prGateVersion", "gateStatus", "policy", "diff", "blockingFindingCount", "annotations", "note", "boundaryNote"],
+      "additionalProperties": false,
+      "properties": {
+        "prGateVersion": { "type": "string" },
+        "gateStatus": { "enum": ["PASS", "FAIL"] },
+        "policy": {
+          "type": "object",
+          "required": ["blockingSeverities"],
+          "additionalProperties": false,
+          "properties": {
+            "blockingSeverities": {
+              "type": "array",
+              "description": "Always an explicit caller input, echoed back verbatim (de-duplicated) - never hardcoded, never guessed.",
+              "items": { "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFORMATIONAL"] }
+            }
+          }
+        },
+        "diff": {
+          "type": "object",
+          "description": "The UNMODIFIED output of diff_reports.diff_reports() (see version-diff-reports-schema.json / D-054) - newFindings/resolvedFindings/modifiedFindings, categoryCoverageDelta, etc."
+        },
+        "blockingFindingCount": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Count of diff.newFindings whose severity is in policy.blockingSeverities. resolvedFindings/modifiedFindings are NEVER counted here."
+        },
+        "annotations": {
+          "type": "array",
+          "description": "G4. Built from ALL diff.newFindings (not only blocking ones) so a CI comment can surface everything new, not just what fails the build. Purely structured - no free-text field, no source/diff reproduction.",
+          "items": {
+            "type": "object",
+            "required": ["file", "lineStart", "lineEnd", "contract", "function", "severity", "category", "stableKey"],
+            "additionalProperties": false,
+            "properties": {
+              "file": { "type": ["string", "null"] },
+              "lineStart": { "type": ["integer", "null"] },
+              "lineEnd": { "type": ["integer", "null"] },
+              "contract": { "type": ["string", "null"] },
+              "function": { "type": ["string", "null"] },
+              "severity": { "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFORMATIONAL"] },
+              "category": { "type": ["string", "null"] },
+              "stableKey": { "type": "string" }
+            }
+          }
+        },
+        "note": { "type": "string" },
+        "boundaryNote": { "type": "string" }
+      }
+    }
+  },
+  "businessRules": [
+    "R-G1: ingest_pr_changed_files() reuses ingest_onchain.build_bundle() UNCHANGED - path sanitization, duplicate rejection, and bundle-marker-injection rejection are never re-derived, since a PR's changed files are exactly as untrusted as explorer-sourced files.",
+    "R-G2: evaluate_pr_gate()'s diff field is the UNMODIFIED output of diff_reports.diff_reports() (V2.5/D-054) - this module never re-implements finding matching/stableKey logic.",
+    "R-G3: The gate decision (gateStatus/blockingFindingCount) considers ONLY diff.newFindings. resolvedFindings and modifiedFindings describe the baseline's own pre-existing history and NEVER affect the gate. policy.blockingSeverities is a REQUIRED, explicit caller input - this module has no hardcoded threshold and no code path that invents one.",
+    "R-G4: annotations[] contains ONLY structured, bounded fields (file/lineStart/lineEnd/contract/function/severity/category/stableKey) - it NEVER includes a finding's free-text description/evidence/recommendation/patch fields or any reproduction of source/diff content, so an embedded secret can never be echoed into a PR comment/annotation built from it.",
+    "R-G5: This module makes no network/API calls, holds no credentials, and posts nothing itself - permissions/authentication, retries/timeouts/rate limits, and the actual comment/annotation/commit-status API calls are entirely the calling CI workflow's responsibility.",
+    "R-G6: A PASS gateStatus is never proof of safety - it only reflects what this comparison, under the caller's own policy, could determine from the two reports it was given (see NEVER_SAFE_BY_SILENCE_NOTE)."
+  ]
+}
