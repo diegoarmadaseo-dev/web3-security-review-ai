@@ -249,13 +249,22 @@ def _force_utf8_stdio() -> None:
                 pass
 
 
-def _read_json_file(path: str) -> Any:
-    with open(path, "r", encoding="utf-8") as handle:
-        raw = handle.read()
+def _read_json_file(path: Optional[str]) -> Any:
+    """path=None reads stdin instead (V2.11, A-04) - same fallback already
+    established by ingest_onchain.py/score.py/validate_report.py/
+    render_report.py/compare_bytecode.py. Only "ingest" (a single JSON
+    input) exposes this; "gate" keeps 3 required file arguments, which has
+    no single-optional-positional precedent to copy without inventing a new
+    convention."""
+    if path:
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = handle.read()
+    else:
+        raw = sys.stdin.read()
     try:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise PrGateError("%s is not valid JSON: %s" % (path, exc)) from exc
+        raise PrGateError("%s is not valid JSON: %s" % (path or "stdin", exc)) from exc
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -269,7 +278,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="gate_mode", required=True)
 
     ingest_parser = subparsers.add_parser("ingest", help="Build a preprocess.py-ready bundle from one ref's already-fetched changed files.")
-    ingest_parser.add_argument("input", help="Path to a JSON file: {\"refLabel\": str, \"changedFiles\": [{\"path\",\"content\"}, ...]}")
+    ingest_parser.add_argument("input", nargs="?", default=None, help="Path to a JSON file: {\"refLabel\": str, \"changedFiles\": [{\"path\",\"content\"}, ...]}. Reads stdin if omitted.")
     ingest_parser.add_argument("--out", default=None, help="Write the result to this file instead of stdout.")
     ingest_parser.add_argument("--indent", type=int, default=2, help="JSON indentation (0 for compact output).")
 
@@ -290,7 +299,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         if args.gate_mode == "ingest":
             payload = _read_json_file(args.input)
-            _require(isinstance(payload, dict), "%s must contain a JSON object" % args.input)
+            _require(isinstance(payload, dict), "%s must contain a JSON object" % (args.input or "stdin"))
             result = ingest_pr_changed_files(payload.get("refLabel"), payload.get("changedFiles"))
         else:
             base_report = _read_json_file(args.base_report)

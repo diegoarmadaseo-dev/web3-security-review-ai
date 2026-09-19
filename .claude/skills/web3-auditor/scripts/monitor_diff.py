@@ -486,13 +486,22 @@ def _force_utf8_stdio() -> None:
                 pass
 
 
-def _read_json_file(path: str) -> Any:
-    with open(path, "r", encoding="utf-8") as handle:
-        raw = handle.read()
+def _read_json_file(path: Optional[str]) -> Any:
+    """path=None reads stdin instead (V2.11, A-04) - same fallback already
+    established by ingest_onchain.py/score.py/validate_report.py/
+    render_report.py/compare_bytecode.py. Only "finding-lifecycle" (a single
+    JSON input) exposes this; "snapshot-drift" keeps 2 required file
+    arguments, which has no single-optional-positional precedent to copy
+    without inventing a new convention."""
+    if path:
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = handle.read()
+    else:
+        raw = sys.stdin.read()
     try:
         return json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise MonitorDiffError("%s is not valid JSON: %s" % (path, exc)) from exc
+        raise MonitorDiffError("%s is not valid JSON: %s" % (path or "stdin", exc)) from exc
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -513,7 +522,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     drift_parser.add_argument("--indent", type=int, default=2, help="JSON indentation (0 for compact output).")
 
     lifecycle_parser = subparsers.add_parser("finding-lifecycle", help="Track finding new/resolved/regressed status across an ordered sequence of scans.")
-    lifecycle_parser.add_argument("scans", help="Path to a JSON file containing {\"scans\": [...]} in chronological order.")
+    lifecycle_parser.add_argument("scans", nargs="?", default=None, help="Path to a JSON file containing {\"scans\": [...]} in chronological order. Reads stdin if omitted.")
     lifecycle_parser.add_argument("--out", default=None, help="Write the result to this file instead of stdout.")
     lifecycle_parser.add_argument("--indent", type=int, default=2, help="JSON indentation (0 for compact output).")
 
@@ -532,7 +541,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             payload = _read_json_file(args.scans)
             _require(isinstance(payload, dict) and isinstance(payload.get("scans"), list),
-                      "%s must contain a JSON object with a 'scans' array" % args.scans)
+                      "%s must contain a JSON object with a 'scans' array" % (args.scans or "stdin"))
             result = compute_finding_lifecycle(payload["scans"])
     except (MonitorDiffError, DiffError, OSError, json.JSONDecodeError) as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False), file=sys.stdout)

@@ -444,6 +444,43 @@ class CliTests(unittest.TestCase):
             self.assertEqual(exit_code, monitor_diff.EXIT_FAILED)
             self.assertFalse(json.loads(out)["ok"])
 
+    def _run_cli_with_stdin(self, argv, stdin_text):
+        old_stdin = sys.stdin
+        sys.stdin = io.StringIO(stdin_text)
+        try:
+            return self._run_cli(argv)
+        finally:
+            sys.stdin = old_stdin
+
+    def test_finding_lifecycle_reads_from_stdin_when_scans_omitted(self):
+        # V2.10 -> V2.11 (A-04): "finding-lifecycle" now matches the stdin
+        # fallback every other single-file script CLI already has.
+        payload = {"scans": [{"snapshotTimestamp": "t1", "report": {"findings": [], "categoryCoverage": []}}]}
+        exit_code, out = self._run_cli_with_stdin(["finding-lifecycle"], json.dumps(payload))
+        self.assertEqual(exit_code, monitor_diff.EXIT_OK)
+        self.assertEqual(json.loads(out)["scanCount"], 1)
+
+    def test_finding_lifecycle_stdin_result_matches_file_based_result(self):
+        payload = {"scans": [{"snapshotTimestamp": "t1", "report": {"findings": [], "categoryCoverage": []}}]}
+        stdin_exit, stdin_out = self._run_cli_with_stdin(["finding-lifecycle"], json.dumps(payload))
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "scans.json"
+            p.write_text(json.dumps(payload), encoding="utf-8")
+            file_exit, file_out = self._run_cli(["finding-lifecycle", str(p)])
+        self.assertEqual(stdin_exit, file_exit)
+        self.assertEqual(stdin_out, file_out)
+
+    def test_finding_lifecycle_malformed_stdin_error_mentions_stdin(self):
+        exit_code, out = self._run_cli_with_stdin(["finding-lifecycle"], "not json")
+        self.assertEqual(exit_code, monitor_diff.EXIT_FAILED)
+        self.assertIn("stdin", json.loads(out)["error"])
+
+    def test_snapshot_drift_still_requires_both_file_arguments(self):
+        # A-04 explicitly does NOT extend "snapshot-drift" (2 required
+        # files) - no single-optional-positional precedent exists to copy.
+        with self.assertRaises(SystemExit):
+            monitor_diff.main(["snapshot-drift", "only_one.json"])
+
 
 # ---------------------------------------------------------------------------
 # Schema drift

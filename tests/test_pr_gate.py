@@ -328,6 +328,45 @@ class CliTests(unittest.TestCase):
             self.assertFalse(envelope["ok"])
             self.assertIn("error", envelope)
 
+    def _run_cli_with_stdin(self, argv, stdin_text):
+        old_stdin = sys.stdin
+        sys.stdin = io.StringIO(stdin_text)
+        try:
+            return self._run_cli(argv)
+        finally:
+            sys.stdin = old_stdin
+
+    def test_ingest_reads_from_stdin_when_input_omitted(self):
+        # V2.10 -> V2.11 (A-04): "ingest" now matches the stdin fallback
+        # every other single-file script CLI already has.
+        payload = json.dumps({"refLabel": "head", "changedFiles": [{"path": "A.sol", "content": "contract A {}"}]})
+        exit_code, out = self._run_cli_with_stdin(["ingest"], payload)
+        self.assertEqual(exit_code, pr_gate.EXIT_OK)
+        self.assertEqual(json.loads(out)["acceptedFileCount"], 1)
+
+    def test_ingest_stdin_result_matches_file_based_result(self):
+        payload = {"refLabel": "head", "changedFiles": [{"path": "A.sol", "content": "contract A {}"}]}
+        stdin_exit, stdin_out = self._run_cli_with_stdin(["ingest"], json.dumps(payload))
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "input.json"
+            p.write_text(json.dumps(payload), encoding="utf-8")
+            file_exit, file_out = self._run_cli(["ingest", str(p)])
+        self.assertEqual(stdin_exit, file_exit)
+        self.assertEqual(stdin_out, file_out)
+
+    def test_ingest_malformed_stdin_yields_clean_error_envelope_mentioning_stdin(self):
+        exit_code, out = self._run_cli_with_stdin(["ingest"], "not json")
+        self.assertEqual(exit_code, pr_gate.EXIT_FAILED)
+        envelope = json.loads(out)
+        self.assertFalse(envelope["ok"])
+        self.assertIn("stdin", envelope["error"])
+
+    def test_gate_still_requires_all_three_file_arguments(self):
+        # A-04 explicitly does NOT extend "gate" (3 required files) - no
+        # single-optional-positional precedent exists to copy there.
+        with self.assertRaises(SystemExit):
+            pr_gate.main(["gate", "only_one.json"])
+
 
 # ---------------------------------------------------------------------------
 # Schema drift

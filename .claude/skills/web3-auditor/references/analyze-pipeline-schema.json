@@ -1,0 +1,54 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "web3-security-review-ai/analyze-pipeline-schema.json",
+  "title": "Mechanized Deterministic Pipeline: Steps 3->7->8(retry<=2)->9 (V2.11)",
+  "description": "Reference shapes for scripts/analyze_pipeline.py's run_analyze_pipeline() (docs/decisiones.md D-066, capability A-03). This script NEVER performs SKILL.md Step 6 (Analysis) - draft_report must already be the AI-authored draft for the same source being preprocessed. It reuses preprocess.run()/score.score_report()/validate_report.validate_report()/render_report.render_markdown()/render_html() UNCHANGED.",
+  "oneOf": [
+    { "$ref": "#/definitions/needsRevisionResult" },
+    { "$ref": "#/definitions/renderedResult" }
+  ],
+  "definitions": {
+    "needsRevisionResult": {
+      "type": "object",
+      "description": "Returned when validate_report() still finds errors and the SKILL.md Step 8 retry cap (at most 2 retries, 3 attempts total) has not yet been reached.",
+      "required": ["pipelineVersion", "status", "attempt", "attemptsRemaining", "errors", "preprocessArtifact", "note"],
+      "additionalProperties": false,
+      "properties": {
+        "pipelineVersion": { "type": "string" },
+        "status": { "const": "needs_revision" },
+        "attempt": { "type": "integer", "minimum": 1, "maximum": 3 },
+        "attemptsRemaining": { "type": "integer", "minimum": 0, "maximum": 2 },
+        "errors": {
+          "type": "array",
+          "description": "The UNMODIFIED error list from validate_report.validate_report().",
+          "items": { "type": "string" }
+        },
+        "preprocessArtifact": { "type": "object", "description": "The UNMODIFIED Step 3 output of preprocess.run()." },
+        "note": { "type": "string" }
+      }
+    },
+    "renderedResult": {
+      "type": "object",
+      "description": "Returned when validate_report() finds zero errors - Step 9 (render) has run.",
+      "required": ["pipelineVersion", "status", "attempt", "scoredReport", "preprocessArtifact", "renderFormat", "rendered", "note"],
+      "additionalProperties": false,
+      "properties": {
+        "pipelineVersion": { "type": "string" },
+        "status": { "const": "rendered" },
+        "attempt": { "type": "integer", "minimum": 1, "maximum": 3 },
+        "scoredReport": { "type": "object", "description": "The UNMODIFIED output of score.score_report(draft_report)." },
+        "preprocessArtifact": { "type": "object", "description": "The UNMODIFIED Step 3 output of preprocess.run()." },
+        "renderFormat": { "enum": ["markdown", "html"] },
+        "rendered": { "type": "string", "description": "The UNMODIFIED output of render_report.render_markdown()/render_html()." },
+        "note": { "type": "string" }
+      }
+    }
+  },
+  "businessRules": [
+    "R-A1: This module never performs Step 6 (Analysis). draft_report is always an external, already AI-authored input - there is no code path that inspects a finding's substance or invents/edits one.",
+    "R-A2: attempt is a caller-declared, never-inferred integer in [1,3] (SKILL.md Step 8: at most 2 retries, 3 attempts total). Any other value (including a non-int, a bool, or a value outside the range) raises AnalyzePipelineError BEFORE Step 3 (preprocess) even runs.",
+    "R-A3: A still-invalid report on attempt 1 or 2 returns status='needs_revision' (never raises) - the caller may still fix the draft and retry. A still-invalid report on attempt 3 (the last allowed attempt) raises AnalyzePipelineError - never returned as if it were a normal result, matching SKILL.md's 'never present an unvalidated report as if it were normal.'",
+    "R-A4: Step 7 (score) and Step 8 (validate) and Step 9 (render) are exactly score.score_report()/validate_report.validate_report()/render_report.render_markdown() or render_html() UNCHANGED - this module owns zero scoring/validation/rendering logic of its own, including the HTML allowHtmlReport mode gate, which lives inside render_html() itself and is never bypassed or re-implemented here.",
+    "R-A5: This module makes no network/API calls, holds no credentials, and stores nothing between calls - attempt counting is entirely the caller's responsibility, exactly like monitor_diff.py's snapshotTimestamp and pr_gate.py's refLabel are caller-declared, never inferred."
+  ]
+}
