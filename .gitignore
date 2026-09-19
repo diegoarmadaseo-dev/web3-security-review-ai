@@ -24,6 +24,11 @@ venv/
 *.tmp
 *.log
 
+# Sitio estático generado por website/build_site.py (V2.12) - artefacto
+# reconstruible desde config/modes.json + el --help real de cada script;
+# no se versiona una segunda copia que pueda desincronizarse.
+website/dist/
+
 # SO / editores
 .DS_Store
 Thumbs.db
