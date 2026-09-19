@@ -1,0 +1,141 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "web3-security-review-ai/monitor-diff-schema.json",
+  "title": "Continuous On-Chain Monitoring: Temporal Drift + Finding Lifecycle (V2.9)",
+  "description": "Reference shapes for scripts/monitor_diff.py's two output modes (docs/decisiones.md D-063). This script NEVER makes a network call, NEVER stores snapshot/scan history, NEVER alerts, and NEVER generates a timestamp itself - snapshotTimestamp is always caller-supplied. It reuses compare_bytecode.py's normalize_hex/strip_cbor_metadata/byte_divergence_profile and diff_reports.py's diff_reports()/stableKey UNCHANGED. All results are structural facts, never automatic security verdicts.",
+  "oneOf": [
+    { "$ref": "#/definitions/snapshotPairResult" },
+    { "$ref": "#/definitions/findingLifecycleResult" }
+  ],
+  "definitions": {
+    "snapshotPairResult": {
+      "type": "object",
+      "description": "Output of monitor_snapshot_pair() / CLI mode 'snapshot-drift' (M1+M3).",
+      "required": ["monitorVersion", "coverageStatus", "identicalToLastSnapshot", "drift", "note"],
+      "additionalProperties": false,
+      "properties": {
+        "monitorVersion": { "type": "string" },
+        "coverageStatus": {
+          "type": "object",
+          "description": "M3. A WINDOW/coverage status ONLY - a distinct vocabulary from compare_bytecode.py's five bytecode verdicts (MATCH/MISMATCH/UNAVAILABLE/INCOMPLETE/UNRESOLVED), which this script never touches or adds to.",
+          "required": ["status", "reasons"],
+          "additionalProperties": false,
+          "properties": {
+            "status": { "enum": ["ASSESSED", "NOT_ASSESSED"] },
+            "reasons": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "identicalToLastSnapshot": {
+          "type": "boolean",
+          "description": "M3 idempotency: true when the two snapshots' comparison-relevant content hashes match (excluding snapshotTimestamp)."
+        },
+        "drift": { "$ref": "#/definitions/temporalDrift" },
+        "note": { "type": "string" }
+      }
+    },
+    "temporalDrift": {
+      "type": "object",
+      "description": "M1. Output of compute_temporal_snapshot_drift(). snapshot1 is assumed earlier, snapshot2 later, by argument order alone - never inferred from timestamp values. Identity is (chainId, address) - BOTH must resolve and match exactly (D-064) or the function raises before any comparison is attempted; chainId is the canonical numeric form resolved via chains.py - a network name/alias is never identity by itself.",
+      "required": ["monitorVersion", "chainId", "address", "snapshot1Timestamp", "snapshot2Timestamp", "flagChanges", "bytecodeDrift", "proxyDrift", "note"],
+      "additionalProperties": false,
+      "properties": {
+        "monitorVersion": { "type": "string" },
+        "chainId": { "type": "integer", "description": "D-064. Canonical numeric chainId shared by both snapshots." },
+        "address": { "type": ["string", "null"], "pattern": "^0x[0-9a-f]{40}$" },
+        "snapshot1Timestamp": { "type": "string" },
+        "snapshot2Timestamp": { "type": "string" },
+        "flagChanges": {
+          "type": "array",
+          "description": "Only entries where the field actually changed. verified/hasCode are always compared; adminAddress/ownerAddress are compared ONLY when both snapshots supply a usable value - never guessed.",
+          "items": {
+            "type": "object",
+            "required": ["field", "from", "to"],
+            "additionalProperties": false,
+            "properties": {
+              "field": { "enum": ["verified", "hasCode", "adminAddress", "ownerAddress"] },
+              "from": {},
+              "to": {}
+            }
+          }
+        },
+        "bytecodeDrift": {
+          "type": "object",
+          "required": ["status", "detail"],
+          "additionalProperties": false,
+          "properties": {
+            "status": { "enum": ["MATCH", "MISMATCH", "UNAVAILABLE"] },
+            "detail": { "type": "string" },
+            "divergenceProfile": {
+              "description": "MISMATCH only. Reused verbatim from compare_bytecode.py's C-10 shape - purely descriptive, never changes status.",
+              "type": "object"
+            }
+          }
+        },
+        "proxyDrift": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["proxyKey", "status", "detail"],
+            "additionalProperties": false,
+            "properties": {
+              "proxyKey": { "type": "string" },
+              "status": { "enum": ["MATCH", "MISMATCH", "UNAVAILABLE"] },
+              "detail": { "type": "string" },
+              "implementationKey": { "type": ["string", "null"] },
+              "implementationKeyFrom": { "type": ["string", "null"] },
+              "implementationKeyTo": { "type": ["string", "null"] }
+            }
+          }
+        },
+        "note": { "type": "string" }
+      }
+    },
+    "findingLifecycleResult": {
+      "type": "object",
+      "description": "M2. Output of compute_finding_lifecycle() / CLI mode 'finding-lifecycle'. Reuses diff_reports.py's diff_reports()/stableKey unchanged for every consecutive pair of scans.",
+      "required": ["monitorVersion", "scanCount", "perFinding", "regressedFindingCount", "note"],
+      "additionalProperties": false,
+      "properties": {
+        "monitorVersion": { "type": "string" },
+        "scanCount": { "type": "integer", "minimum": 1 },
+        "perFinding": {
+          "type": "object",
+          "description": "Keyed by stableKey (score.compute_stable_key).",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["history", "currentStatus", "everRegressed"],
+            "additionalProperties": false,
+            "properties": {
+              "history": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["status", "timestamp"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "status": { "enum": ["new", "resolved", "regressed"] },
+                    "timestamp": { "type": "string" }
+                  }
+                }
+              },
+              "currentStatus": { "enum": ["present", "resolved"] },
+              "everRegressed": { "type": "boolean" }
+            }
+          }
+        },
+        "regressedFindingCount": { "type": "integer", "minimum": 0 },
+        "note": { "type": "string" }
+      }
+    }
+  },
+  "businessRules": [
+    "R-M1: M1/M2 results are structural facts, never automatic security verdicts - a bytecode/proxy change or a finding's new/resolved/regressed status may be entirely legitimate; interpreting significance is the analysis step's (or a human's) job.",
+    "R-M2: coverageStatus's NOT_ASSESSED is a monitoring-window/coverage status ONLY. compare_bytecode.py's five verdicts (MATCH/MISMATCH/UNAVAILABLE/INCOMPLETE/UNRESOLVED) are a completely separate, unmodified vocabulary - this script never adds a sixth bytecode verdict.",
+    "R-M3: A NOT_ASSESSED window, an empty flagChanges/proxyDrift list, or a currentStatus of 'resolved' is NEVER proof of safety - it only describes what this specific comparison, given the specific data it received, could determine.",
+    "R-M4: snapshotTimestamp (on every snapshot and every scan) is REQUIRED and always caller-supplied; this script never calls a clock. Snapshot/scan chronology is asserted by the caller's argument/array order, never inferred by parsing timestamp values.",
+    "R-M5: This script has no database, no cron/scheduling, no alerting, and no RPC/network calls - persisting history and acting on a reported change are entirely the calling workflow's responsibility.",
+    "R-M6: compute_temporal_snapshot_drift requires both snapshots to share the SAME (chainId, address) identity - chainId resolved to its canonical numeric form via chains.py (a name/alias is never identity by itself) and address normalized - a same-address-different-chain or same-chain-different-address pair, or one with an unresolvable chainId on either side, is always rejected before any comparison is attempted (D-064).",
+    "R-M7: adminAddress/ownerAddress drift is only reported when BOTH snapshots explicitly supply a value for that field - absence on either side is never guessed or treated as 'unchanged'.",
+    "R-M8: compute_finding_lifecycle reuses diff_reports.diff_reports()/score.compute_stable_key unchanged; a resolved finding that reappears in a later scan is tagged 'regressed', never silently re-reported as merely 'new'."
+  ]
+}

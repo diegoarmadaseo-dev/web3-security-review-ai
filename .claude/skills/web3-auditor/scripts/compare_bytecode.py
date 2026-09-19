@@ -1033,12 +1033,12 @@ def _chains_known_map(chain_ids: List[str]) -> Dict[str, bool]:
 
 # V2.8 Block 3, C-10: purely descriptive byte-diff characterization of an
 # ALREADY-DECIDED MISMATCH.  Thresholds are generous, named constants, never
-# used to change a verdict - see _byte_divergence_profile's own docstring.
+# used to change a verdict - see byte_divergence_profile's own docstring.
 _DIVERGENCE_LOCALIZED_MAX_BYTES = 128      # ~4 32-byte slots (immutables/library addresses)
 _DIVERGENCE_LOCALIZED_MAX_REGIONS = 8
 
 
-def _byte_divergence_profile(hex_a: str, hex_b: str) -> Dict[str, Any]:
+def byte_divergence_profile(hex_a: str, hex_b: str) -> Dict[str, Any]:
     """Purely descriptive byte-level characterization of two ALREADY-DIFFERENT
     normalized (CBOR-stripped) bytecode hex strings.  Never asserts a cause -
     an immutable value, a linked library address, and a genuine functional
@@ -1050,7 +1050,12 @@ def _byte_divergence_profile(hex_a: str, hex_b: str) -> Dict[str, Any]:
     as, a handful of immutable/library-address substitutions); 'structural'
     means the differences are larger or more widespread; different-length
     inputs are their own bucket ('different-length'), never guessed into
-    either of the other two."""
+    either of the other two.
+
+    PUBLIC (V2.9, D-063): promoted from a private helper so monitor_diff.py
+    (M1, temporal snapshot drift) can reuse it for the SAME characterization
+    across time instead of across chains - the byte-level math is identical
+    either way, so this is deliberately NOT re-derived in the new script."""
     len_a, len_b = len(hex_a) // 2, len(hex_b) // 2
     if len_a != len_b:
         return {
@@ -1132,7 +1137,7 @@ def _cross_chain_bytecode_drift(
             divergence_profile = {
                 "referenceChainId": reference_cid,
                 "perChain": {
-                    cid: _byte_divergence_profile(reference_hex, normalized[cid])
+                    cid: byte_divergence_profile(reference_hex, normalized[cid])
                     for cid in chain_ids[1:]
                     if normalized[cid] != reference_hex
                 },
