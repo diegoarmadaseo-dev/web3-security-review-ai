@@ -1,0 +1,7 @@
+# Only the PostgreSQL backend needs this (backend/db.py, backend/repository.py,
+# backend/migrate.py, backend/tenant_scope.py). The SQLite backend
+# (repository.connect()) is unaffected and needs no third-party dependency -
+# see backend/db.py's module docstring. Not required to run the default
+# test suite unless the PostgreSQL integration tests are being exercised
+# (tests/test_backend_postgres_integration.py, which self-skips without it).
+psycopg[binary]>=3.1,<4
