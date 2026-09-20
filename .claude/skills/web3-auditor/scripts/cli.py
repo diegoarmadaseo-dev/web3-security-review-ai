@@ -59,6 +59,9 @@ COMMANDS = {
     "delegatecall-cycle": "delegatecall_cycle",
     "constructor-zero-address": "constructor_zero_address",
     "render-advisory-summary": "render_advisory_summary",
+    "upgrade-authority-guard": "upgrade_authority_guard",
+    "bytecode-metamorphic-signal": "bytecode_metamorphic_signal",
+    "implementation-constructor-signal": "implementation_constructor_signal",
 }
 
 

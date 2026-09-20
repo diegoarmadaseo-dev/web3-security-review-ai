@@ -1,0 +1,28 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "implementation_constructor_signal.py output (V3 Block 7, F3, docs/decisiones.md D-075)",
+  "description": "Documentation reference only, not executed at runtime. Structural signal only (constructor params[] presence) - no severity, cannot distinguish a safe immutable-only constructor from a proxy-unsafe one without body parsing (out of scope).",
+  "type": "object",
+  "required": ["implementationConstructorSignalVersion", "status", "flagged"],
+  "additionalProperties": false,
+  "properties": {
+    "implementationConstructorSignalVersion": {"type": "string"},
+    "status": {"enum": ["flagged", "clean", "not_computed"]},
+    "message": {"type": "string"},
+    "note": {"type": "string"},
+    "flagged": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["proxyKey", "implementationKey", "constructorParamCount", "confidence"],
+        "additionalProperties": false,
+        "properties": {
+          "proxyKey": {"type": "string"},
+          "implementationKey": {"type": "string"},
+          "constructorParamCount": {"type": "integer", "minimum": 1},
+          "confidence": {"const": "low"}
+        }
+      }
+    }
+  }
+}

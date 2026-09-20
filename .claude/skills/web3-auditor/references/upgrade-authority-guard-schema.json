@@ -1,0 +1,27 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "upgrade_authority_guard.py output (V3 Block 7, F1, docs/decisiones.md D-075)",
+  "description": "Documentation reference only, not executed at runtime. Advisory signal only - no severity field anywhere; matches by canonical signature TEXT, never a computed selector (see module docstring for the Keccak/SHA3-256 rationale).",
+  "type": "object",
+  "required": ["upgradeAuthorityGuardVersion", "status", "flagged"],
+  "additionalProperties": false,
+  "properties": {
+    "upgradeAuthorityGuardVersion": {"type": "string"},
+    "status": {"enum": ["flagged", "clean"]},
+    "note": {"type": "string"},
+    "flagged": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["contractKey", "function", "signature", "confidence"],
+        "additionalProperties": false,
+        "properties": {
+          "contractKey": {"type": "string"},
+          "function": {"type": "string"},
+          "signature": {"type": "string"},
+          "confidence": {"const": "low"}
+        }
+      }
+    }
+  }
+}

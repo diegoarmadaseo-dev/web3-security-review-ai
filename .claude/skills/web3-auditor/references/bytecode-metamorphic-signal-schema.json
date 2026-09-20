@@ -1,0 +1,17 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "bytecode_metamorphic_signal.py output (V3 Block 7, F2, docs/decisiones.md D-075)",
+  "description": "Documentation reference only, not executed at runtime. Advisory co-occurrence signal only - no severity, never a claim of exploitability or that a redeploy has occurred or will occur.",
+  "type": "object",
+  "required": ["bytecodeMetamorphicSignalVersion", "status", "cborMetadataStripped", "hasCreate2", "hasSelfdestruct", "confidence", "note"],
+  "additionalProperties": false,
+  "properties": {
+    "bytecodeMetamorphicSignalVersion": {"type": "string"},
+    "status": {"enum": ["signal_present", "no_signal"]},
+    "cborMetadataStripped": {"type": "boolean"},
+    "hasCreate2": {"type": "boolean"},
+    "hasSelfdestruct": {"type": "boolean"},
+    "confidence": {"const": "low"},
+    "note": {"type": "string"}
+  }
+}
