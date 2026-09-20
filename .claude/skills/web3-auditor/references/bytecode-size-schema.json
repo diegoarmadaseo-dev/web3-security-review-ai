@@ -1,0 +1,16 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "bytecode_size.py output (V3 Block 5, D2, docs/decisiones.md D-073)",
+  "description": "Documentation reference only, not executed at runtime. Exact EIP-170 byte-length comparison, advisory only.",
+  "type": "object",
+  "required": ["bytecodeSizeVersion", "status", "sizeBytes", "limitBytes", "bytesOverLimit", "note"],
+  "additionalProperties": false,
+  "properties": {
+    "bytecodeSizeVersion": {"type": "string"},
+    "status": {"enum": ["within_limit", "exceeds_limit"]},
+    "sizeBytes": {"type": "integer", "minimum": 0},
+    "limitBytes": {"const": 24576},
+    "bytesOverLimit": {"type": "integer", "minimum": 0},
+    "note": {"type": "string"}
+  }
+}

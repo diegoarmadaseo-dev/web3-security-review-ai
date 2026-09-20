@@ -1,0 +1,38 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "initializer_safety.py output (V3 Block 5, D1, docs/decisiones.md D-073)",
+  "description": "Documentation reference only, not executed at runtime. Structural/version facts only - no severity field anywhere, never a claim of exploitability.",
+  "type": "object",
+  "required": ["initializerSafetyVersion", "contractsCompared", "contractsFlagged", "results", "note"],
+  "additionalProperties": false,
+  "properties": {
+    "initializerSafetyVersion": {"type": "string"},
+    "contractsCompared": {"type": "array", "items": {"type": "string"}},
+    "contractsFlagged": {"type": "array", "items": {"type": "string"}},
+    "note": {"type": "string"},
+    "results": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["status", "findings"],
+        "additionalProperties": false,
+        "properties": {
+          "status": {"enum": ["unchanged", "flagged"]},
+          "findings": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["type", "function"],
+              "properties": {
+                "type": {"enum": ["guard_removed", "reinitializer_version_reused"]},
+                "function": {"type": "string"},
+                "modifierBefore": {"type": "string"},
+                "version": {"type": "integer", "minimum": 0}
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

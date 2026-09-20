@@ -53,6 +53,9 @@ COMMANDS = {
     "proxy-fingerprint": "proxy_fingerprint",
     "compiler-bugs": "compiler_bugs",
     "upgrade-gap": "upgrade_gap",
+    "initializer-safety": "initializer_safety",
+    "bytecode-size": "bytecode_size",
+    "bytecode-compiler-bugs": "bytecode_compiler_bugs",
 }
 
 

@@ -1,0 +1,18 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "bytecode_compiler_bugs.py output (V3 Block 5, D3, docs/decisiones.md D-073)",
+  "description": "Documentation reference only, not executed at runtime. Bridges compare_bytecode.py's CBOR decoder to compiler_bugs.py's matcher - both reused unchanged.",
+  "type": "object",
+  "required": ["bytecodeCompilerBugsVersion", "status", "extractionDetail", "extractedVersion", "compilerBugReport"],
+  "additionalProperties": false,
+  "properties": {
+    "bytecodeCompilerBugsVersion": {"type": "string"},
+    "status": {"enum": ["version_extracted", "version_not_found"]},
+    "extractionDetail": {"type": "string"},
+    "extractedVersion": {"type": ["string", "null"]},
+    "compilerBugReport": {
+      "description": "Null when status is version_not_found; otherwise the exact object compiler_bugs.py's compute_compiler_bug_report() returns unchanged - see compiler-bugs-schema.json.",
+      "type": ["object", "null"]
+    }
+  }
+}
