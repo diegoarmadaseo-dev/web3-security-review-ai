@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Vericexa">
+  <rect width="32" height="32" rx="7" fill="#1d4ed8"/>
+  <path d="M16 6 L25 9.5 V16.2 C25 21.3 21.2 25.4 16 27 C10.8 25.4 7 21.3 7 16.2 V9.5 Z"
+        fill="none" stroke="#ffffff" stroke-width="2" stroke-linejoin="round"/>
+  <path d="M12 16.3 L15 19.3 L20.5 12.8" fill="none" stroke="#ffffff" stroke-width="2.1"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

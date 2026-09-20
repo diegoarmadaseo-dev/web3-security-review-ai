@@ -81,7 +81,8 @@ limitativas y se revisan a mano en cada commit.
 - Indicador de riesgo: **"This indicator reflects findings detected within the analyzed scope. It is not a measure of overall protocol security."** y, cuando la banda sea LOW: **"A LOW automated risk indicator does not mean that deployment is safe."**
 - Patches: **"Suggested remediation only. Review, compile, test and validate independently before use."**
 - Retención: **"The Skill deletes its local temporary working copy at the end of execution. This does not control platform, runtime, provider, billing, security or execution-log retention outside the Skill."**
-- Procesamiento LLM: **"LLM processing via Capafy infrastructure."** Proveedor y modelo solo con `[CAPAFY-VERIFY]` hasta tener confirmación documental.
+- Procesamiento LLM (informe generado por la propia Skill, donde el comprador ya está en la plataforma que lo genera): **"LLM processing via Capafy infrastructure."** Proveedor y modelo solo con `[CAPAFY-VERIFY]` hasta tener confirmación documental.
+- Procesamiento LLM (sitio web público de marketing, `website/content.py` → `LLM_PROCESSING_NOTE`): **"LLM processing via third-party infrastructure."** Decisión deliberada, no deriva: mismo hecho (el procesamiento LLM lo realiza un tercero) declarado en dos superficies con nivel de detalle distinto - el sitio web público de marketing/CTA no nombra la marca del proveedor de infraestructura, el informe de la Skill sí. Ninguna de las dos fórmulas oculta ni inventa la relación con el tercero.
 - Gas: nunca cifras exactas ("saves 17,392 gas") sin medición real; impacto cualitativo low / medium / high.
 - Ausencia de score: **"Automated deterministic scoring was unavailable in this runtime."** con `scoreStatus: "not_computed"`.
 
