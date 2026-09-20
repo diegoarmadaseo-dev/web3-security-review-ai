@@ -53,7 +53,7 @@ blockingCategories (below) only FILTER which already-computed findings
 count toward the gate - they never add a new check or change a finding's
 own severity/confidence/category.
 
-V3 Block 1 "CI Security Gate 2.0" (docs/decisiones.md D-06X) adds, all
+V3 Block 1 "CI Security Gate 2.0" (docs/decisiones.md D-068) adds, all
 additive/opt-in so G1-G4's existing behavior and CLI are byte-for-byte
 unchanged when unused:
 
