@@ -127,7 +127,7 @@ PAGE_TITLES: Dict[str, str] = {
 }
 PAGE_DESCRIPTIONS: Dict[str, str] = {
     "index.html": "Vericexa is an automated, AI-assisted blockchain security platform for Web3 developers, reviewing smart contracts with findings, an Automated Risk Indicator and suggested remediation for Solidity and Vyper.",
-    "features.html": "What Vericexa reviews today: pre-deployment review, security diffing, deployed-source verification, source-vs-deployed bytecode comparison, multi-chain EVM support and a CI security gate.",
+    "features.html": "What Vericexa reviews today: pre-deployment review, security diffing, deployed-source verification, source-vs-deployed bytecode comparison, multi-chain EVM support, a CI security gate, and a deterministic advisory layer covering upgrade/proxy safety, bytecode-only checks, cross-contract reachability and constructor sanity.",
     "demo.html": "A real example finding from Vericexa's internal test fixtures, showing the report format: severity, confidence, evidence, recommendation and Automated Risk Indicator.",
     "methodology.html": "How Vericexa's review pipeline works: deterministic detectors across ten vulnerability categories, AI-assisted analysis, confidence levels and the Automated Risk Indicator.",
     "developers.html": "Reference for wiring Vericexa's CLI and CI security gate into your own pipeline, including PR ingestion, baseline diffing and snapshot drift tracking.",
@@ -153,9 +153,9 @@ FEATURES_AVAILABLE: List[Dict[str, str]] = [
     },
     {
         "name": "Security Diff",
-        "summary": "A smart contract security diff: compare two analysis runs to see what changed.",
-        "detail": "Diffs two reports, or two preprocessed inputs, to highlight new, resolved and regressed findings - so a re-review after a fix focuses on what actually moved.",
-        "evidence": "scripts/diff_reports.py",
+        "summary": "A smart contract security diff: compare two analysis runs to see what changed, plus a structural risk classification of that change.",
+        "detail": "Diffs two reports, or two preprocessed inputs, to highlight new, resolved and regressed findings - so a re-review after a fix focuses on what actually moved. A separate structural check classifies each diff as no-change, safe, or worth a closer look, based on what changed (visibility, modifiers, inheritance), independent of whether any detector already flagged it.",
+        "evidence": "scripts/diff_reports.py, scripts/change_impact.py",
     },
     {
         "name": "Deployed-Source Verification",
@@ -181,6 +181,30 @@ FEATURES_AVAILABLE: List[Dict[str, str]] = [
         "detail": "Reads a report from a file or stdin and applies explicit gating rules inside your own pipeline. No hosted runner and no third-party account are required to use it.",
         "evidence": "scripts/pr_gate.py",
     },
+    {
+        "name": "Upgrade and Proxy Safety Checks",
+        "summary": "A set of deterministic advisory checks for upgradeable and proxy-based contracts.",
+        "detail": "Covers unprotected upgrade-authority functions, missing or removed initializer/reinitializer guards, storage-layout collisions and shrinking storage-gap reservations between two versions, delegatecall-cycle detection across a resolved proxy graph, recognized proxy patterns (EIP-1167 minimal proxies and the EIP-1967 storage-slot convention), and a structural signal when a proxy's own implementation contract has a constructor that accepts parameters. Each check is advisory-only with its own stated scope - none assigns a severity or a definitive verdict, and governance/timelock review is not covered.",
+        "evidence": "scripts/upgrade_authority_guard.py, scripts/initializer_safety.py, scripts/storage_layout.py, scripts/upgrade_gap.py, scripts/delegatecall_cycle.py, scripts/proxy_fingerprint.py, scripts/implementation_constructor_signal.py",
+    },
+    {
+        "name": "Bytecode-Only and Compiler-Version Advisory Checks",
+        "summary": "Advisory checks that work even when only compiled bytecode is available, with no source.",
+        "detail": "Flags the presence of specific opcodes (DELEGATECALL, CALLCODE, SELFDESTRUCT) and their combination with CREATE2 in bytecode alone, checks deployed bytecode size against the EIP-170 limit, and cross-references a contract's compiler version - extracted from bytecode metadata when source is unavailable, or supplied directly when it is - against a dataset of known compiler bugs. Each result states its own confidence; offered because a large share of deployed contracts have no verified source available for a deeper check.",
+        "evidence": "scripts/bytecode_advisory.py, scripts/bytecode_size.py, scripts/bytecode_metamorphic_signal.py, scripts/bytecode_compiler_bugs.py, scripts/compiler_bugs.py",
+    },
+    {
+        "name": "Cross-Contract and Constructor Sanity Checks",
+        "summary": "Checks that look beyond a single function: cross-contract reachability and constructor-argument sanity.",
+        "detail": "Traces whether an unguarded, externally reachable function in one contract can call an equally unguarded function in another contract within the same bundle, and checks planned constructor arguments for the literal zero address on parameters already identified as address-typed. Both are advisory signals, not confirmed findings - reachability and intent still need to be assessed by the caller.",
+        "evidence": "scripts/privilege_path.py, scripts/constructor_zero_address.py",
+    },
+    {
+        "name": "Advisory Workflow and Reporting",
+        "summary": "Tools for consuming the advisory checks above as part of a review or a CI pipeline, not just as one-off JSON output.",
+        "detail": "Renders a bundle of advisory-check results as one human-readable summary, assembles the already-known context (function, contract, related call/delegatecall edges) around one specific location to speed up reviewing a finding, and reduces a bundle of advisory results to a single pass/fail signal for a pipeline gate - each strictly relaying what the underlying checks already computed, never adding a new judgment of its own.",
+        "evidence": "scripts/render_advisory_summary.py, scripts/finding_context_bundle.py, scripts/advisory_gate.py",
+    },
 ]
 
 FEATURES_PARTIAL: List[Dict[str, str]] = [
@@ -189,12 +213,6 @@ FEATURES_PARTIAL: List[Dict[str, str]] = [
         "summary": "A cross-contract system graph (contracts, calls, proxies) is computed in Pro-tier analysis.",
         "detail": "That graph powers proxy resolution and cross-contract checks today. A standalone multi-contract review narrative is not yet a separate deliverable, and system-graph computation is limited to the Pro tier.",
         "evidence": "scripts/preprocess.py (compute_system_graph, gated by modes.json allowSystemGraph)",
-    },
-    {
-        "name": "Upgrade Review",
-        "summary": "Static checks for common proxy/upgradeability patterns, plus bytecode-level proxy-implementation verification.",
-        "detail": "Covers unprotected upgrade functions, missing initializer guards, and proxy-vs-implementation bytecode drift (including across chains). It is not yet a dedicated end-to-end upgrade-path review - storage-layout collision analysis and governance/timelock review are not covered.",
-        "evidence": "scripts/detectors/access_control.py (SC10), scripts/compare_bytecode.py (proxyComparisons)",
     },
     {
         "name": "Monitoring",
@@ -214,6 +232,7 @@ DIFFERENTIATORS: List[str] = [
     "Verifies deployed bytecode against your source, including proxy implementations and cross-chain drift - a basic source-only scanner cannot see what is actually on-chain.",
     "Chain-identity-aware: the same address on two different chains is never silently treated as the same contract.",
     "Ships a provider-agnostic CI security gate and a security-diff mode, so review fits into a pipeline instead of a one-off report.",
+    "Layers deterministic advisory checks for upgrade/proxy safety, bytecode-only coverage and cross-contract reachability on top of the core review - each one advisory-only, with its own stated scope, and never silently altering the score.",
 ]
 
 # ---------------------------------------------------------------------------

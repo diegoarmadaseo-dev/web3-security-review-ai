@@ -148,6 +148,23 @@ class ContentCentralizationTests(unittest.TestCase):
         for f in content.FEATURES_AVAILABLE + content.FEATURES_PARTIAL:
             self.assertTrue(f.get("evidence"), "%s has no evidence pointer" % f["name"])
 
+    def test_v3_advisory_scripts_are_all_represented_in_features_available(self):
+        # Every advisory script shipped since V3 Block 3 must be named in at
+        # least one FEATURES_AVAILABLE entry's own evidence trail, so the
+        # website can never silently drift stale again the way the old
+        # "Upgrade Review" partial entry did before this test existed.
+        evidence_text = " ".join(f.get("evidence", "") for f in content.FEATURES_AVAILABLE)
+        v3_advisory_scripts = [
+            "storage_layout.py", "privilege_path.py", "bytecode_advisory.py", "change_impact.py",
+            "proxy_fingerprint.py", "compiler_bugs.py", "upgrade_gap.py", "initializer_safety.py",
+            "bytecode_size.py", "bytecode_compiler_bugs.py", "delegatecall_cycle.py",
+            "constructor_zero_address.py", "render_advisory_summary.py", "upgrade_authority_guard.py",
+            "bytecode_metamorphic_signal.py", "implementation_constructor_signal.py",
+            "finding_context_bundle.py", "advisory_gate.py",
+        ]
+        for script in v3_advisory_scripts:
+            self.assertIn(script, evidence_text, "%s is not referenced by any FEATURES_AVAILABLE entry" % script)
+
     def test_faq_items_are_unique_questions(self):
         questions = [q for q, _a in content.FAQ_ITEMS]
         self.assertEqual(len(questions), len(set(questions)))
