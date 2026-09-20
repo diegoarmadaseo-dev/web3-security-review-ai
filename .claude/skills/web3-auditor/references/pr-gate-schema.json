@@ -1,8 +1,8 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "web3-security-review-ai/pr-gate-schema.json",
-  "title": "Provider-Agnostic PR/CI Security Gate (V2.10)",
-  "description": "Reference shapes for scripts/pr_gate.py's two output modes (docs/decisiones.md D-065). This script NEVER makes a network call, NEVER holds credentials, and NEVER posts a comment/annotation/commit status itself - it is provider-agnostic by construction (nothing here names a specific Git hosting provider). It reuses ingest_onchain.build_bundle() and diff_reports.diff_reports()/score.compute_stable_key UNCHANGED.",
+  "title": "Provider-Agnostic PR/CI Security Gate (V2.10 + V3 Block 1 \"CI Security Gate 2.0\")",
+  "description": "Reference shapes for scripts/pr_gate.py's two output modes (docs/decisiones.md D-065, D-06X). This script NEVER makes a network call, NEVER holds credentials, and NEVER posts a comment/annotation/commit status itself - it is provider-agnostic by construction (nothing here names a specific Git hosting provider). It reuses ingest_onchain.build_bundle() and diff_reports.diff_reports()/score.compute_stable_key UNCHANGED. V3 Block 1 added policy.minConfidence/policy.blockingCategories (both optional) and two opt-in CLI flags (--strict-exit, --format text) documented in pr_gate.py's own module docstring - the result SHAPE below is otherwise byte-for-byte the V2.10 shape.",
   "oneOf": [
     { "$ref": "#/definitions/ingestResult" },
     { "$ref": "#/definitions/gateResult" }
@@ -43,6 +43,7 @@
         "gateStatus": { "enum": ["PASS", "FAIL"] },
         "policy": {
           "type": "object",
+          "description": "minConfidence/blockingCategories (V3 Block 1) are OPTIONAL narrowing filters, present in this echoed-back object only when the caller supplied them - omitting both reproduces the exact V2.10 policy shape and gate decision.",
           "required": ["blockingSeverities"],
           "additionalProperties": false,
           "properties": {
@@ -50,6 +51,16 @@
               "type": "array",
               "description": "Always an explicit caller input, echoed back verbatim (de-duplicated) - never hardcoded, never guessed.",
               "items": { "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFORMATIONAL"] }
+            },
+            "minConfidence": {
+              "type": "string",
+              "enum": ["high", "medium", "low"],
+              "description": "V3 Block 1, optional. Only present if the caller set it. A newFinding is excluded from blocking only if its OWN confidence is a recognized value below this rank - a missing/unrecognized confidence on a finding is never treated as a free pass."
+            },
+            "blockingCategories": {
+              "type": "array",
+              "description": "V3 Block 1, optional. Only present if the caller set it. Each item must be one of preprocess.CATEGORIES's own keys (the SC01-SC10 taxonomy plus its supplementary EXTRA-* checks) - deliberately not enumerated here as a fixed list, since preprocess.CATEGORIES is the single source of truth and a second, hardcoded copy of its keys would drift as categories are added there.",
+              "items": { "type": "string" }
             }
           }
         },
@@ -92,6 +103,8 @@
     "R-G3: The gate decision (gateStatus/blockingFindingCount) considers ONLY diff.newFindings. resolvedFindings and modifiedFindings describe the baseline's own pre-existing history and NEVER affect the gate. policy.blockingSeverities is a REQUIRED, explicit caller input - this module has no hardcoded threshold and no code path that invents one.",
     "R-G4: annotations[] contains ONLY structured, bounded fields (file/lineStart/lineEnd/contract/function/severity/category/stableKey) - it NEVER includes a finding's free-text description/evidence/recommendation/patch fields or any reproduction of source/diff content, so an embedded secret can never be echoed into a PR comment/annotation built from it.",
     "R-G5: This module makes no network/API calls, holds no credentials, and posts nothing itself - permissions/authentication, retries/timeouts/rate limits, and the actual comment/annotation/commit-status API calls are entirely the calling CI workflow's responsibility.",
-    "R-G6: A PASS gateStatus is never proof of safety - it only reflects what this comparison, under the caller's own policy, could determine from the two reports it was given (see NEVER_SAFE_BY_SILENCE_NOTE)."
+    "R-G6: A PASS gateStatus is never proof of safety - it only reflects what this comparison, under the caller's own policy, could determine from the two reports it was given (see NEVER_SAFE_BY_SILENCE_NOTE).",
+    "R-G7 (V3 Block 1): policy.minConfidence/policy.blockingCategories only ever NARROW which severity-matching newFindings count as blocking - they never add a new check, never change a finding's own severity/confidence/category, and an unrecognized policy key or an invalid value for a recognized key raises an error rather than being silently ignored (fail closed, never fail open).",
+    "R-G8 (V3 Block 1): the CLI's default behavior (no --strict-exit, no --format) is byte-for-byte the V2.10 behavior - a FAIL gateStatus still exits EXIT_OK unless --strict-exit is explicitly passed, and --format defaults to json."
   ]
 }

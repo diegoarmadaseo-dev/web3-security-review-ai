@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Minimal, provider-agnostic PR/CI security gate (V2.10, docs/decisiones.md
-D-065).
+D-065; V3 Block 1 "CI Security Gate 2.0" extends the policy/output layer
+only - G1-G4 themselves are UNCHANGED, see each function's own docstring).
 
 Four capabilities:
 
@@ -47,7 +48,35 @@ input or output shape names a specific Git hosting provider.
 No new detectors: G1 is pure ingestion reuse, G2 is pure diff_reports reuse,
 G3 is a policy/aggregation layer over already-computed findings (never a
 new judgment about a contract), and G4 is a pure re-shaping of already-
-existing finding fields.
+existing finding fields. V3 Block 1 keeps this invariant: minConfidence/
+blockingCategories (below) only FILTER which already-computed findings
+count toward the gate - they never add a new check or change a finding's
+own severity/confidence/category.
+
+V3 Block 1 "CI Security Gate 2.0" (docs/decisiones.md D-06X) adds, all
+additive/opt-in so G1-G4's existing behavior and CLI are byte-for-byte
+unchanged when unused:
+
+  - Policy-as-config: `policy` may now also carry `minConfidence`
+    ("high"/"medium"/"low") and/or `blockingCategories` (a subset of
+    preprocess.CATEGORIES's own SC01-SC10 keys - never a second hardcoded
+    list). Both are OPTIONAL narrowing filters over newFindings that
+    already passed the blockingSeverities check; omitting either preserves
+    the exact V2.10 gate decision. Unknown policy keys, or a recognized key
+    with an invalid shape/value, raise PrGateError - this module never
+    silently ignores a typo'd or malformed policy field and never treats
+    that as an empty/passing policy (fail closed, not fail open).
+  - `gate --strict-exit`: opt-in flag. Default CLI behavior is UNCHANGED -
+    `main()` still returns EXIT_OK for any successfully-computed gate
+    result, including gateStatus "FAIL" (see test_gate_cli_end_to_end's own
+    comment: this was a deliberate V2.10 choice, since G3's docstring
+    already says permissions/enforcement belong to the calling workflow).
+    Only when --strict-exit is passed does a "FAIL" gateStatus make the
+    process exit EXIT_GATE_BLOCKED instead - for a CI template that wants
+    this script's own exit code to fail the job, without changing what any
+    existing caller relying on the old default sees.
+  - `gate --format text`: opt-in human-readable rendering of the same
+    result, alongside the unchanged default `--format json`.
 
 Standard library only. No network access, no LLM calls. Python 3.8+.
 """
@@ -67,13 +96,17 @@ if SCRIPT_DIR not in sys.path:
 from ingest_onchain import build_bundle  # noqa: E402
 from diff_reports import diff_reports, DiffError  # noqa: E402
 from score import compute_stable_key  # noqa: E402
+import preprocess  # noqa: E402 - reused ONLY for preprocess.CATEGORIES's SC01-SC10 key set (blockingCategories validation); no other symbol, no new coupling.
 
-PR_GATE_VERSION = "2026.1"
+PR_GATE_VERSION = "2026.2"
 
 EXIT_OK = 0
 EXIT_FAILED = 1
+EXIT_GATE_BLOCKED = 2  # only ever returned when --strict-exit was explicitly passed; see module docstring.
 
 _VALID_SEVERITIES = frozenset(["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFORMATIONAL"])
+_CONFIDENCE_RANK = {"high": 3, "medium": 2, "low": 1}  # higher = more confident; matches docs/commercial-claims.md's own high/medium/low vocabulary.
+_KNOWN_POLICY_KEYS = frozenset(["blockingSeverities", "minConfidence", "blockingCategories"])
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f]")
 
 NEVER_A_GITHUB_CLIENT_NOTE = (
@@ -186,22 +219,85 @@ def build_annotation_list(findings: Any) -> List[Dict[str, Any]]:
 # G2+G3: baseline-vs-PR diff and deterministic gate
 # ---------------------------------------------------------------------------
 
-def _require_blocking_severities(policy: Any) -> List[str]:
+def _validate_policy(policy: Any) -> Dict[str, Any]:
+    """Validates the full V3 Block 1 policy shape and returns it normalized
+    (deduplicated, caller-given order preserved). Unknown keys and
+    recognized-but-malformed values both raise PrGateError - this is the
+    ONLY entry point evaluate_pr_gate() uses for policy input, so a typo'd
+    or invalid policy can never be silently ignored/fall back to "nothing
+    configured" (fail closed, never fail open)."""
     _require(isinstance(policy, dict), "policy must be a JSON object")
+    unknown_keys = sorted(set(policy.keys()) - _KNOWN_POLICY_KEYS)
+    _require(
+        not unknown_keys,
+        "policy contains unrecognized key(s) %r - must be a subset of %s; a typo'd or "
+        "outdated key is never silently ignored" % (unknown_keys, sorted(_KNOWN_POLICY_KEYS)),
+    )
+
     severities = policy.get("blockingSeverities")
     _require(
         isinstance(severities, list) and all(isinstance(s, str) for s in severities),
         "policy.blockingSeverities is required and must be a list of severity strings - "
         "thresholds are always an explicit caller input, never hardcoded or guessed",
     )
-    unknown = sorted(set(severities) - _VALID_SEVERITIES)
+    unknown_severities = sorted(set(severities) - _VALID_SEVERITIES)
     _require(
-        not unknown,
+        not unknown_severities,
         "policy.blockingSeverities contains unrecognized severity value(s) %r - must be a "
         "subset of %s (report-schema.json's own severity enum, never a different vocabulary)"
-        % (unknown, sorted(_VALID_SEVERITIES)),
+        % (unknown_severities, sorted(_VALID_SEVERITIES)),
     )
-    return list(dict.fromkeys(severities))  # de-duplicate, preserve caller-given order
+    normalized: Dict[str, Any] = {"blockingSeverities": list(dict.fromkeys(severities))}
+
+    if "minConfidence" in policy:
+        min_confidence = policy["minConfidence"]
+        _require(
+            isinstance(min_confidence, str) and min_confidence in _CONFIDENCE_RANK,
+            "policy.minConfidence must be one of %s" % sorted(_CONFIDENCE_RANK),
+        )
+        normalized["minConfidence"] = min_confidence
+
+    if "blockingCategories" in policy:
+        categories = policy["blockingCategories"]
+        _require(
+            isinstance(categories, list) and all(isinstance(cat, str) for cat in categories),
+            "policy.blockingCategories must be a list of category strings",
+        )
+        unknown_categories = sorted(set(categories) - set(preprocess.CATEGORIES))
+        _require(
+            not unknown_categories,
+            "policy.blockingCategories contains unrecognized category value(s) %r - must be a "
+            "subset of %s (preprocess.CATEGORIES's own SC01-SC10 keys, never a second list)"
+            % (unknown_categories, sorted(preprocess.CATEGORIES)),
+        )
+        normalized["blockingCategories"] = list(dict.fromkeys(categories))
+
+    return normalized
+
+
+def _is_blocking_finding(finding: Any, policy: Dict[str, Any]) -> bool:
+    """G3's per-finding predicate. minConfidence/blockingCategories only ever
+    NARROW which severity-matching findings block, and both follow the same
+    fail-closed rule: a finding is excluded ONLY when its own confidence/
+    category is a CONFIDENTLY-recognized value outside what the policy
+    asked for. A missing/malformed confidence or category on a finding
+    (never expected from this pipeline's own output, but never trusted
+    blindly either) is never treated as a free pass - it stays blocking."""
+    if not isinstance(finding, dict):
+        return False
+    if finding.get("severity") not in policy["blockingSeverities"]:
+        return False
+    min_confidence = policy.get("minConfidence")
+    if min_confidence is not None:
+        finding_rank = _CONFIDENCE_RANK.get(finding.get("confidence"))
+        if finding_rank is not None and finding_rank < _CONFIDENCE_RANK[min_confidence]:
+            return False
+    blocking_categories = policy.get("blockingCategories")
+    if blocking_categories is not None:
+        category = finding.get("category")
+        if category in preprocess.CATEGORIES and category not in blocking_categories:
+            return False
+    return True
 
 
 def evaluate_pr_gate(base_report: Dict[str, Any], head_report: Dict[str, Any], policy: Dict[str, Any]) -> Dict[str, Any]:
@@ -215,23 +311,58 @@ def evaluate_pr_gate(base_report: Dict[str, Any], head_report: Dict[str, Any], p
     describes the codebase's pre-existing history, not something this PR
     introduced, and never blocks it. blockingSeverities is REQUIRED,
     explicit, caller-supplied input; an empty list is a valid (if unusual)
-    caller choice meaning nothing blocks."""
+    caller choice meaning nothing blocks. minConfidence/blockingCategories
+    (V3 Block 1) are optional additional narrowing filters - see
+    _is_blocking_finding()."""
     diff = diff_reports(base_report, head_report)
-    blocking_severities = _require_blocking_severities(policy)
+    policy = _validate_policy(policy)
 
     new_findings = diff["newFindings"]
-    blocking_findings = [f for f in new_findings if isinstance(f, dict) and f.get("severity") in blocking_severities]
+    blocking_findings = [f for f in new_findings if _is_blocking_finding(f, policy)]
 
     return {
         "prGateVersion": PR_GATE_VERSION,
         "gateStatus": "FAIL" if blocking_findings else "PASS",
-        "policy": {"blockingSeverities": blocking_severities},
+        "policy": policy,
         "diff": diff,
         "blockingFindingCount": len(blocking_findings),
         "annotations": build_annotation_list(new_findings),
         "note": NEVER_SAFE_BY_SILENCE_NOTE,
         "boundaryNote": NEVER_A_GITHUB_CLIENT_NOTE,
     }
+
+
+# ---------------------------------------------------------------------------
+# V3 Block 1: human-readable rendering of a gate result (opt-in, `--format
+# text`). Pure presentation over evaluate_pr_gate()'s own, unmodified return
+# value - adds no new field, computes no new judgment.
+# ---------------------------------------------------------------------------
+
+def render_gate_text(result: Dict[str, Any]) -> str:
+    policy = result["policy"]
+    lines = [
+        "PR Security Gate: %s (%d blocking finding%s)"
+        % (result["gateStatus"], result["blockingFindingCount"], "" if result["blockingFindingCount"] == 1 else "s"),
+        "Policy: blockingSeverities=%s" % (", ".join(policy["blockingSeverities"]) or "(none)"),
+    ]
+    if policy.get("minConfidence"):
+        lines.append("        minConfidence=%s" % policy["minConfidence"])
+    if policy.get("blockingCategories"):
+        lines.append("        blockingCategories=%s" % ", ".join(policy["blockingCategories"]))
+    lines.append("")
+    lines.append("New findings introduced by this change (all of them, not only blocking ones):")
+    if not result["annotations"]:
+        lines.append("  (none)")
+    for ann in result["annotations"]:
+        location = "%s:%s" % (ann.get("file") or "?", ann.get("lineStart") if ann.get("lineStart") is not None else "?")
+        lines.append(
+            "  [%s] %s %s in %s (%s)"
+            % (ann.get("severity") or "?", ann.get("category") or "?", location, ann.get("function") or "?", ann.get("stableKey", "")[:12])
+        )
+    lines.append("")
+    lines.append(result["note"])
+    lines.append(result["boundaryNote"])
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -285,9 +416,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     gate_parser = subparsers.add_parser("gate", help="Diff base vs head scored reports and evaluate the PASS/FAIL policy.")
     gate_parser.add_argument("base_report", help="Path to the BASE ref's scored report JSON.")
     gate_parser.add_argument("head_report", help="Path to the HEAD ref's scored report JSON.")
-    gate_parser.add_argument("policy", help="Path to a JSON file: {\"blockingSeverities\": [...]}")
+    gate_parser.add_argument("policy", help="Path to a JSON file: {\"blockingSeverities\": [...], \"minConfidence\": \"high\"|\"medium\"|\"low\" (optional), \"blockingCategories\": [\"SC01\", ...] (optional)}")
     gate_parser.add_argument("--out", default=None, help="Write the result to this file instead of stdout.")
     gate_parser.add_argument("--indent", type=int, default=2, help="JSON indentation (0 for compact output).")
+    gate_parser.add_argument(
+        "--format", choices=["json", "text"], default="json",
+        help="Output shape (default: json, unchanged from V2.10). 'text' renders a human-readable summary instead.",
+    )
+    gate_parser.add_argument(
+        "--strict-exit", action="store_true",
+        help="Opt-in (default: off, unchanged from V2.10). When set, exit code %d (EXIT_GATE_BLOCKED) is returned "
+        "if gateStatus is FAIL, instead of the default %d. Without this flag, the process exit code reflects only "
+        "whether the gate ran successfully, never the gate decision itself - see the module docstring." % (EXIT_GATE_BLOCKED, EXIT_OK),
+    )
 
     return parser
 
@@ -309,13 +450,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     except (PrGateError, DiffError, OSError, json.JSONDecodeError) as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False), file=sys.stdout)
         return EXIT_FAILED
-    indent = args.indent if args.indent > 0 else None
-    text = json.dumps(result, ensure_ascii=False, indent=indent, sort_keys=True)
+
+    if args.gate_mode == "gate" and args.format == "text":
+        text = render_gate_text(result)
+    else:
+        indent = args.indent if args.indent > 0 else None
+        text = json.dumps(result, ensure_ascii=False, indent=indent, sort_keys=True)
+
     if args.out:
         with open(args.out, "w", encoding="utf-8") as handle:
             handle.write(text + "\n")
     else:
         print(text)
+
+    if args.gate_mode == "gate" and args.strict_exit and result["gateStatus"] == "FAIL":
+        return EXIT_GATE_BLOCKED
     return EXIT_OK
 
 

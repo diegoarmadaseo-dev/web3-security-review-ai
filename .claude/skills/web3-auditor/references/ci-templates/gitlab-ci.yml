@@ -1,0 +1,46 @@
+# Reference GitLab CI template for scripts/pr_gate.py (V3 Block 1,
+# "CI Security Gate 2.0"). Copy the relevant job into your .gitlab-ci.yml
+# and adjust the marked steps for your own project.
+#
+# What this script does NOT do (read before wiring this in):
+#   - It never calls the GitLab API, holds no token, and posts nothing
+#     itself - posting a merge-request note/annotation from
+#     gate-result.json is YOUR pipeline's job.
+#   - It never runs the AI-assisted analysis step (SKILL.md Step 6). Turning
+#     source into a scored report needs an AI-authored draft finding set
+#     produced by your own Skill/LLM integration BEFORE `analyze-pipeline`
+#     or `score` can run - this template does not invent that call.
+#   - This job only fails the pipeline if you set --strict-exit; without
+#     it, pr_gate.py always exits 0 and you must branch on gateStatus in
+#     gate-result.json yourself (see pr_gate.py's module docstring).
+
+security-gate:
+  stage: test
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  script:
+    # 1) Produce a SCORED report for the MR's base (target) ref and head
+    #    (source) ref. Placeholder: this is where your own pipeline runs
+    #    preprocess -> (your AI analysis step, Step 6) -> score for each
+    #    ref, writing base-report.json and head-report.json. Neither this
+    #    template nor pr_gate.py performs that step.
+    - echo "TODO: write base-report.json and head-report.json here"
+    - exit 1  # remove once the step above is wired up
+
+    # 2) Define your policy once, in-repo, versioned like any other config.
+    #    Minimal (V2.10-compatible): {"blockingSeverities": ["CRITICAL", "HIGH"]}
+    #    V3 Block 1 additions are optional - see: python cli.py pr-gate gate --help
+
+    # 3) Evaluate the gate. --strict-exit makes this job fail the pipeline
+    #    when gateStatus is FAIL; --format text is easier to read in the
+    #    job log, --format json (default) is what a later "post a note"
+    #    job should parse instead.
+    - >
+      python .claude/skills/web3-auditor/scripts/cli.py pr-gate gate
+      base-report.json head-report.json security-gate-policy.json
+      --strict-exit --format text --out gate-result.txt
+    - cat gate-result.txt
+  artifacts:
+    when: always
+    paths:
+      - gate-result.txt

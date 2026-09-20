@@ -1,0 +1,4 @@
+{
+  "blockingSeverities": ["CRITICAL", "HIGH"],
+  "minConfidence": "medium"
+}

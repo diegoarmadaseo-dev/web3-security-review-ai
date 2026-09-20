@@ -244,6 +244,165 @@ class PrGateEvaluationTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# V3 Block 1 "CI Security Gate 2.0": policy-as-config (minConfidence /
+# blockingCategories), strict validation, --strict-exit, --format text.
+# ---------------------------------------------------------------------------
+
+class PolicyAsConfigTests(unittest.TestCase):
+    """Positive/negative/adversarial coverage for the new, OPTIONAL policy
+    fields. Every case that used only blockingSeverities before this block
+    is covered by the untouched PrGateEvaluationTests above - this class
+    only adds cases for the new filters."""
+
+    # --- positive: minConfidence ---------------------------------------
+
+    def test_min_confidence_high_excludes_a_medium_confidence_finding(self):
+        result = pr_gate.evaluate_pr_gate(
+            make_report([]),
+            make_report([{**make_finding("f", severity="HIGH"), "confidence": "medium"}]),
+            {"blockingSeverities": ["HIGH"], "minConfidence": "high"},
+        )
+        self.assertEqual(result["gateStatus"], "PASS")
+        self.assertEqual(result["blockingFindingCount"], 0)
+
+    def test_min_confidence_high_still_blocks_a_high_confidence_finding(self):
+        result = pr_gate.evaluate_pr_gate(
+            make_report([]),
+            make_report([{**make_finding("f", severity="HIGH"), "confidence": "high"}]),
+            {"blockingSeverities": ["HIGH"], "minConfidence": "high"},
+        )
+        self.assertEqual(result["gateStatus"], "FAIL")
+
+    def test_min_confidence_is_omittable_and_preserves_v2_10_behavior(self):
+        # Backward compatibility: a policy with ONLY blockingSeverities
+        # (the entire V2.10 policy shape) must gate exactly as before.
+        result = pr_gate.evaluate_pr_gate(
+            make_report([]),
+            make_report([{**make_finding("f", severity="HIGH"), "confidence": "low"}]),
+            {"blockingSeverities": ["HIGH"]},
+        )
+        self.assertEqual(result["gateStatus"], "FAIL")
+        self.assertNotIn("minConfidence", result["policy"])
+
+    def test_adversarial_missing_confidence_on_finding_still_blocks_fail_closed(self):
+        finding = make_finding("f", severity="HIGH")
+        del finding["confidence"]
+        result = pr_gate.evaluate_pr_gate(
+            make_report([]), make_report([finding]),
+            {"blockingSeverities": ["HIGH"], "minConfidence": "high"},
+        )
+        self.assertEqual(result["gateStatus"], "FAIL", "a missing confidence must never be a free pass")
+
+    def test_adversarial_malformed_confidence_value_on_finding_still_blocks_fail_closed(self):
+        result = pr_gate.evaluate_pr_gate(
+            make_report([]),
+            make_report([{**make_finding("f", severity="HIGH"), "confidence": "VERY HIGH!!"}]),
+            {"blockingSeverities": ["HIGH"], "minConfidence": "high"},
+        )
+        self.assertEqual(result["gateStatus"], "FAIL")
+
+    # --- positive: blockingCategories -----------------------------------
+
+    def test_blocking_categories_excludes_a_category_not_in_the_list(self):
+        result = pr_gate.evaluate_pr_gate(
+            make_report([]), make_report([make_finding("f", category="SC08", severity="HIGH")]),
+            {"blockingSeverities": ["HIGH"], "blockingCategories": ["SC01"]},
+        )
+        self.assertEqual(result["gateStatus"], "PASS")
+
+    def test_blocking_categories_still_blocks_a_category_in_the_list(self):
+        result = pr_gate.evaluate_pr_gate(
+            make_report([]), make_report([make_finding("f", category="SC01", severity="HIGH")]),
+            {"blockingSeverities": ["HIGH"], "blockingCategories": ["SC01"]},
+        )
+        self.assertEqual(result["gateStatus"], "FAIL")
+
+    def test_threshold_edge_empty_blocking_categories_never_blocks(self):
+        # Same semantics as the pre-existing blockingSeverities: [] edge
+        # case (test_threshold_edge_empty_blocking_list_never_blocks): an
+        # empty allowlist is a valid (if unusual) caller choice meaning
+        # nothing blocks via this filter - never a free pass for OTHER
+        # findings, just an empty set of categories that qualify.
+        result = pr_gate.evaluate_pr_gate(
+            make_report([]), make_report([make_finding("f", category="SC01", severity="CRITICAL")]),
+            {"blockingSeverities": ["CRITICAL"], "blockingCategories": []},
+        )
+        self.assertEqual(result["gateStatus"], "PASS")
+        self.assertEqual(result["blockingFindingCount"], 0)
+
+    def test_adversarial_missing_category_on_finding_still_blocks_fail_closed(self):
+        finding = make_finding("f", severity="HIGH")
+        del finding["category"]
+        result = pr_gate.evaluate_pr_gate(
+            make_report([]), make_report([finding]),
+            {"blockingSeverities": ["HIGH"], "blockingCategories": ["SC01"]},
+        )
+        self.assertEqual(result["gateStatus"], "FAIL", "a missing category must never be a free pass")
+
+    def test_combined_filters_all_must_agree_to_block(self):
+        result = pr_gate.evaluate_pr_gate(
+            make_report([]),
+            make_report([{**make_finding("f", category="SC01", severity="HIGH"), "confidence": "low"}]),
+            {"blockingSeverities": ["HIGH"], "minConfidence": "high", "blockingCategories": ["SC01"]},
+        )
+        # HIGH severity + SC01 both match, but confidence "low" < "high" -> excluded.
+        self.assertEqual(result["gateStatus"], "PASS")
+
+    # --- negative: strict, fail-closed validation ------------------------
+
+    def test_unknown_policy_key_raises_never_silently_ignored(self):
+        with self.assertRaises(pr_gate.PrGateError):
+            pr_gate.evaluate_pr_gate(
+                make_report([]), make_report([]),
+                {"blockingSeverities": ["HIGH"], "blockingSeverity": ["HIGH"]},  # typo'd key
+            )
+
+    def test_invalid_min_confidence_value_raises(self):
+        with self.assertRaises(pr_gate.PrGateError):
+            pr_gate.evaluate_pr_gate(
+                make_report([]), make_report([]),
+                {"blockingSeverities": ["HIGH"], "minConfidence": "VERY_HIGH"},
+            )
+
+    def test_min_confidence_wrong_type_raises(self):
+        with self.assertRaises(pr_gate.PrGateError):
+            pr_gate.evaluate_pr_gate(
+                make_report([]), make_report([]),
+                {"blockingSeverities": ["HIGH"], "minConfidence": 1},
+            )
+
+    def test_blocking_categories_wrong_type_raises(self):
+        with self.assertRaises(pr_gate.PrGateError):
+            pr_gate.evaluate_pr_gate(
+                make_report([]), make_report([]),
+                {"blockingSeverities": ["HIGH"], "blockingCategories": "SC01"},
+            )
+
+    def test_blocking_categories_unknown_category_raises(self):
+        with self.assertRaises(pr_gate.PrGateError):
+            pr_gate.evaluate_pr_gate(
+                make_report([]), make_report([]),
+                {"blockingSeverities": ["HIGH"], "blockingCategories": ["SC99"]},
+            )
+
+    def test_blocking_categories_non_string_entries_raise(self):
+        with self.assertRaises(pr_gate.PrGateError):
+            pr_gate.evaluate_pr_gate(
+                make_report([]), make_report([]),
+                {"blockingSeverities": ["HIGH"], "blockingCategories": [1]},
+            )
+
+    def test_reuses_preprocess_categories_never_a_second_hardcoded_list(self):
+        # Single-source-of-truth check: every SC01-SC10 key must be valid.
+        for category in preprocess.CATEGORIES:
+            result = pr_gate.evaluate_pr_gate(
+                make_report([]), make_report([make_finding("f", category=category, severity="HIGH")]),
+                {"blockingSeverities": ["HIGH"], "blockingCategories": [category]},
+            )
+            self.assertEqual(result["gateStatus"], "FAIL", category)
+
+
+# ---------------------------------------------------------------------------
 # G4: provider-agnostic annotations, secrets safety
 # ---------------------------------------------------------------------------
 
@@ -367,6 +526,82 @@ class CliTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             pr_gate.main(["gate", "only_one.json"])
 
+    def _write_gate_inputs(self, tmp, head_findings, policy):
+        base_p, head_p, policy_p = Path(tmp) / "base.json", Path(tmp) / "head.json", Path(tmp) / "policy.json"
+        base_p.write_text(json.dumps(make_report([])), encoding="utf-8")
+        head_p.write_text(json.dumps(make_report(head_findings)), encoding="utf-8")
+        policy_p.write_text(json.dumps(policy), encoding="utf-8")
+        return str(base_p), str(head_p), str(policy_p)
+
+    def test_strict_exit_is_opt_in_default_behavior_is_byte_for_byte_unchanged(self):
+        # Same scenario as test_gate_cli_end_to_end, asserted again here to
+        # make the V3 Block 1 non-regression explicit: omitting --strict-exit
+        # must still exit EXIT_OK on a FAIL gateStatus.
+        with tempfile.TemporaryDirectory() as tmp:
+            base_p, head_p, policy_p = self._write_gate_inputs(
+                tmp, [make_finding("f", severity="HIGH")], {"blockingSeverities": ["HIGH"]}
+            )
+            exit_code, out = self._run_cli(["gate", base_p, head_p, policy_p])
+        self.assertEqual(exit_code, pr_gate.EXIT_OK)
+        self.assertEqual(json.loads(out)["gateStatus"], "FAIL")
+
+    def test_strict_exit_returns_gate_blocked_code_on_fail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_p, head_p, policy_p = self._write_gate_inputs(
+                tmp, [make_finding("f", severity="HIGH")], {"blockingSeverities": ["HIGH"]}
+            )
+            exit_code, out = self._run_cli(["gate", base_p, head_p, policy_p, "--strict-exit"])
+        self.assertEqual(exit_code, pr_gate.EXIT_GATE_BLOCKED)
+        self.assertNotEqual(pr_gate.EXIT_GATE_BLOCKED, pr_gate.EXIT_FAILED, "a gate FAIL must be distinguishable from a tool/input error")
+        self.assertEqual(json.loads(out)["gateStatus"], "FAIL")  # --strict-exit never changes the JSON payload itself
+
+    def test_strict_exit_still_returns_ok_code_on_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_p, head_p, policy_p = self._write_gate_inputs(tmp, [], {"blockingSeverities": ["HIGH"]})
+            exit_code, out = self._run_cli(["gate", base_p, head_p, policy_p, "--strict-exit"])
+        self.assertEqual(exit_code, pr_gate.EXIT_OK)
+        self.assertEqual(json.loads(out)["gateStatus"], "PASS")
+
+    def test_strict_exit_on_a_tool_error_is_still_exit_failed_not_gate_blocked(self):
+        # Adversarial: an invalid policy must never be mistaken for (or
+        # silently downgraded to) a normal gate FAIL - it is a distinct,
+        # explicit tool error even with --strict-exit set.
+        with tempfile.TemporaryDirectory() as tmp:
+            base_p, head_p, policy_p = self._write_gate_inputs(tmp, [], {"blockingSeverities": ["NOT_REAL"]})
+            exit_code, out = self._run_cli(["gate", base_p, head_p, policy_p, "--strict-exit"])
+        self.assertEqual(exit_code, pr_gate.EXIT_FAILED)
+        self.assertFalse(json.loads(out)["ok"])
+
+    def test_format_text_is_opt_in_default_is_still_valid_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_p, head_p, policy_p = self._write_gate_inputs(
+                tmp, [make_finding("f", severity="HIGH")], {"blockingSeverities": ["HIGH"]}
+            )
+            exit_code, out = self._run_cli(["gate", base_p, head_p, policy_p])
+        json.loads(out)  # must not raise
+
+    def test_format_text_renders_a_human_readable_non_json_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_p, head_p, policy_p = self._write_gate_inputs(
+                tmp, [make_finding("f", severity="HIGH")], {"blockingSeverities": ["HIGH"]}
+            )
+            exit_code, out = self._run_cli(["gate", base_p, head_p, policy_p, "--format", "text"])
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(out)
+        self.assertIn("PR Security Gate: FAIL", out)
+        self.assertIn("1 blocking finding", out)
+
+    def test_format_text_never_includes_a_findings_free_text_field(self):
+        # Same secrets-safety property as G4's structured annotations,
+        # verified again at the human-readable-rendering boundary.
+        with tempfile.TemporaryDirectory() as tmp:
+            base_p, head_p, policy_p = self._write_gate_inputs(
+                tmp, [make_finding("f", severity="HIGH")], {"blockingSeverities": ["HIGH"]}
+            )
+            exit_code, out = self._run_cli(["gate", base_p, head_p, policy_p, "--format", "text"])
+        self.assertNotIn("API_KEY", out)
+        self.assertNotIn("a secret-adjacent description", out)
+
 
 # ---------------------------------------------------------------------------
 # Schema drift
@@ -390,6 +625,31 @@ class SchemaDriftTests(unittest.TestCase):
         required = set(schema["definitions"]["gateResult"]["properties"]["annotations"]["items"]["required"])
         annotations = pr_gate.build_annotation_list([make_finding("f")])
         self.assertEqual(required, set(annotations[0].keys()))
+
+    def test_policy_optional_fields_are_declared_in_schema_not_just_in_code(self):
+        # V3 Block 1: the schema's policy.properties must name every key
+        # _validate_policy() accepts, or the schema silently drifts from
+        # the real, permissive-when-valid contract. blockingCategories is
+        # deliberately NOT schema-enum-validated against a fixed list (see
+        # the schema's own description) - preprocess.CATEGORIES is broader
+        # than SC01-SC10 (it also has supplementary EXTRA-* checks) and is
+        # itself the single source of truth _validate_policy() reuses.
+        schema = json.loads((REFERENCES_DIR / "pr-gate-schema.json").read_text(encoding="utf-8"))
+        policy_schema = schema["definitions"]["gateResult"]["properties"]["policy"]
+        self.assertEqual(set(policy_schema["properties"].keys()), pr_gate._KNOWN_POLICY_KEYS)
+        self.assertNotIn("enum", policy_schema["properties"]["blockingCategories"]["items"])
+        self.assertTrue(set(preprocess.CATEGORIES) - {"SC01", "SC02", "SC03", "SC04", "SC05", "SC06", "SC07", "SC08", "SC09", "SC10"})
+
+    def test_gate_result_with_full_v3_policy_still_matches_schema_required_fields(self):
+        # The extended policy shape must not add/remove any TOP-LEVEL
+        # gateResult key - only policy's own (optional) sub-fields grow.
+        schema = json.loads((REFERENCES_DIR / "pr-gate-schema.json").read_text(encoding="utf-8"))
+        required = set(schema["definitions"]["gateResult"]["required"])
+        result = pr_gate.evaluate_pr_gate(
+            make_report([]), make_report([make_finding("f")]),
+            {"blockingSeverities": ["HIGH"], "minConfidence": "medium", "blockingCategories": ["SC01"]},
+        )
+        self.assertEqual(required, set(result.keys()))
 
 
 if __name__ == "__main__":

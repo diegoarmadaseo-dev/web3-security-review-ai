@@ -1,0 +1,61 @@
+# Reference GitHub Actions template for scripts/pr_gate.py (V3 Block 1,
+# "CI Security Gate 2.0"). Copy this into .github/workflows/ and adjust the
+# marked steps for your own repository.
+#
+# What this script does NOT do (read before wiring this in):
+#   - It never calls the GitHub API, holds no token, and posts nothing
+#     itself - posting a PR comment/annotation from `gate-result.json` is
+#     YOUR workflow's job (see pr_gate.py's own NEVER_A_GITHUB_CLIENT_NOTE).
+#   - It never runs the AI-assisted analysis step (SKILL.md Step 6). Turning
+#     source into a scored report needs an AI-authored draft finding set
+#     produced by your own Skill/LLM integration BEFORE `analyze-pipeline`
+#     or `score` can run - this template does not invent that call.
+#   - This job only fails if you set --strict-exit; without it, pr_gate.py
+#     always exits 0 and you must branch on gateStatus in gate-result.json
+#     yourself (see pr_gate.py's module docstring for why that is the
+#     V2.10 default).
+
+name: security-gate
+
+on:
+  pull_request:
+
+jobs:
+  security-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1) Produce a SCORED report for the PR's base ref and head ref.
+      #    Placeholder: this is where your own pipeline runs preprocess ->
+      #    (your AI analysis step, Step 6) -> score for each ref, writing
+      #    base-report.json and head-report.json. Neither this template nor
+      #    pr_gate.py performs that step.
+      - name: Produce base/head scored reports
+        run: |
+          echo "TODO: write base-report.json and head-report.json here"
+          exit 1  # remove once the step above is wired up
+
+      # 2) Define your policy once, in-repo, versioned like any other config.
+      #    Minimal (V2.10-compatible): {"blockingSeverities": ["CRITICAL", "HIGH"]}
+      #    V3 Block 1 additions are optional - see gate --help.
+
+      # 3) Evaluate the gate. --strict-exit makes THIS STEP fail the job
+      #    when gateStatus is FAIL; --format text is easier to read in logs,
+      #    --format json (default) is what a later "post a comment" step
+      #    should parse instead.
+      - name: Run CI Security Gate
+        run: |
+          python .claude/skills/web3-auditor/scripts/cli.py pr-gate gate \
+            base-report.json head-report.json security-gate-policy.json \
+            --strict-exit --format text --out gate-result.txt
+          cat gate-result.txt
+
+      # 4) Optional: upload the machine-readable result for a later step
+      #    (e.g. your own PR-comment job) to consume.
+      - name: Upload gate result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-gate-result
+          path: gate-result.txt
