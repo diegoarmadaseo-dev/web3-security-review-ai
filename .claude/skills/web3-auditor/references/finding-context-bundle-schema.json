@@ -1,0 +1,26 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "finding_context_bundle.py output (V3 Block 8, G1, docs/decisiones.md D-076)",
+  "description": "Documentation reference only, not executed at runtime. Pure data assembly only - every field is copied unchanged from preprocess.py's own output; no new judgment, severity, or finding is introduced.",
+  "type": "object",
+  "required": ["findingContextBundleVersion", "contractKey", "function", "contract", "matchedFunction", "systemGraph", "note"],
+  "additionalProperties": false,
+  "properties": {
+    "findingContextBundleVersion": {"type": "string"},
+    "contractKey": {"type": "string"},
+    "function": {"type": ["string", "null"]},
+    "contract": {"type": "object"},
+    "matchedFunction": {"type": ["object", "null"]},
+    "systemGraph": {
+      "type": "object",
+      "required": ["status", "contractEdges", "functionEdges"],
+      "additionalProperties": false,
+      "properties": {
+        "status": {"enum": ["computed", "not_computed"]},
+        "contractEdges": {"type": "array"},
+        "functionEdges": {"type": ["array", "null"]}
+      }
+    },
+    "note": {"type": "string"}
+  }
+}

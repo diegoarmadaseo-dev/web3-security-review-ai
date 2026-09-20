@@ -1,0 +1,28 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "advisory_gate.py output (V3 Block 8, G2, docs/decisiones.md D-076)",
+  "description": "Documentation reference only, not executed at runtime. Aggregates each advisory tool's own already-computed signal only - no new severity or judgment; an unrecognized or missing per-tool signal is NOT_ASSESSED, never PASS.",
+  "type": "object",
+  "required": ["advisoryGateVersion", "overall", "okCount", "flagCount", "notAssessedCount", "tools", "note"],
+  "additionalProperties": false,
+  "properties": {
+    "advisoryGateVersion": {"type": "string"},
+    "overall": {"enum": ["PASS", "FAIL", "INCOMPLETE"]},
+    "okCount": {"type": "integer", "minimum": 0},
+    "flagCount": {"type": "integer", "minimum": 0},
+    "notAssessedCount": {"type": "integer", "minimum": 0},
+    "note": {"type": "string"},
+    "tools": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["outcome", "rawSignal"],
+        "additionalProperties": false,
+        "properties": {
+          "outcome": {"enum": ["OK", "FLAG", "NOT_ASSESSED"]},
+          "rawSignal": {}
+        }
+      }
+    }
+  }
+}

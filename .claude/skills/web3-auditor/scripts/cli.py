@@ -62,6 +62,8 @@ COMMANDS = {
     "upgrade-authority-guard": "upgrade_authority_guard",
     "bytecode-metamorphic-signal": "bytecode_metamorphic_signal",
     "implementation-constructor-signal": "implementation_constructor_signal",
+    "finding-context-bundle": "finding_context_bundle",
+    "advisory-gate": "advisory_gate",
 }
 
 
