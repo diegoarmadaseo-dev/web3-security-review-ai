@@ -3,7 +3,7 @@
   "mode": "standard",
   "language": "en",
   "targetCategory": "SC07",
-  "allowedCategories": ["SC07"],
+  "allowedCategories": ["SC07", "SC01"],
   "expectedCompleteness": "complete",
   "expectedCompletenessReasonCodes": [],
   "injectionExpected": false,
