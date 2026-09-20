@@ -36,7 +36,8 @@
     },
     {
       "category": "SC08",
-      "status": "DETECTED"
+      "note": "The missing-cumulative-tracking root cause (no state records the amount already released) also enables a same-transaction reentrant exploit via beneficiary's receive/fallback, but this shares SC02's invariant and remediation exactly (see F-58ed17be) rather than being a second, independent root cause: fixing the SC02 finding (update released before the transfer) closes this path too, so it is not reported as a separate finding here.",
+      "status": "NOT_DETECTED"
     },
     {
       "category": "SC09",
@@ -53,44 +54,9 @@
   "compilerVersion": "0.8.20",
   "findings": [
     {
-      "category": "SC08",
-      "confidence": "high",
-      "description": "release() sends ETH to beneficiary via a low-level call and never writes to any state variable, either before or after that call. Because vestedAmount() depends only on block.timestamp, which does not change within a transaction, and no state tracks how much has already been paid out, the amount computed is identical on every call made in the same block. If beneficiary is, or later becomes, a contract, its receive/fallback function can call release() again before the outer call returns, and that reentrant call will pass the same beneficiary check and recompute the same payable amount. Nested reentrant calls can repeat this until the contract's ETH balance is exhausted, letting the beneficiary withdraw far more than the amount that has actually vested - potentially the entire balance held by the contract - in a single transaction, completely bypassing the time-based release schedule the contract exists to enforce.",
-      "evidence": [
-        "function release() external {",
-        "uint256 amount = vestedAmount();",
-        "(bool ok, ) = beneficiary.call{value: amount}(\"\");",
-        "require(ok, \"transfer failed\");"
-      ],
-      "id": "F-faf2f7f0",
-      "locations": [
-        {
-          "contract": "SimpleVesting",
-          "file": "contract_d.sol",
-          "function": "vestedAmount",
-          "lineEnd": 21,
-          "lineStart": 17
-        },
-        {
-          "contract": "SimpleVesting",
-          "file": "contract_d.sol",
-          "function": "release",
-          "lineEnd": 28,
-          "lineStart": 24
-        }
-      ],
-      "mergedCount": 1,
-      "patch": null,
-      "recommendation": "Add a state variable (e.g. released) that records cumulative amount paid out, update it to reflect the new total before making the external call (checks-effects-interactions), and only transfer vestedAmount() - released. Additionally apply a reentrancy guard (e.g. OpenZeppelin's ReentrancyGuard/nonReentrant) as defense in depth.",
-      "severity": "CRITICAL",
-      "signature": "reentrant-release-drains-full-balance",
-      "stableKey": "sha256:faf2f7f016cfa78d53109905d29ab708f7878cb3dcf5f2169a8a41594f099b32",
-      "status": "suspected"
-    },
-    {
       "category": "SC02",
       "confidence": "high",
-      "description": "vestedAmount() always returns the total amount vested since startTime, not the amount still owed, and release() forwards this full to-date figure on every single call instead of the incremental unreleased balance. Even with a single, non-malicious beneficiary calling release() more than once as time passes - an ordinary way to interact with a vesting contract - the second call will try to resend the entire cumulative vested amount again. If the contract holds only totalAllocation, this second call reverts once the already-paid amount exceeds the remaining balance, permanently stranding the rest of the beneficiary's legitimately vested funds since no other withdrawal path exists. If the contract instead holds surplus ETH (for example, extra deposits through the payable receive() function), subsequent calls overpay the beneficiary beyond their true entitlement. Either way, the contract does not actually implement incremental vested-claim accounting.",
+      "description": "vestedAmount() always returns the total amount vested since startTime, not the amount still owed, and release() forwards this full to-date figure on every single call instead of the incremental unreleased balance - the contract does not actually implement incremental vested-claim accounting (invariant violated: cumulative amount released must never exceed vestedAmount() minus what was already released). Even with a single, non-malicious beneficiary calling release() more than once as time passes - an ordinary way to interact with a vesting contract - the second call will try to resend the entire cumulative vested amount again, either reverting once the already-paid amount exceeds the remaining balance (permanently stranding the rest of the beneficiary's legitimately vested funds) or, if the contract holds surplus ETH, overpaying beyond the true entitlement. The same missing state update also means that if beneficiary is, or later becomes, a contract, its receive/fallback function can call release() again before the outer call returns and pass the identical check, letting a single transaction's worth of reentrant calls drain far more than what has actually vested - potentially the entire balance - in one shot rather than over several separate calls. Both paths share one root cause and one fix.",
       "evidence": [
         "return (totalAllocation * (block.timestamp - startTime)) / duration;",
         "uint256 amount = vestedAmount();",
@@ -115,8 +81,8 @@
       ],
       "mergedCount": 1,
       "patch": null,
-      "recommendation": "Introduce a released state variable, compute the newly claimable amount as vestedAmount() - released on each call, transfer only that delta, and update released before the transfer.",
-      "severity": "HIGH",
+      "recommendation": "Introduce a released state variable, compute the newly claimable amount as vestedAmount() - released on each call, transfer only that delta, and update released before the transfer (checks-effects-interactions - this ordering is what also closes the reentrant path). Optionally apply a reentrancy guard as defense in depth.",
+      "severity": "CRITICAL",
       "signature": "vested-amount-ignores-prior-releases",
       "stableKey": "sha256:58ed17be3a2637680ffa9875d11a29d788c24b14742283714ef90d62d04bf50c",
       "status": "suspected"

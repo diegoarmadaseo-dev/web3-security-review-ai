@@ -45,6 +45,7 @@ COMMANDS = {
     "monitor": "monitor_diff",
     "pr-gate": "pr_gate",
     "analyze-pipeline": "analyze_pipeline",
+    "verify-evidence": "evidence_locality",
 }
 
 

@@ -97,8 +97,29 @@ repeating the value, a fragment of it, or naming which kind it looked like beyon
 Using the preprocess artifact as data (Step 2), decide which signals rise to real findings in context.
 A signal firing is never by itself a finding - `references/checklist.md` documents each family's
 `fpRisk` and what would need to be true for it to matter. Categories SC02-SC04 in particular need
-real contextual support; without it, keep `confidence` at `medium` or `low` rather than promoting a
-bare signal.
+real contextual support: the finding's own `description` must state the SPECIFIC invariant this
+violates (e.g. "cumulative amount released must never exceed the vested amount less what was already
+released") or the SPECIFIC external dependency being exploited (e.g. "reads price directly from this
+unguarded AMM call, with no TWAP/staleness check"). A description that only restates the category name
+or pattern-matches a keyword ("involves price", "involves a flash loan") without naming that
+invariant/dependency does not count as real contextual support - without it, cap `confidence` at
+`medium` (never `high`) rather than promoting a bare signal to `high`/`critical`. A named invariant
+that turns out to be genuinely distinct from every other drafted finding's invariant is real support
+on its own merits, even in a case built around a different target category - do not suppress or cap a
+finding just because it wasn't what the input was expected to contain.
+
+Before finalizing any `HIGH`/`CRITICAL` finding, re-examine it once, adversarially: does its evidence
+actually support its OWN category, or does it share the same root cause/invariant as another finding
+already drafted under a different category? Two findings describing the same underlying defect from
+two angles (e.g. "repeated ordinary calls drain funds" and "a reentrant callback drains funds", when
+neither names an invariant the other doesn't already cover) are one finding, not two - keep it under
+its primary/best-fitting category and remove the other, never keep both. This self-check may downgrade
+confidence/severity, recategorize, merge, or remove a finding; it must never invent a new finding,
+invent evidence, or rewrite evidence to make a finding fit. `scripts/evidence_locality.py`
+(`cli.py verify-evidence`) can check a draft's evidence against the actual source text
+deterministically - given `{"findings": [...], "sourceFiles": {path: text}}`, it flags each finding
+`verified`/`location_mismatch`/`fabricated`/`unverifiable`. A `fabricated` result, or an unresolved
+`location_mismatch`, means remove or downgrade that finding - never patch its evidence to pass.
 
 When `systemGraph.status` is `"computed"` (`pro` mode only), use it to reason across contracts: its
 `nodes`/`edges` (`inherits`, `calls`, `delegatesTo`) and `proxies[]` can help correlate a signal in one
