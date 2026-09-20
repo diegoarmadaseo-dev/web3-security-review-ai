@@ -1,0 +1,29 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "bytecode_advisory.py output (V3 Block 3, B3, docs/decisiones.md D-071)",
+  "description": "Documentation reference only, not executed at runtime. Advisory only: no severity field anywhere - confidence is always the fixed string 'low'.",
+  "type": "object",
+  "required": ["bytecodeAdvisoryVersion", "status", "cborMetadataStripped", "advisories", "advisoryCount", "note"],
+  "additionalProperties": false,
+  "properties": {
+    "bytecodeAdvisoryVersion": {"type": "string"},
+    "status": {"const": "computed"},
+    "cborMetadataStripped": {"type": "boolean"},
+    "advisoryCount": {"type": "integer", "minimum": 0},
+    "note": {"type": "string"},
+    "advisories": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["opcode", "opcodeHex", "confidence", "note"],
+        "additionalProperties": false,
+        "properties": {
+          "opcode": {"enum": ["DELEGATECALL", "CALLCODE", "SELFDESTRUCT"]},
+          "opcodeHex": {"type": "string", "pattern": "^0x[0-9a-f]{2}$"},
+          "confidence": {"const": "low"},
+          "note": {"type": "string"}
+        }
+      }
+    }
+  }
+}

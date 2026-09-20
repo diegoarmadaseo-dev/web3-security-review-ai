@@ -1,0 +1,49 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "storage_layout.py output (V3 Block 3, B1, docs/decisiones.md D-071)",
+  "description": "Documentation reference only, not executed at runtime (same status as bytecode-compare-schema.json/monitor-diff-schema.json - only report-schema.json has an executable counterpart, validate_report.py). constant/immutable variables are excluded from the underlying comparison entirely (neither occupies a real storage slot).",
+  "type": "object",
+  "required": ["storageLayoutVersion", "contractsCompared", "contractsAtRisk", "results", "scopeNote"],
+  "additionalProperties": false,
+  "properties": {
+    "storageLayoutVersion": {"type": "string"},
+    "contractsCompared": {"type": "array", "items": {"type": "string"}},
+    "contractsAtRisk": {"type": "array", "items": {"type": "string"}},
+    "scopeNote": {"type": "string"},
+    "results": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["status", "v1Count", "v2Count", "firstDivergenceIndex", "collisions"],
+        "additionalProperties": false,
+        "properties": {
+          "status": {"enum": ["unchanged", "safe_append", "collision_risk"]},
+          "v1Count": {"type": "integer", "minimum": 0},
+          "v2Count": {"type": "integer", "minimum": 0},
+          "firstDivergenceIndex": {"type": ["integer", "null"], "minimum": 0},
+          "collisions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["index", "v1", "v2"],
+              "additionalProperties": false,
+              "properties": {
+                "index": {"type": "integer", "minimum": 0},
+                "v1": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/varRef"}]},
+                "v2": {"anyOf": [{"type": "null"}, {"$ref": "#/definitions/varRef"}]}
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "varRef": {
+      "type": "object",
+      "required": ["name", "type"],
+      "additionalProperties": false,
+      "properties": {"name": {"type": "string"}, "type": {"type": ["string", "null"]}}
+    }
+  }
+}

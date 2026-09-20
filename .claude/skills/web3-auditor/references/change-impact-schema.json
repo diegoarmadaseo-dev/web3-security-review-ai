@@ -1,0 +1,26 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "change_impact.py output (V3 Block 3, B4, docs/decisiones.md D-071)",
+  "description": "Documentation reference only, not executed at runtime. Purely structural classification over a diff_reports.py 'preprocess'-mode output - never a finding, never a severity, never touches score.py.",
+  "type": "object",
+  "required": ["changeImpactVersion", "overall", "overallReasons", "perContract", "note"],
+  "additionalProperties": false,
+  "properties": {
+    "changeImpactVersion": {"type": "string"},
+    "overall": {"enum": ["NO_CHANGE", "SAFE", "REVIEW_RECOMMENDED"]},
+    "overallReasons": {"type": "array", "items": {"type": "string"}},
+    "note": {"type": "string"},
+    "perContract": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["classification", "reasons"],
+        "additionalProperties": false,
+        "properties": {
+          "classification": {"enum": ["NO_CHANGE", "SAFE", "REVIEW_RECOMMENDED"]},
+          "reasons": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    }
+  }
+}

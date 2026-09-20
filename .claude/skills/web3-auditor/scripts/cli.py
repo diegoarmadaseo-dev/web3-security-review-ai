@@ -46,6 +46,10 @@ COMMANDS = {
     "pr-gate": "pr_gate",
     "analyze-pipeline": "analyze_pipeline",
     "verify-evidence": "evidence_locality",
+    "storage-layout": "storage_layout",
+    "privilege-path": "privilege_path",
+    "bytecode-advisory": "bytecode_advisory",
+    "change-impact": "change_impact",
 }
 
 

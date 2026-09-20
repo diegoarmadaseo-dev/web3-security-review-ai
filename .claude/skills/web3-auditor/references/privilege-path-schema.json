@@ -1,0 +1,59 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "privilege_path.py output (V3 Block 3, B2, docs/decisiones.md D-071)",
+  "description": "Documentation reference only, not executed at runtime. Advisory only: notice there is deliberately no severity field anywhere in this shape - confidence is always the fixed string 'low'.",
+  "type": "object",
+  "required": ["privilegePathVersion", "status", "paths"],
+  "additionalProperties": false,
+  "properties": {
+    "privilegePathVersion": {"type": "string"},
+    "status": {"enum": ["computed", "not_computed"]},
+    "message": {"type": "string"},
+    "paths": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["entry", "target", "hops", "confidence", "matchedOverloads", "ambiguousOverload"],
+        "additionalProperties": false,
+        "properties": {
+          "entry": {"$ref": "#/definitions/contractFunction"},
+          "target": {"$ref": "#/definitions/contractFunction"},
+          "confidence": {"const": "low"},
+          "matchedOverloads": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string"},
+            "description": "Param signature(s) of every overload at target.function that is itself exposed - a bare call-graph edge cannot say which overload is really invoked, so every exposed one is listed rather than guessing."
+          },
+          "ambiguousOverload": {
+            "type": "boolean",
+            "description": "True when target.function resolves to more than one overload in that contract (regardless of how many are exposed)."
+          },
+          "hops": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["from", "fromFunction", "to", "toFunction"],
+              "additionalProperties": false,
+              "properties": {
+                "from": {"type": "string"},
+                "fromFunction": {"type": "string"},
+                "to": {"type": "string"},
+                "toFunction": {"type": "string"}
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "contractFunction": {
+      "type": "object",
+      "required": ["contract", "function"],
+      "additionalProperties": false,
+      "properties": {"contract": {"type": "string"}, "function": {"type": "string"}}
+    }
+  }
+}
