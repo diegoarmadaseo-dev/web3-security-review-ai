@@ -1,0 +1,26 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "delegatecall_cycle.py output (V3 Block 6, E1, docs/decisiones.md D-074)",
+  "description": "Documentation reference only, not executed at runtime. Advisory graph fact only - no severity field anywhere, never a claim of runtime reachability.",
+  "type": "object",
+  "required": ["delegatecallCycleVersion", "status", "cycles"],
+  "additionalProperties": false,
+  "properties": {
+    "delegatecallCycleVersion": {"type": "string"},
+    "status": {"enum": ["cycle_found", "no_cycle", "not_computed"]},
+    "message": {"type": "string"},
+    "note": {"type": "string"},
+    "cycles": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "confidence"],
+        "additionalProperties": false,
+        "properties": {
+          "path": {"type": "array", "items": {"type": "string"}, "minItems": 2},
+          "confidence": {"const": "low"}
+        }
+      }
+    }
+  }
+}

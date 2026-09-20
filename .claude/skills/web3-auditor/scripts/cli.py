@@ -56,6 +56,9 @@ COMMANDS = {
     "initializer-safety": "initializer_safety",
     "bytecode-size": "bytecode_size",
     "bytecode-compiler-bugs": "bytecode_compiler_bugs",
+    "delegatecall-cycle": "delegatecall_cycle",
+    "constructor-zero-address": "constructor_zero_address",
+    "render-advisory-summary": "render_advisory_summary",
 }
 
 

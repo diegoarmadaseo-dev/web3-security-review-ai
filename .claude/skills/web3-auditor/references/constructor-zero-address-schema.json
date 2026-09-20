@@ -1,0 +1,26 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "constructor_zero_address.py output (V3 Block 6, E2, docs/decisiones.md D-074)",
+  "description": "Documentation reference only, not executed at runtime. Sanity signal only - the zero address may be intentional, never a severity or a claim of wrongness.",
+  "type": "object",
+  "required": ["constructorZeroAddressVersion", "contractKey", "status", "flagged", "note"],
+  "additionalProperties": false,
+  "properties": {
+    "constructorZeroAddressVersion": {"type": "string"},
+    "contractKey": {"type": "string"},
+    "status": {"enum": ["clean", "flagged", "no_constructor"]},
+    "note": {"type": "string"},
+    "flagged": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["paramName", "paramIndex"],
+        "additionalProperties": false,
+        "properties": {
+          "paramName": {"type": ["string", "null"]},
+          "paramIndex": {"type": "integer", "minimum": 0}
+        }
+      }
+    }
+  }
+}

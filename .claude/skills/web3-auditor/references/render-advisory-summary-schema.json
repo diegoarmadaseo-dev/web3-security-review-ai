@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "render_advisory_summary.py INPUT (V3 Block 6, E3, docs/decisiones.md D-074)",
+  "description": "Documentation reference only, not executed at runtime. This tool's OUTPUT is Markdown prose (no schema applies); this describes its INPUT bundle instead. Every key is optional - a tool the caller didn't run is simply absent, never a placeholder. additionalProperties is true: an unknown key is rendered generically under its own name rather than rejected, since this module never judges which sections 'should' exist.",
+  "type": "object",
+  "additionalProperties": {"type": "object"},
+  "properties": {
+    "storageLayout": {"type": "object", "description": "storage_layout.py output (B1)"},
+    "privilegePath": {"type": "object", "description": "privilege_path.py output (B2)"},
+    "bytecodeAdvisory": {"type": "object", "description": "bytecode_advisory.py output (B3)"},
+    "changeImpact": {"type": "object", "description": "change_impact.py output (B4)"},
+    "proxyFingerprint": {"type": "object", "description": "proxy_fingerprint.py output (C1)"},
+    "compilerBugs": {"type": "object", "description": "compiler_bugs.py output (C2)"},
+    "upgradeGap": {"type": "object", "description": "upgrade_gap.py output (C3)"},
+    "initializerSafety": {"type": "object", "description": "initializer_safety.py output (D1)"},
+    "bytecodeSize": {"type": "object", "description": "bytecode_size.py output (D2)"},
+    "bytecodeCompilerBugs": {"type": "object", "description": "bytecode_compiler_bugs.py output (D3)"},
+    "delegatecallCycle": {"type": "object", "description": "delegatecall_cycle.py output (E1)"},
+    "constructorZeroAddress": {"type": "object", "description": "constructor_zero_address.py output (E2)"}
+  }
+}
