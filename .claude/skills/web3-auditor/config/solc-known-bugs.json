@@ -1,0 +1,25 @@
+{
+  "datasetVersion": "2026.1-stub",
+  "sourceUrl": "https://docs.soliditylang.org/en/latest/bugs.html",
+  "provenance": "STUB DATASET, illustrative only. Written from training knowledge with NO live network verification this session (this analyzer's core is network-free by design and has no way to fetch Solidity's own published bugs.json). Every entry below has \"verified\": false: its version boundaries are NOT independently confirmed. Diego must replace bugs[] with a real snapshot of the official list (fetched and reviewed by a human) before this dataset is relied on for any real deployment decision - see docs/decisiones.md D-072.",
+  "bugs": [
+    {
+      "uid": "STUB-0001",
+      "name": "ABIEncoderV2 struct/array encoding issues (illustrative placeholder)",
+      "introducedVersion": "0.5.0",
+      "fixedVersion": "0.5.10",
+      "severity": "medium",
+      "summary": "Placeholder entry representing the class of early ABIEncoderV2 storage/array encoding bugs documented in Solidity's own bug list for the 0.5.x line. Exact affected range NOT independently verified this session.",
+      "verified": false
+    },
+    {
+      "uid": "STUB-0002",
+      "name": "Yul optimizer memory-side-effect issues (illustrative placeholder)",
+      "introducedVersion": "0.8.13",
+      "fixedVersion": "0.8.15",
+      "severity": "medium",
+      "summary": "Placeholder entry representing the class of Yul-optimizer miscompilation bugs documented in Solidity's own bug list for early 0.8.x releases. Exact affected range NOT independently verified this session.",
+      "verified": false
+    }
+  ]
+}

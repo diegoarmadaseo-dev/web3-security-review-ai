@@ -1,0 +1,31 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "compiler_bugs.py output (V3 Block 4, C2, docs/decisiones.md D-072)",
+  "description": "Documentation reference only, not executed at runtime. Every matched entry echoes the bundled dataset's own 'verified' flag and provenance - a stub/unverified dataset hit can never be mistaken for a confirmed one.",
+  "type": "object",
+  "required": ["compilerBugsVersion", "datasetVersion", "datasetSourceUrl", "datasetProvenance", "status", "compilerVersion", "matches"],
+  "additionalProperties": false,
+  "properties": {
+    "compilerBugsVersion": {"type": "string"},
+    "datasetVersion": {"type": ["string", "null"]},
+    "datasetSourceUrl": {"type": ["string", "null"]},
+    "datasetProvenance": {"type": ["string", "null"]},
+    "status": {"enum": ["affected", "not_affected", "unparseable_version"]},
+    "compilerVersion": {},
+    "matches": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["uid", "name", "severity", "summary", "verified"],
+        "additionalProperties": false,
+        "properties": {
+          "uid": {"type": ["string", "null"]},
+          "name": {"type": ["string", "null"]},
+          "severity": {"type": ["string", "null"]},
+          "summary": {"type": ["string", "null"]},
+          "verified": {"type": "boolean"}
+        }
+      }
+    }
+  }
+}

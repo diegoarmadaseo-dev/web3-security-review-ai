@@ -1,0 +1,38 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "upgrade_gap.py output (V3 Block 4, C3, docs/decisiones.md D-072)",
+  "description": "Documentation reference only, not executed at runtime. Structural only - a 'shrunk' result is not itself a defect; never replaces storage_layout.py (B1).",
+  "type": "object",
+  "required": ["upgradeGapVersion", "contractsCompared", "contractsFlagged", "results", "note"],
+  "additionalProperties": false,
+  "properties": {
+    "upgradeGapVersion": {"type": "string"},
+    "contractsCompared": {"type": "array", "items": {"type": "string"}},
+    "contractsFlagged": {"type": "array", "items": {"type": "string"}},
+    "note": {"type": "string"},
+    "results": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["overall", "gaps"],
+        "additionalProperties": false,
+        "properties": {
+          "overall": {"enum": ["not_present", "unchanged", "expanded", "shrunk", "removed"]},
+          "gaps": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "required": ["status", "sizeBefore", "sizeAfter"],
+              "additionalProperties": false,
+              "properties": {
+                "status": {"enum": ["added", "removed", "unchanged", "expanded", "shrunk"]},
+                "sizeBefore": {"type": ["integer", "null"], "minimum": 0},
+                "sizeAfter": {"type": ["integer", "null"], "minimum": 0}
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

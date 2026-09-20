@@ -446,8 +446,13 @@ def line_metrics(text: str, masked: str) -> Dict[str, int]:
 # Secrets: detection and redaction. Values are never echoed.
 # ---------------------------------------------------------------------------
 
+EIP1967_IMPLEMENTATION_SLOT_HEX = "360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"  # EIP-1967 implementation
+# Named (V3 Block 4, C1, docs/decisiones.md D-072) so scripts/proxy_fingerprint.py can import this
+# SAME constant instead of redeclaring its own copy - single source of truth, same discipline as
+# D-058. Value/set membership below is unchanged from before this name existed.
+
 KNOWN_PUBLIC_SLOTS = {
-    "360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc",  # EIP-1967 implementation
+    EIP1967_IMPLEMENTATION_SLOT_HEX,
     "b53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103",  # EIP-1967 admin
     "a3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50",  # EIP-1967 beacon
     "c5f16f0fcc639fa48a6947836d9850f504798523bf8c9a3a87d5876cf622bcf7",  # EIP-1822 proxiable

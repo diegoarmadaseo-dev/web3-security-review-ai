@@ -50,6 +50,9 @@ COMMANDS = {
     "privilege-path": "privilege_path",
     "bytecode-advisory": "bytecode_advisory",
     "change-impact": "change_impact",
+    "proxy-fingerprint": "proxy_fingerprint",
+    "compiler-bugs": "compiler_bugs",
+    "upgrade-gap": "upgrade_gap",
 }
 
 
