@@ -170,3 +170,20 @@ CREATE TABLE webhook_events (
     processed_at        TEXT,
     processing_error    TEXT
 );
+
+-- Phase 2 (backend/migrations/0002_auth_tokens.sql's mirror - see that
+-- file's docstring for why this is separate from `sessions`, and for
+-- requested_ip's rate-limit-only purpose).
+CREATE TABLE auth_tokens (
+    id              TEXT PRIMARY KEY,
+    email           TEXT NOT NULL,
+    token_hash      TEXT NOT NULL UNIQUE,
+    requested_ip    TEXT,
+    created_at      TEXT NOT NULL,
+    expires_at      TEXT NOT NULL,
+    consumed_at     TEXT,
+    CHECK (expires_at > created_at),
+    CHECK (email = lower(email))
+);
+CREATE INDEX idx_auth_tokens_email_created ON auth_tokens(email, created_at);
+CREATE INDEX idx_auth_tokens_ip_created ON auth_tokens(requested_ip, created_at);

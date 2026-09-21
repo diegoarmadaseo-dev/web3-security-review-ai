@@ -39,6 +39,7 @@ try:
 except ImportError:  # pragma: no cover - exercised by environments without psycopg installed.
     psycopg = None
 
+import backend.auth as auth
 import backend.db as db
 import backend.migrate as migrate
 import backend.repository as repo
@@ -116,10 +117,11 @@ class MigrationIntegrationTests(unittest.TestCase):
         self.conn, self.applied = _reset_database_and_migrate()
         self.addCleanup(self.conn.close)
 
-    def test_fresh_database_applies_the_one_migration(self):
-        self.assertEqual(self.applied, ["0001_initial_schema"])
+    def test_fresh_database_applies_both_migrations_in_order(self):
+        # 0002_auth_tokens.sql (Phase 2) added alongside 0001_initial_schema.sql (Phase 1).
+        self.assertEqual(self.applied, ["0001_initial_schema", "0002_auth_tokens"])
 
-    def test_all_twelve_tables_exist(self):
+    def test_all_thirteen_tables_exist(self):
         cur = db.execute(
             self.conn,
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
@@ -128,7 +130,7 @@ class MigrationIntegrationTests(unittest.TestCase):
         expected = {
             "schema_migrations", "users", "workspaces", "workspace_members", "sessions",
             "entitlements", "projects", "contracts", "analysis_jobs", "reports",
-            "audit_events", "webhook_events",
+            "audit_events", "webhook_events", "auth_tokens",
         }
         self.assertEqual(tables, expected)
 
@@ -293,6 +295,83 @@ class ConcurrentClaimIntegrationTests(unittest.TestCase):
         final = repo.get_job(self.conn, job_id)
         self.assertEqual(final["status"], "claimed")
         self.assertEqual(final["claimed_by"], winners[0])
+
+
+class AuthTokenIntegrationTests(unittest.TestCase):
+    """Phase 2 identity/access (docs/decisiones.md D-077/D-078 follow-up):
+    backend/auth.py against real PostgreSQL - UUID/TIMESTAMPTZ
+    normalization for auth_tokens/sessions rows, and the same real
+    concurrent-consume race ConcurrentClaimIntegrationTests already
+    proved for job claiming, applied to magic-link token consumption."""
+
+    def setUp(self):
+        self.conn, _ = _reset_database_and_migrate()
+        self.addCleanup(self.conn.close)
+
+    def test_token_and_session_ids_are_plain_strings_not_native_pg_types(self):
+        token = auth.request_magic_link(self.conn, "pg-auth@example.com", ip="10.0.0.1")
+        session = auth.consume_token_and_create_session(self.conn, token)
+        self.assertIsInstance(session["session_id"], str)
+        self.assertIsInstance(session["user_id"], str)
+        result = auth.validate_session(self.conn, session["session_token"])
+        self.assertEqual(result["user_id"], session["user_id"])
+
+    def test_single_use_consume_against_real_postgres(self):
+        token = auth.request_magic_link(self.conn, "pg-single-use@example.com")
+        first = auth.consume_token_and_create_session(self.conn, token)
+        second = auth.consume_token_and_create_session(self.conn, token)
+        self.assertIsNotNone(first)
+        self.assertIsNone(second)
+
+    def test_rate_limit_enforced_against_real_postgres(self):
+        for i in range(auth.RATE_LIMIT_MAX_PER_EMAIL):
+            auth.request_magic_link(self.conn, "pg-ratelimit@example.com", ip="10.0.0.%d" % i)
+        with self.assertRaises(auth.RateLimitExceeded):
+            auth.request_magic_link(self.conn, "pg-ratelimit@example.com", ip="10.0.0.99")
+
+    def test_two_real_connections_racing_to_consume_the_same_token_exactly_one_wins(self):
+        token = auth.request_magic_link(self.conn, "pg-race@example.com")
+        self.conn.commit()
+
+        barrier = threading.Barrier(2)
+        results = {}
+
+        def _consume(worker_id):
+            worker_conn = db.connect_postgres(DSN)
+            try:
+                barrier.wait(timeout=5)
+                results[worker_id] = auth.consume_token_and_create_session(worker_conn, token)
+            finally:
+                worker_conn.close()
+
+        threads = [threading.Thread(target=_consume, args=(w,)) for w in ("A", "B")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        winners = [w for w, r in results.items() if r is not None]
+        losers = [w for w, r in results.items() if r is None]
+        self.assertEqual(len(winners), 1, "expected exactly one winner, got: %r" % (results,))
+        self.assertEqual(len(losers), 1)
+
+    def test_cross_tenant_member_management_against_real_postgres(self):
+        owner_a = repo.create_user(self.conn, "pg-owner-a@example.com")
+        owner_b = repo.create_user(self.conn, "pg-owner-b@example.com")
+        workspace_a = repo.create_workspace(self.conn, "PG Workspace A", owner_a)
+        workspace_b = repo.create_workspace(self.conn, "PG Workspace B", owner_b)
+        self.conn.commit()
+
+        self.assertIsNone(tenant_scope.resolve_workspace_role(self.conn, owner_b, workspace_a))
+        with self.assertRaises(tenant_scope.TenantScopeError):
+            tenant_scope.require_workspace_role(self.conn, owner_b, workspace_a)
+
+        member = repo.create_user(self.conn, "pg-member@example.com")
+        repo.add_workspace_member(self.conn, workspace_a, member, "member")
+        self.conn.commit()
+        self.assertTrue(repo.remove_workspace_member(self.conn, workspace_a, member))
+        self.assertFalse(repo.remove_workspace_member(self.conn, workspace_a, member))  # already gone - idempotent.
+        self.assertIsNone(tenant_scope.resolve_workspace_role(self.conn, member, workspace_b))
 
 
 if __name__ == "__main__":

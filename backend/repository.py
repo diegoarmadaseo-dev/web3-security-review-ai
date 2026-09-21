@@ -137,6 +137,60 @@ def add_workspace_member(conn: Any, workspace_id: str, user_id: str, role: str) 
     conn.commit()
 
 
+def update_workspace_member_role(conn: Any, workspace_id: str, user_id: str, role: str) -> bool:
+    """Returns True if a membership row existed and was updated, False if
+    this user is not a member of this workspace at all (never raises for
+    that - the caller already resolved membership via tenant_scope before
+    calling this, so "not a member" here would itself be a caller bug,
+    but this function still reports it rather than silently no-op'ing)."""
+    if role not in ("owner", "admin", "member"):
+        raise RepositoryError("role must be one of owner/admin/member, got %r" % role)
+    cur = db.execute(
+        conn,
+        "UPDATE workspace_members SET role = ? WHERE workspace_id = ? AND user_id = ?",
+        (role, workspace_id, user_id),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def remove_workspace_member(conn: Any, workspace_id: str, user_id: str) -> bool:
+    """Returns True if a membership row existed and was removed, False if
+    this user was already not a member (idempotent, never raises for
+    that). Does NOT prevent removing a workspace's last owner - a
+    business rule for a later phase to add if needed, not a data-layer
+    concern."""
+    cur = db.execute(
+        conn,
+        "DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?",
+        (workspace_id, user_id),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def get_user_by_email(conn: Any, email: str) -> Optional[Dict[str, Any]]:
+    """Case-insensitive by construction, never by a LOWER() query - every
+    row's email is already stored lowercase (users_email_lowercase CHECK,
+    both schema files) and every caller normalizes before calling (see
+    backend/auth.py's normalize_email()), so an exact match is correct
+    and sargable on both backends."""
+    cur = db.execute(conn, "SELECT * FROM users WHERE email = ?", (email,))
+    return db.normalize_row(cur.fetchone())
+
+
+def mark_email_verified(conn: Any, user_id: str) -> None:
+    """Idempotent: sets email_verified_at only if it is still NULL, so a
+    second successful login never overwrites the ORIGINAL verification
+    timestamp with a later one."""
+    db.execute(
+        conn,
+        "UPDATE users SET email_verified_at = ? WHERE id = ? AND email_verified_at IS NULL",
+        (utcnow_iso(), user_id),
+    )
+    conn.commit()
+
+
 # ---------------------------------------------------------------------------
 # Billing mirror
 # ---------------------------------------------------------------------------

@@ -4,14 +4,15 @@ parallel schema files this phase maintains (backend/migrations/*.sql,
 authoritative PostgreSQL; backend/schema_sqlite.sql, the SQLite test
 mirror - see that file's own docstring for why two files exist).
 
-migrate.py's own mechanics are tested against a small, deliberately
+migrate.py's own mechanics are tested here against a small, deliberately
 SQLite-compatible fixture migrations directory, never against the real
-backend/migrations/0001_initial_schema.sql - that file is genuine
-PostgreSQL DDL (gen_random_uuid(), JSONB, CREATE EXTENSION) and this
-environment has no PostgreSQL server or driver to run it against; see the
-architectural-blocker note in this phase's final report. What IS tested
-here is migrate.py's own discovery/ordering/tracking/idempotency logic,
-which is dialect-agnostic by construction.
+backend/migrations/*.sql files - those are genuine PostgreSQL DDL
+(gen_random_uuid(), JSONB, CREATE EXTENSION). What IS tested here is
+migrate.py's own discovery/ordering/tracking/idempotency logic, which is
+dialect-agnostic by construction; the real *.sql files ARE actually
+applied against a live PostgreSQL 15 container elsewhere (see
+tests/test_backend_postgres_integration.py's MigrationIntegrationTests,
+docs/decisiones.md D-078) - that gap is closed, not an open blocker.
 
 Run from the repository root: python -m unittest
 """
@@ -26,7 +27,7 @@ import unittest
 import backend.migrate as migrate
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-POSTGRES_MIGRATION = os.path.join(REPO_ROOT, "backend", "migrations", "0001_initial_schema.sql")
+POSTGRES_MIGRATIONS_DIR = os.path.join(REPO_ROOT, "backend", "migrations")
 SQLITE_MIRROR = os.path.join(REPO_ROOT, "backend", "schema_sqlite.sql")
 
 _CREATE_TABLE_RE = re.compile(r"CREATE TABLE\s+(\w+)\s*\(", re.IGNORECASE)
@@ -93,20 +94,32 @@ class ApplyPendingMigrationsTests(unittest.TestCase):
 
 
 class SchemaFileDriftTests(unittest.TestCase):
-    """The two schema files (Postgres migration, SQLite test mirror) are
+    """The two schema files (Postgres migrations, SQLite test mirror) are
     deliberately separate (see schema_sqlite.sql's docstring) - this is
     the regression guard against them silently drifting apart, the same
     concern D-058's single-source-of-truth discipline exists for
     elsewhere in this repository, applied here to a case where a true
-    single source isn't possible across two SQL dialects."""
+    single source isn't possible across two SQL dialects.
+
+    Compares against the UNION of every file in backend/migrations/
+    (via migrate.discover_migrations() itself, so this can never drift
+    from what migrate.py actually applies) rather than a single
+    hardcoded filename - the SQLite mirror represents the cumulative
+    schema across ALL migrations, not just the first one (a real gap
+    this test itself had until Phase 2 added a second migration file
+    and caught it: it used to compare only 0001_initial_schema.sql,
+    silently never checking any later file against the mirror at all)."""
 
     def test_both_schema_files_define_the_same_set_of_tables(self):
-        with open(POSTGRES_MIGRATION, "r", encoding="utf-8") as handle:
-            postgres_tables = _table_names(handle.read())
+        postgres_tables: set = set()
+        for filename in migrate.discover_migrations(POSTGRES_MIGRATIONS_DIR):
+            with open(os.path.join(POSTGRES_MIGRATIONS_DIR, filename), "r", encoding="utf-8") as handle:
+                postgres_tables |= _table_names(handle.read())
         with open(SQLITE_MIRROR, "r", encoding="utf-8") as handle:
             sqlite_tables = _table_names(handle.read())
         self.assertEqual(postgres_tables, sqlite_tables)
         self.assertIn("analysis_jobs", postgres_tables)  # sanity: the extraction itself actually found real tables.
+        self.assertIn("auth_tokens", postgres_tables)  # sanity: a later migration file is actually being read too.
 
 
 if __name__ == "__main__":
