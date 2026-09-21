@@ -80,10 +80,15 @@ CREATE TABLE entitlements (
     id                          TEXT PRIMARY KEY,
     workspace_id                TEXT NOT NULL UNIQUE REFERENCES workspaces(id),
     plan                        TEXT NOT NULL CHECK (plan IN ('quick', 'standard', 'pro')),
-    status                      TEXT NOT NULL CHECK (status IN ('active', 'trialing', 'past_due', 'canceled', 'incomplete')),
+    -- Phase 3 (backend/migrations/0003_entitlement_status_expand.sql's
+    -- mirror): the full set of real Stripe Subscription statuses.
+    status                      TEXT NOT NULL CHECK (status IN ('active', 'trialing', 'past_due', 'canceled', 'incomplete', 'incomplete_expired', 'unpaid')),
     stripe_customer_id          TEXT,
     stripe_subscription_id      TEXT UNIQUE,
     current_period_end          TEXT,
+    -- Phase 3 (backend/migrations/0004_entitlement_event_provenance.sql's
+    -- mirror): ordering baseline against stale/out-of-order webhooks.
+    stripe_event_created_at     TEXT,
     created_at                  TEXT NOT NULL,
     updated_at                  TEXT NOT NULL
 );

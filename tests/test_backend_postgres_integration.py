@@ -41,6 +41,7 @@ except ImportError:  # pragma: no cover - exercised by environments without psyc
 
 import backend.auth as auth
 import backend.db as db
+import backend.http_app as http_app
 import backend.migrate as migrate
 import backend.repository as repo
 import backend.tenant_scope as tenant_scope
@@ -117,9 +118,33 @@ class MigrationIntegrationTests(unittest.TestCase):
         self.conn, self.applied = _reset_database_and_migrate()
         self.addCleanup(self.conn.close)
 
-    def test_fresh_database_applies_both_migrations_in_order(self):
-        # 0002_auth_tokens.sql (Phase 2) added alongside 0001_initial_schema.sql (Phase 1).
-        self.assertEqual(self.applied, ["0001_initial_schema", "0002_auth_tokens"])
+    def test_fresh_database_applies_all_four_migrations_in_order(self):
+        # 0002_auth_tokens.sql (Phase 2), 0003_entitlement_status_expand.sql
+        # and 0004_entitlement_event_provenance.sql (Phase 3) added
+        # alongside 0001_initial_schema.sql (Phase 1).
+        self.assertEqual(
+            self.applied,
+            ["0001_initial_schema", "0002_auth_tokens", "0003_entitlement_status_expand", "0004_entitlement_event_provenance"],
+        )
+
+    def test_entitlement_status_check_accepts_the_phase_3_expanded_values(self):
+        # The one thing 0003_entitlement_status_expand.sql actually
+        # changes: a real Postgres CHECK constraint, which the SQLite
+        # mirror cannot verify by construction (see that file's own
+        # docstring on why the two schemas are deliberately separate) -
+        # this is the one place that constraint is proven against a real
+        # server rather than merely mirrored. entitlements.workspace_id
+        # is itself UNIQUE, so each status needs its own real workspace.
+        owner_id = repo.new_id()
+        db.execute(self.conn, "INSERT INTO users (id, email, created_at, updated_at) VALUES (%s, %s, now(), now())", (owner_id, "owner@example.com"))
+        seen_statuses = set()
+        for status in ("incomplete_expired", "unpaid"):
+            workspace_id = repo.new_id()
+            db.execute(self.conn, "INSERT INTO workspaces (id, name, owner_user_id, created_at, updated_at) VALUES (%s, %s, %s, now(), now())", (workspace_id, "WS-" + status, owner_id))
+            self.conn.commit()
+            repo.create_entitlement(self.conn, workspace_id, "quick", status)
+            seen_statuses.add(repo.get_entitlement_by_workspace(self.conn, workspace_id)["status"])
+        self.assertEqual(seen_statuses, {"incomplete_expired", "unpaid"})
 
     def test_all_thirteen_tables_exist(self):
         cur = db.execute(
@@ -372,6 +397,119 @@ class AuthTokenIntegrationTests(unittest.TestCase):
         self.assertTrue(repo.remove_workspace_member(self.conn, workspace_a, member))
         self.assertFalse(repo.remove_workspace_member(self.conn, workspace_a, member))  # already gone - idempotent.
         self.assertIsNone(tenant_scope.resolve_workspace_role(self.conn, member, workspace_b))
+
+
+class WebhookHardeningIntegrationTests(unittest.TestCase):
+    """Phase 3 webhook hardening (docs/decisiones.md D-077 follow-up):
+    the retry-after-failure fix in repository.record_webhook_event()/
+    mark_webhook_event_processed() and backend/http_app.py's
+    _handle_billing_webhook() specifically targets a real Postgres
+    transaction-abort bug (unlike SQLite, Postgres aborts the WHOLE
+    transaction on any error until an explicit ROLLBACK) - so, per this
+    phase's own instructions, these tests run against a real server
+    rather than the SQLite suite, which cannot reproduce the bug this
+    exists to close at all (confirmed empirically during the audit that
+    found it)."""
+
+    def setUp(self):
+        self.conn, _ = _reset_database_and_migrate()
+        self.addCleanup(self.conn.close)
+
+    def _process_once(self, event_id, event_type, obj):
+        """Mirrors backend/http_app.py's _handle_billing_webhook() logic
+        exactly (claim -> apply -> commit-or-rollback+record) without the
+        HTTP layer, which is irrelevant to this transaction-level bug -
+        same level AuthTokenIntegrationTests already tests auth.py at."""
+        should_process = repo.record_webhook_event(self.conn, event_id, event_type)
+        if not should_process:
+            return "skipped-duplicate"
+        try:
+            http_app._apply_webhook_event(self.conn, event_type, obj, None)
+            repo.mark_webhook_event_processed(self.conn, event_id)
+            return "succeeded"
+        except Exception as exc:
+            self.conn.rollback()
+            repo.mark_webhook_event_processed(self.conn, event_id, error=str(exc))
+            return "failed: %s" % exc
+
+    def _doomed_event(self):
+        # References a workspace that does not exist -> a real
+        # ForeignKeyViolation from inside create_entitlement(), the exact
+        # failure class that triggered the original bug.
+        return {
+            "id": "sub_pg_1", "customer": "cus_pg_1", "status": "active",
+            "metadata": {"workspace_id": "00000000-0000-0000-0000-000000000000", "plan": "quick"},
+            "items": {"data": []},
+        }
+
+    def test_processing_failure_leaves_event_retryable_and_a_later_retry_succeeds(self):
+        event_id, event_type = "evt_pg_retry_1", "customer.subscription.updated"
+        first = self._process_once(event_id, event_type, self._doomed_event())
+        self.assertTrue(first.startswith("failed:"), first)
+
+        owner = repo.create_user(self.conn, "pg-retry-owner@example.com")
+        workspace_id = repo.create_workspace(self.conn, "PG Retry WS", owner)
+        self.conn.commit()
+        fixed_event = dict(self._doomed_event())
+        fixed_event["metadata"] = {"workspace_id": workspace_id, "plan": "quick"}
+
+        second = self._process_once(event_id, event_type, fixed_event)
+        self.assertEqual(second, "succeeded")
+        self.assertEqual(repo.get_entitlement_by_workspace(self.conn, workspace_id)["status"], "active")
+
+    def test_first_attempt_failure_does_not_mark_event_successfully_processed(self):
+        event_id, event_type = "evt_pg_retry_2", "customer.subscription.updated"
+        self._process_once(event_id, event_type, self._doomed_event())
+        cur = db.execute(self.conn, "SELECT processed_at, processing_error FROM webhook_events WHERE id = %s", (event_id,))
+        row = db.normalize_row(cur.fetchone())
+        self.assertIsNone(row["processed_at"])
+        self.assertIsNotNone(row["processing_error"])
+
+    def test_recovery_write_succeeds_immediately_after_a_real_postgres_abort_without_manual_rollback_it_would_not(self):
+        # Proves the fix's mechanism directly: reproduce the abort, then
+        # show the OLD code's exact call (no rollback first) really does
+        # raise InFailedSqlTransaction on this connection - and that a
+        # fresh attempt on a properly-rolled-back connection does not.
+        should_process = repo.record_webhook_event(self.conn, "evt_pg_retry_3", "customer.subscription.updated")
+        self.assertTrue(should_process)
+        with self.assertRaises(Exception):
+            http_app._apply_webhook_event(self.conn, "customer.subscription.updated", self._doomed_event(), None)
+        with self.assertRaises(psycopg.errors.InFailedSqlTransaction):
+            repo.mark_webhook_event_processed(self.conn, "evt_pg_retry_3", error="without rollback, this itself fails")
+        self.conn.rollback()  # the actual fix backend/http_app.py applies before this same call.
+        repo.mark_webhook_event_processed(self.conn, "evt_pg_retry_3", error="recorded cleanly after rollback")
+        row = db.normalize_row(db.execute(self.conn, "SELECT processing_error FROM webhook_events WHERE id = %s", ("evt_pg_retry_3",)).fetchone())
+        self.assertEqual(row["processing_error"], "recorded cleanly after rollback")
+
+    def test_concurrent_retry_of_the_same_previously_failed_event_is_single_success(self):
+        event_id, event_type = "evt_pg_retry_4", "customer.subscription.updated"
+        self._process_once(event_id, event_type, self._doomed_event())  # first attempt fails, leaves it retryable.
+
+        owner = repo.create_user(self.conn, "pg-retry-concurrent-owner@example.com")
+        workspace_id = repo.create_workspace(self.conn, "PG Retry Concurrent WS", owner)
+        self.conn.commit()
+        fixed_event = dict(self._doomed_event())
+        fixed_event["metadata"] = {"workspace_id": workspace_id, "plan": "quick"}
+
+        barrier = threading.Barrier(2)
+        results = {}
+
+        def _retry(worker_id):
+            worker_conn = db.connect_postgres(DSN)
+            try:
+                barrier.wait(timeout=5)
+                results[worker_id] = repo.record_webhook_event(worker_conn, event_id, event_type)
+            finally:
+                worker_conn.close()
+
+        threads = [threading.Thread(target=_retry, args=(w,)) for w in ("A", "B")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        winners = [w for w, claimed in results.items() if claimed]
+        self.assertEqual(len(winners), 1, "expected exactly one claimant, got: %r" % (results,))
 
 
 if __name__ == "__main__":

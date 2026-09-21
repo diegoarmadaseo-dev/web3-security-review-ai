@@ -203,15 +203,24 @@ def create_entitlement(
     stripe_customer_id: Optional[str] = None,
     stripe_subscription_id: Optional[str] = None,
     current_period_end: Optional[str] = None,
+    stripe_event_created_at: Optional[str] = None,
 ) -> str:
+    """stripe_event_created_at (docs/decisiones.md D-077 follow-up,
+    Phase 3 webhook hardening) establishes the ordering baseline this
+    row's FUTURE updates are checked against - see
+    update_entitlement_status()'s own docstring. Optional/defaults to
+    None for callers that don't have a Stripe event to attribute this
+    creation to (e.g. existing tests) - a NULL baseline is treated as
+    "no provenance yet, any event supersedes it", never as a reason to
+    reject a legitimate first update."""
     entitlement_id = new_id()
     now = utcnow_iso()
     db.execute(
         conn,
         "INSERT INTO entitlements "
-        "(id, workspace_id, plan, status, stripe_customer_id, stripe_subscription_id, current_period_end, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (entitlement_id, workspace_id, plan, status, stripe_customer_id, stripe_subscription_id, current_period_end, now, now),
+        "(id, workspace_id, plan, status, stripe_customer_id, stripe_subscription_id, current_period_end, stripe_event_created_at, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (entitlement_id, workspace_id, plan, status, stripe_customer_id, stripe_subscription_id, current_period_end, stripe_event_created_at, now, now),
     )
     conn.commit()
     return entitlement_id
@@ -222,17 +231,56 @@ def update_entitlement_status(
     workspace_id: str,
     status: str,
     current_period_end: Optional[str] = None,
+    stripe_event_created_at: Optional[str] = None,
 ) -> bool:
     """Returns True if a row was updated, False if this workspace has no
-    entitlement row yet (a later phase's webhook handler must create one
-    via create_entitlement() first on the initial checkout completion)."""
-    cur = db.execute(
-        conn,
-        "UPDATE entitlements SET status = ?, current_period_end = COALESCE(?, current_period_end), updated_at = ? WHERE workspace_id = ?",
-        (status, current_period_end, utcnow_iso(), workspace_id),
-    )
+    entitlement row yet (caller must create one via create_entitlement()
+    first) OR - Phase 3 webhook hardening, docs/decisiones.md D-077
+    follow-up - the incoming stripe_event_created_at is stale/tied
+    against the row's own stored value and was correctly ignored. Both
+    "no row" and "stale, ignored" report False on purpose: a caller like
+    backend/http_app.py's _upsert_entitlement() that needs to tell them
+    apart (to decide whether to fall back to create_entitlement()) must
+    check existence itself first via get_entitlement_by_workspace() -
+    this function alone cannot and should not guess which case applies.
+
+    ORDERING RULE (Stripe explicitly documents that webhook delivery is
+    at-least-once and NOT guaranteed in order): when
+    stripe_event_created_at is given, the update is applied ONLY if the
+    row has no baseline yet (stripe_event_created_at IS NULL) or the
+    incoming value is STRICTLY greater than the stored one - a tie is
+    deliberately treated as NOT newer (rejected), the simplest
+    deterministic tie-break that requires no further guessing about
+    which of two same-second events is "really" later. When
+    stripe_event_created_at is omitted (None), no ordering check is
+    applied at all (the pre-Phase-3-hardening behavior) - existing
+    callers that never had a Stripe event to attribute an update to
+    (there are none in this codebase today outside tests) keep working
+    unchanged."""
+    if stripe_event_created_at is None:
+        cur = db.execute(
+            conn,
+            "UPDATE entitlements SET status = ?, current_period_end = COALESCE(?, current_period_end), updated_at = ? WHERE workspace_id = ?",
+            (status, current_period_end, utcnow_iso(), workspace_id),
+        )
+    else:
+        cur = db.execute(
+            conn,
+            "UPDATE entitlements SET status = ?, current_period_end = COALESCE(?, current_period_end), "
+            "stripe_event_created_at = ?, updated_at = ? "
+            "WHERE workspace_id = ? AND (stripe_event_created_at IS NULL OR stripe_event_created_at < ?)",
+            (status, current_period_end, stripe_event_created_at, utcnow_iso(), workspace_id, stripe_event_created_at),
+        )
     conn.commit()
     return cur.rowcount > 0
+
+
+def get_entitlement_by_workspace(conn: Any, workspace_id: str) -> Optional[Dict[str, Any]]:
+    """Returns this workspace's entitlement row, or None if it has never
+    completed a checkout (an expected, normal state - e.g. every
+    freshly-created workspace - never an error)."""
+    cur = db.execute(conn, "SELECT * FROM entitlements WHERE workspace_id = ?", (workspace_id,))
+    return db.normalize_row(cur.fetchone())
 
 
 # ---------------------------------------------------------------------------
@@ -439,12 +487,33 @@ def append_audit_event(
 
 
 def record_webhook_event(conn: Any, event_id: str, event_type: str) -> bool:
-    """Returns True if this is the first time event_id has been seen
-    (caller should process it), or False if it was already recorded
-    (caller must skip processing - a duplicate Stripe webhook delivery,
-    never a reason to double-grant/double-charge). Never raises for a
-    duplicate; that is the expected, normal outcome this function exists
-    to detect cheaply."""
+    """Returns True if the caller should (re)process event_id now, False
+    if it must be skipped. Three cases, in order (Phase 3 webhook
+    hardening, docs/decisiones.md D-077 follow-up - the original version
+    of this function only ever handled the first two):
+
+      1. First-ever delivery: the INSERT succeeds outright - True.
+      2. A row already exists and previously SUCCEEDED
+         (processed_at IS NOT NULL): never reprocessed - False. This is
+         the only state "duplicate" is allowed to mean; see
+         mark_webhook_event_processed()'s docstring on why success is the
+         ONLY thing that permanently closes an event out.
+      3. A row already exists but never succeeded (processed_at IS NULL
+         - either a prior attempt FAILED and left processing_error set,
+         or a concurrent attempt is mid-flight right now with
+         processing_error still NULL): the UPDATE below attempts to
+         atomically RECLAIM it for a retry, but its WHERE clause only
+         matches the "previously failed" case (processing_error IS NOT
+         NULL) - a concurrently in-flight attempt (processing_error IS
+         NULL, nothing to flip yet) is correctly left alone, so two
+         callers racing to retry the SAME failed event can never both
+         win: the UPDATE clears processing_error to NULL as PART of
+         claiming it, so a second, concurrent identical UPDATE re-reads
+         processing_error as already NULL once the first one commits and
+         correctly matches zero rows.
+
+    Never raises for a duplicate or a losing race; both are expected,
+    normal outcomes this function exists to detect cheaply."""
     try:
         db.execute(
             conn,
@@ -455,4 +524,45 @@ def record_webhook_event(conn: Any, event_id: str, event_type: str) -> bool:
         return True
     except db.integrity_error_class(conn):
         conn.rollback()
-        return False
+    cur = db.execute(
+        conn,
+        "UPDATE webhook_events SET processing_error = NULL WHERE id = ? AND processed_at IS NULL AND processing_error IS NOT NULL",
+        (event_id,),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def mark_webhook_event_processed(conn: Any, event_id: str, error: Optional[str] = None) -> None:
+    """Records the outcome of processing a webhook event this call site
+    already confirmed (via record_webhook_event() returning True) it
+    owns. error=None for success: sets processed_at, the ONLY thing that
+    permanently closes an event.id out of future reprocessing (see
+    record_webhook_event()'s docstring) - a non-None error records the
+    failure reason but deliberately leaves processed_at NULL, so the
+    event remains eligible for a future retry to reclaim (Phase 3
+    webhook hardening, docs/decisiones.md D-077 follow-up - the previous
+    version of this function always set processed_at regardless of
+    success/failure, which silently made every failure permanent; see
+    that follow-up's decision entry for the concrete Postgres transaction-
+    abort bug this caused and how it was found).
+
+    On the FAILURE path specifically, the caller (backend/http_app.py's
+    _handle_billing_webhook) is expected to have already called
+    conn.rollback() before this runs - on Postgres, ANY error inside a
+    transaction aborts the WHOLE transaction until an explicit ROLLBACK
+    (unlike SQLite), so writing this recovery row on the SAME,
+    still-aborted connection would itself raise InFailedSqlTransaction,
+    permanently losing the very failure this call exists to record. This
+    function does not call rollback() itself because it has no way to
+    know whether the caller's transaction was ever actually aborted
+    (SQLite never aborts it, and even on Postgres not every exception
+    involves the database) - an unconditional rollback here would be
+    correct on Postgres but silently discard an unrelated, still-good
+    write on SQLite, so the caller (which knows exactly what failed and
+    why) owns that decision."""
+    if error is None:
+        db.execute(conn, "UPDATE webhook_events SET processed_at = ?, processing_error = NULL WHERE id = ?", (utcnow_iso(), event_id))
+    else:
+        db.execute(conn, "UPDATE webhook_events SET processing_error = ? WHERE id = ?", (error, event_id))
+    conn.commit()

@@ -7,12 +7,59 @@ supplied X-Forwarded-For header (same rule website/server.py documents).
 
 Endpoints: POST /auth/request-link, GET+POST /auth/verify,
 POST /auth/logout, POST /workspaces/<id>/members,
-DELETE /workspaces/<id>/members/<user_id>. Nothing else - no resource
+DELETE /workspaces/<id>/members/<user_id>, POST /billing/checkout,
+POST /billing/portal, POST /billing/webhook. Nothing else - no resource
 (project/contract/job/report) endpoints exist yet; that is a later
 phase's job, wired against the SAME session/tenant-scope machinery this
 module establishes. No workspace-creation endpoint exists yet either
 (not in this phase's requested endpoint list) - tests create workspaces
 directly via backend.repository.
+
+BILLING (Phase 3, docs/decisiones.md D-077 follow-up): /billing/checkout
+and /billing/portal are ordinary session-authed, CSRF-checked,
+state-changing endpoints like the member-management ones above - the
+workspace_id they act on comes from the JSON request body (there is no
+per-workspace URL prefix for these two routes), but it is NEVER trusted
+blindly: _current_user_id() resolves the caller from their session
+cookie exactly as every other handler does, then
+tenant_scope.require_workspace_role() re-derives that user's REAL role
+in the claimed workspace_id from the database before anything else
+happens - the same "authorization is a database fact, never a client
+claim" pattern _handle_member_add()/_handle_member_remove() already use.
+A tampered workspace_id in the body simply resolves to "you have no
+role here" and gets a 403, never a bypass. The Stripe Price ID actually
+charged is likewise never client-supplied - the client sends an internal
+plan name, and billing.StripeBilling.resolve_price_id() is the only
+place that becomes a Price ID (see backend/billing.py).
+
+/billing/webhook is the one endpoint in this module that is NOT
+session-authed and does NOT call _reject_if_cross_origin(): it has no
+browser Origin at all (Stripe's servers call it directly), and its
+"authentication" is the Stripe-Signature header verified against the
+UNTOUCHED raw request body by billing.StripeBilling.
+verify_and_parse_webhook() - see that function's own docstring for why
+the body must never be JSON-parsed before that call.
+
+RETRY AND ORDERING SAFETY (Phase 3 webhook hardening, docs/decisiones.md
+D-077 follow-up - hardened after a final security audit found two real
+gaps): a webhook event.id is deduplicated by repository.
+record_webhook_event() - but "duplicate" now means "already SUCCEEDED",
+never merely "already seen once": an event whose processing previously
+failed remains retryable, and record_webhook_event() atomically reclaims
+it for exactly one concurrent retrier (see that function's own
+docstring). A failure never poisons the connection for the recovery
+write that records it either - see the conn.rollback() call in
+_handle_billing_webhook() below and repository.mark_webhook_event_
+processed()'s docstring for the real, empirically-confirmed Postgres bug
+this closes. Separately, every entitlement update carries the triggering
+Stripe Event's own `created` timestamp through to repository.
+update_entitlement_status()/create_entitlement(), which reject a stale
+or tied update rather than blindly applying it - Stripe explicitly
+documents webhook delivery as at-least-once and NOT guaranteed in order,
+so without this an old, out-of-order event could both wrongly revoke an
+active subscriber's access and, worse, wrongly RESTORE access after a
+real cancellation (both confirmed reproducible before this fix - see
+that same audit).
 
 SCANNER/PREFETCH SAFETY: GET /auth/verify is read-only (backend.auth.
 peek_token, never consumes) and renders a confirmation page requiring an
@@ -102,6 +149,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, quote, unquote_plus, urlparse
 
 import backend.auth as auth
+import backend.billing as billing_module
 import backend.db as db
 import backend.repository as repo
 import backend.tenant_scope as tenant_scope
@@ -208,17 +256,138 @@ _INVALID_PAGE = (
     b"<p>Request a new sign-in link and try again.</p></body></html>"
 )
 
+_SUBSCRIPTION_EVENT_TYPES = ("customer.subscription.updated", "customer.subscription.deleted")
+
+
+def _upsert_entitlement(
+    conn: Any,
+    workspace_id: Optional[str],
+    plan: Optional[str],
+    status: str,
+    stripe_customer_id: Optional[str],
+    stripe_subscription_id: Optional[str],
+    current_period_end: Optional[str],
+    event_created_at: Optional[str],
+) -> None:
+    """Shared by every branch of _apply_webhook_event() below that carries
+    an authoritative subscription status. Checks existence FIRST (rather
+    than branching on update_entitlement_status()'s return value, as a
+    pre-Phase-3-hardening version of this function did) because that
+    return value is now ambiguous between "no row exists yet" (must
+    create) and "a row exists but this event is stale/tied and was
+    correctly ignored" (must do nothing) - see that function's own
+    docstring on the ordering rule. Creating one on whichever event
+    happens to arrive FIRST for a given workspace also establishes this
+    row's OWN ordering baseline (event_created_at is stamped on create
+    too, not left NULL) - see module docstring on billing's "never
+    assume webhook delivery order". A plan-less event with no existing
+    row to update (should never happen for a session/subscription this
+    backend itself created, since billing.StripeBilling.
+    create_checkout_session() always stamps workspace_id/plan into
+    metadata) is silently skipped rather than guessed at."""
+    if not workspace_id:
+        return
+    if repo.get_entitlement_by_workspace(conn, workspace_id) is None:
+        if plan in ("quick", "standard", "pro"):
+            repo.create_entitlement(conn, workspace_id, plan, status, stripe_customer_id, stripe_subscription_id, current_period_end, event_created_at)
+        return
+    repo.update_entitlement_status(conn, workspace_id, status, current_period_end, event_created_at)
+
+
+def _apply_webhook_event(conn: Any, event_type: str, obj: Dict[str, Any], event_created_at: Optional[str]) -> None:
+    """Dispatches one of the 5 handled Stripe event types
+    (backend/billing.py's module docstring lists them) to an
+    entitlements update. event_created_at is the ENCLOSING Stripe
+    Event's own `created` timestamp (already converted to an ISO string
+    by the caller, _handle_billing_webhook) - the ordering signal every
+    branch below threads through to repository.py's update_entitlement_
+    status()/create_entitlement(), per docs/decisiones.md D-077's Phase 3
+    webhook-hardening follow-up: Stripe explicitly documents webhook
+    delivery as at-least-once and NOT guaranteed in order, so a stale
+    event must never regress (or, after a cancellation, incorrectly
+    restore) a newer entitlement state - see update_entitlement_status()'s
+    own docstring for the exact deterministic rule, including its tie-
+    break. Any OTHER event type Stripe might deliver (there are dozens)
+    is a deliberate silent no-op here, never an error -
+    _handle_billing_webhook() still records via record_webhook_event()/
+    mark_webhook_event_processed() that it was received, so nothing is
+    lost, but this backend only ACTS on the 5 types this phase is scoped
+    to."""
+    if event_type == "checkout.session.completed":
+        # Deliberately NOT _upsert_entitlement(): this event's own object
+        # carries no real subscription status (a Checkout Session's
+        # status is about the CHECKOUT, not the subscription it created),
+        # so this handler only ever CREATES a row that does not exist yet
+        # - using 'incomplete' as an honest placeholder pending the
+        # authoritative status a customer.subscription.* event carries -
+        # and never touches status OR event_created_at on a row that
+        # already exists, at any timestamp: an existing row, by
+        # definition, was already established by a MORE authoritative
+        # event (a subscription event carries a real status; this one
+        # never does), so this event is never "newer" in the sense that
+        # matters here, regardless of what its own `created` says.
+        # Without this asymmetry, a customer.subscription.updated event
+        # that happens to arrive FIRST (setting a real status like
+        # 'active') would be silently regressed back to 'incomplete' by
+        # this event arriving second - exactly the delivery-order
+        # assumption this phase was explicitly scoped to never make.
+        metadata = obj.get("metadata") or {}
+        workspace_id = obj.get("client_reference_id")
+        plan = metadata.get("plan")
+        if workspace_id and plan in ("quick", "standard", "pro") and repo.get_entitlement_by_workspace(conn, workspace_id) is None:
+            repo.create_entitlement(
+                conn,
+                workspace_id,
+                plan,
+                status="incomplete",
+                stripe_customer_id=obj.get("customer"),
+                stripe_subscription_id=obj.get("subscription"),
+                stripe_event_created_at=event_created_at,
+            )
+    elif event_type in _SUBSCRIPTION_EVENT_TYPES:
+        # A canceled subscription's own status is already 'canceled' on
+        # the object customer.subscription.deleted carries - confirmed
+        # Stripe behavior, so both event types share this one branch.
+        metadata = obj.get("metadata") or {}
+        status = obj.get("status")
+        if not isinstance(status, str):
+            return
+        _upsert_entitlement(
+            conn,
+            workspace_id=metadata.get("workspace_id"),
+            plan=metadata.get("plan"),
+            status=status,
+            stripe_customer_id=obj.get("customer"),
+            stripe_subscription_id=obj.get("id"),
+            current_period_end=billing_module.subscription_period_end(obj),
+            event_created_at=event_created_at,
+        )
+    elif event_type == "invoice.paid":
+        workspace_id = billing_module.invoice_workspace_id(obj)
+        if workspace_id:
+            repo.update_entitlement_status(conn, workspace_id, "active", stripe_event_created_at=event_created_at)
+    elif event_type == "invoice.payment_failed":
+        workspace_id = billing_module.invoice_workspace_id(obj)
+        if workspace_id:
+            repo.update_entitlement_status(conn, workspace_id, "past_due", stripe_event_created_at=event_created_at)
+
 
 def make_handler(
     connect_fn: Callable[[], Any],
     email_sender: Any,
     host_allowlist: Sequence[str],
     secure_cookies: bool = True,
+    billing: Optional["billing_module.StripeBilling"] = None,
 ) -> type:
     """Returns a fresh Handler class closed over this specific server
     instance's config - never module-level globals, so multiple servers
     (e.g. one per test) never share state. host_allowlist is required
-    (no default) - see module docstring on host header safety."""
+    (no default) - see module docstring on host header safety. billing is
+    OPTIONAL (None by default) - a deployment/test that never configures
+    Stripe still gets every other endpoint working normally; the three
+    /billing/* routes return a clean 503 rather than raising when it is
+    None (see _handle_billing_checkout() etc.) - see module docstring on
+    billing for the security model those routes follow."""
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "backend-auth/2026.1"
@@ -378,6 +547,12 @@ def make_handler(
                 self._handle_verify_post()
             elif path == "/auth/logout":
                 self._handle_logout()
+            elif path == "/billing/checkout":
+                self._handle_billing_checkout()
+            elif path == "/billing/portal":
+                self._handle_billing_portal()
+            elif path == "/billing/webhook":
+                self._handle_billing_webhook()
             else:
                 match = _MEMBER_COLLECTION_RE.match(path)
                 if match:
@@ -524,6 +699,182 @@ def make_handler(
                 conn.close()
 
         # -------------------------------------------------------------
+        # Billing (Phase 3) - see module docstring on billing.
+        # -------------------------------------------------------------
+        def _handle_billing_checkout(self) -> None:
+            if self._reject_if_cross_origin():
+                return
+            if billing is None:
+                self._send_json(503, {"ok": False, "error": "billing is not configured"})
+                return
+            raw, err_status, err_msg = self._read_body()
+            if err_status:
+                self._send_json(err_status, {"ok": False, "error": err_msg})
+                return
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_json(400, {"ok": False, "error": "request body is not valid UTF-8 JSON"})
+                return
+            workspace_id = payload.get("workspace_id") if isinstance(payload, dict) else None
+            plan = payload.get("plan") if isinstance(payload, dict) else None
+            if not isinstance(workspace_id, str) or not workspace_id:
+                self._send_json(400, {"ok": False, "error": "workspace_id is required"})
+                return
+            host = self.headers.get("Host", "")
+            if host.split(":")[0] not in host_allowlist:
+                self._send_json(400, {"ok": False, "error": "unrecognized host"})
+                return
+            conn = connect_fn()
+            try:
+                current_user_id = self._current_user_id(conn)
+                if current_user_id is None:
+                    self._send_json(401, {"ok": False, "error": "authentication required"})
+                    return
+                try:
+                    tenant_scope.require_workspace_role(conn, current_user_id, workspace_id, allowed_roles=("owner", "admin"))
+                except tenant_scope.TenantScopeError:
+                    self._send_json(403, {"ok": False, "error": "forbidden"})
+                    return
+                existing = repo.get_entitlement_by_workspace(conn, workspace_id)
+                if existing is not None and existing["status"] in ("active", "trialing"):
+                    self._send_json(409, {"ok": False, "error": "this workspace already has an active subscription"})
+                    return
+                scheme = "https" if secure_cookies else "http"
+                success_path = auth.validate_redirect_path(payload.get("success_path") if isinstance(payload, dict) else None)
+                cancel_path = auth.validate_redirect_path(payload.get("cancel_path") if isinstance(payload, dict) else None)
+                try:
+                    session = billing.create_checkout_session(
+                        plan=plan,
+                        workspace_id=workspace_id,
+                        success_url="%s://%s%s" % (scheme, host, success_path),
+                        cancel_url="%s://%s%s" % (scheme, host, cancel_path),
+                        customer_id=existing["stripe_customer_id"] if existing is not None else None,
+                    )
+                except billing_module.PriceNotAllowedError:
+                    self._send_json(400, {"ok": False, "error": "unknown plan"})
+                    return
+                self._send_json(200, {"ok": True, "checkout_url": session.get("url")})
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
+
+        def _handle_billing_portal(self) -> None:
+            if self._reject_if_cross_origin():
+                return
+            if billing is None:
+                self._send_json(503, {"ok": False, "error": "billing is not configured"})
+                return
+            raw, err_status, err_msg = self._read_body()
+            if err_status:
+                self._send_json(err_status, {"ok": False, "error": err_msg})
+                return
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_json(400, {"ok": False, "error": "request body is not valid UTF-8 JSON"})
+                return
+            workspace_id = payload.get("workspace_id") if isinstance(payload, dict) else None
+            if not isinstance(workspace_id, str) or not workspace_id:
+                self._send_json(400, {"ok": False, "error": "workspace_id is required"})
+                return
+            host = self.headers.get("Host", "")
+            if host.split(":")[0] not in host_allowlist:
+                self._send_json(400, {"ok": False, "error": "unrecognized host"})
+                return
+            conn = connect_fn()
+            try:
+                current_user_id = self._current_user_id(conn)
+                if current_user_id is None:
+                    self._send_json(401, {"ok": False, "error": "authentication required"})
+                    return
+                try:
+                    tenant_scope.require_workspace_role(conn, current_user_id, workspace_id, allowed_roles=("owner", "admin"))
+                except tenant_scope.TenantScopeError:
+                    self._send_json(403, {"ok": False, "error": "forbidden"})
+                    return
+                existing = repo.get_entitlement_by_workspace(conn, workspace_id)
+                if existing is None or not existing.get("stripe_customer_id"):
+                    self._send_json(400, {"ok": False, "error": "this workspace has no billing account yet"})
+                    return
+                scheme = "https" if secure_cookies else "http"
+                return_path = auth.validate_redirect_path(payload.get("return_path") if isinstance(payload, dict) else None)
+                session = billing.create_portal_session(
+                    customer_id=existing["stripe_customer_id"],
+                    return_url="%s://%s%s" % (scheme, host, return_path),
+                )
+                self._send_json(200, {"ok": True, "portal_url": session.get("url")})
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
+
+        def _handle_billing_webhook(self) -> None:
+            # No _reject_if_cross_origin() here - see module docstring on
+            # billing: Stripe's servers call this directly and send no
+            # Origin header at all; the Stripe-Signature check below,
+            # verified over the untouched raw body, IS this endpoint's
+            # authentication.
+            if billing is None:
+                self._send_json(503, {"ok": False, "error": "billing is not configured"})
+                return
+            raw, err_status, err_msg = self._read_body()
+            if err_status:
+                self._send_json(err_status, {"ok": False, "error": err_msg})
+                return
+            sig_header = self.headers.get("Stripe-Signature", "")
+            try:
+                event = billing.verify_and_parse_webhook(raw, sig_header)
+            except billing_module.WebhookVerificationError:
+                # The body was already fully read above (unlike
+                # _reject_if_cross_origin()'s rejections), so there is no
+                # unread-body reason to force close_connection here.
+                self._send_json(400, {"ok": False, "error": "invalid signature"})
+                return
+            event_id = event.get("id")
+            event_type = event.get("type")
+            if not isinstance(event_id, str) or not event_id or not isinstance(event_type, str) or not event_type:
+                self._send_json(400, {"ok": False, "error": "malformed event"})
+                return
+            event_created_at = billing_module.stripe_timestamp_to_iso(event.get("created"))
+            conn = connect_fn()
+            try:
+                # True here means "(re)process it now" - a fresh event.id,
+                # OR a previously FAILED one being retried; only an event
+                # that previously SUCCEEDED is ever treated as a duplicate
+                # - see record_webhook_event()'s own docstring (Phase 3
+                # webhook hardening, docs/decisiones.md D-077 follow-up).
+                should_process = repo.record_webhook_event(conn, event_id, event_type)
+                if not should_process:
+                    self._send_json(200, {"ok": True, "duplicate": True})
+                    return
+                obj = ((event.get("data") or {}).get("object")) or {}
+                try:
+                    _apply_webhook_event(conn, event_type, obj, event_created_at)
+                    repo.mark_webhook_event_processed(conn, event_id)
+                    self._send_json(200, {"ok": True})
+                except Exception as exc:
+                    # On Postgres, the exception above already aborted the
+                    # whole transaction (unlike SQLite) - rollback() ends
+                    # that aborted transaction and returns this SAME
+                    # connection to a clean, usable state, exactly the fix
+                    # already applied once in this codebase for the same
+                    # bug class (backend/migrate.py's _already_applied).
+                    # Without this, the recovery write below would itself
+                    # raise (InFailedSqlTransaction), losing the failure
+                    # it exists to record - confirmed empirically against
+                    # a real Postgres container (docs/decisiones.md D-077
+                    # Phase 3 webhook-hardening follow-up). A harmless
+                    # no-op on SQLite, which never aborts a transaction on
+                    # error in the first place.
+                    conn.rollback()
+                    repo.mark_webhook_event_processed(conn, event_id, error=str(exc))
+                    self._send_json(500, {"ok": False, "error": "internal error processing webhook"})
+            finally:
+                conn.close()
+
+        # -------------------------------------------------------------
         # DELETE
         # -------------------------------------------------------------
         def do_DELETE(self) -> None:
@@ -565,6 +916,7 @@ def run_server(
     host: str = "127.0.0.1",
     port: int = 0,
     secure_cookies: bool = True,
+    billing: Optional["billing_module.StripeBilling"] = None,
 ) -> ThreadingHTTPServer:
-    handler_cls = make_handler(connect_fn, email_sender, host_allowlist, secure_cookies)
+    handler_cls = make_handler(connect_fn, email_sender, host_allowlist, secure_cookies, billing)
     return ThreadingHTTPServer((host, port), handler_cls)
