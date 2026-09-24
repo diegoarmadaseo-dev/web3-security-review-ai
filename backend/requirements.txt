@@ -13,3 +13,12 @@ psycopg[binary]>=3.1,<4
 # tested (backend/billing.py degrades the same way db.py does for a
 # missing psycopg, never a silent fallback).
 stripe>=11,<13
+
+# Only backend/object_storage.py's S3Storage needs this (production object
+# storage - Phase 4/5). Not required to run the default test suite, which
+# exercises LocalFilesystemStorage instead (stdlib-only, dev/test); a
+# "boto3 not installed" path is itself tested (S3Storage degrades the same
+# way db.py/billing.py do for their own missing optional package, never a
+# silent fallback to the local adapter). backend/main.py's ROLE=web/
+# ROLE=worker production entrypoint is the one real caller.
+boto3>=1.34,<2

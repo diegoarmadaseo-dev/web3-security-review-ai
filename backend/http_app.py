@@ -5,15 +5,33 @@ BaseHTTPRequestHandler + a route table, per-client IP taken ONLY from
 the socket peer address (self.client_address[0]), never a client-
 supplied X-Forwarded-For header (same rule website/server.py documents).
 
-Endpoints: POST /auth/request-link, GET+POST /auth/verify,
-POST /auth/logout, POST /workspaces/<id>/members,
+Endpoints: GET /auth/login, POST /auth/request-link, GET+POST
+/auth/verify, POST /auth/logout, GET+POST /workspaces,
+GET /workspaces/<id>, POST /workspaces/<id>/members,
 DELETE /workspaces/<id>/members/<user_id>, POST /billing/checkout,
-POST /billing/portal, POST /billing/webhook. Nothing else - no resource
-(project/contract/job/report) endpoints exist yet; that is a later
-phase's job, wired against the SAME session/tenant-scope machinery this
-module establishes. No workspace-creation endpoint exists yet either
-(not in this phase's requested endpoint list) - tests create workspaces
-directly via backend.repository.
+POST /billing/portal, POST /billing/webhook,
+GET+POST /workspaces/<id>/jobs, GET /workspaces/<id>/reports,
+GET /workspaces/<id>/reports/<report_id>.
+
+WORKSPACE CREATION/READ (Phase 5, docs/decisiones.md D-077 follow-up):
+POST /workspaces is the ONLY place a workspace comes into existence
+through this HTTP layer - the owner is always _current_user_id(), never
+a client-supplied field in the request body (repository.create_workspace
+already inserts the owner's workspace_members row atomically - see that
+function's own docstring). There is deliberately NO auto-provision-on-
+first-login: /auth/verify's POST handler only ever creates a session,
+never a workspace, regardless of how many times a token or link is
+verified - see docs/decisiones.md's Phase 5 entry for why an explicit,
+separately-rate-limited endpoint is safer than trying to make workspace
+auto-creation race-safe inside the login path itself. The three GET
+reads (workspace list/detail, job list, report list/detail) are ordinary
+tenant-scoped queries: every workspace_id in a URL is re-resolved against
+the caller's real membership via tenant_scope, exactly like every
+state-changing handler already does - a GET is never exempt from that
+check just because it has no body. A report's storage_ref is never
+returned to the client (see backend/object_storage.py's module
+docstring) - GET .../reports/<id> instead mints a short-lived signed URL
+per request.
 
 BILLING (Phase 3, docs/decisiones.md D-077 follow-up): /billing/checkout
 and /billing/portal are ordinary session-authed, CSRF-checked,
@@ -142,6 +160,7 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import os
 import re
 import sys
 from http import cookies as http_cookies
@@ -163,6 +182,18 @@ REQUEST_TIMEOUT_SECONDS = 10
 _MEMBER_COLLECTION_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/members$")
 _MEMBER_ITEM_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/members/(?P<user_id>[^/]+)$")
 _JOBS_COLLECTION_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/jobs$")
+# Phase 5: anchored with a trailing "$" right after the id group, exactly
+# like every regex above - this cannot ever match a longer path like
+# ".../reports" or ".../jobs", so route-check ORDER against those never
+# matters (same reasoning already applies to _MEMBER_COLLECTION_RE vs.
+# _MEMBER_ITEM_RE).
+_WORKSPACE_ITEM_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)$")
+_REPORTS_COLLECTION_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/reports$")
+_REPORT_ITEM_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/reports/(?P<report_id>[^/]+)$")
+
+_MAX_WORKSPACE_NAME_LENGTH = 200
+_MAX_WORKSPACES_PER_USER = 50  # abuse-safety cap on POST /workspaces - generous for any legitimate account.
+_REPORT_SIGNED_URL_TTL_SECONDS = 300  # short-lived by design, matches this codebase's other signed-URL/token TTL philosophy (auth.py's own TOKEN_TTL_SECONDS).
 
 # Phase 4: a raw-byte cap enforced HERE, synchronously, before anything is
 # queued - "no execution during HTTP request" means this handler never
@@ -267,6 +298,97 @@ _INVALID_PAGE = (
     b"<body><h1>This link is invalid or has expired</h1>"
     b"<p>Request a new sign-in link and try again.</p></body></html>"
 )
+
+# Phase 5: the "app/auth entry" step of the product flow - a plain,
+# JS-free HTML form (same no-JS philosophy as _render_confirm_page above)
+# posting to /auth/request-link. Static content, so a module-level
+# constant rather than a render function, same choice _INVALID_PAGE
+# already made for the same reason.
+_LOGIN_PAGE = (
+    b"<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Sign in</title></head>"
+    b"<body><h1>Sign in</h1>"
+    b"<p>Enter your email to receive a one-time sign-in link.</p>"
+    b"<form method=\"POST\" action=\"/auth/request-link\">"
+    b"<input type=\"email\" name=\"email\" required placeholder=\"you@example.com\">"
+    b"<button type=\"submit\">Send sign-in link</button>"
+    b"</form></body></html>"
+)
+
+
+def _render_request_link_sent_page(message: str) -> bytes:
+    """The HTML counterpart of /auth/request-link's JSON success/error
+    body - rendered only when the request itself arrived form-encoded
+    (i.e. a real browser submitted _LOGIN_PAGE's form, not an API/test
+    caller) - see _handle_request_link()'s own is_form branch. Reuses the
+    same anti-enumeration generic message the JSON path already sends;
+    this function never learns or reveals anything the JSON path
+    wouldn't."""
+    return (
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Check your email</title></head>"
+        "<body><h1>Check your email</h1><p>%s</p>"
+        "<p><a href=\"/auth/login\">Back to sign in</a></p></body></html>"
+        % html.escape(message, quote=True)
+    ).encode("utf-8")
+
+
+_MODES_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ".claude", "skills", "web3-auditor", "config", "modes.json",
+)
+_modes_config_cache: Optional[Dict[str, Any]] = None
+_modes_config_load_attempted = False
+
+
+def _load_modes_config() -> Optional[Dict[str, Any]]:
+    """Best-effort read of config/modes.json - the same single source of
+    truth scripts/preprocess.py and website/build_site.py already treat
+    as authoritative (see that file's own "description" field) - used
+    only for GET /workspaces/<id>'s "limits" field. Cached after the
+    first attempt (this file changes only at deploy time, never
+    mid-process). A missing or malformed file degrades that ONE response
+    field to None rather than failing the request - every other field
+    (workspace/entitlement/budget) comes from this backend's own
+    database and is unaffected. Reads the JSON directly rather than
+    importing scripts/preprocess.py's own loader, deliberately: this
+    keeps the web process's only coupling to .claude/skills/web3-auditor/
+    to a single static data file, never its Python code (worker_
+    entrypoint.py, which actually runs inside a container with that
+    whole tree copied in, is the one place importing that code is
+    appropriate - see that module and backend/docker/Dockerfile.worker)."""
+    global _modes_config_cache, _modes_config_load_attempted
+    if _modes_config_load_attempted:
+        return _modes_config_cache
+    _modes_config_load_attempted = True
+    try:
+        with open(_MODES_CONFIG_PATH, "r", encoding="utf-8") as handle:
+            _modes_config_cache = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        _modes_config_cache = None
+    return _modes_config_cache
+
+
+def _parse_limit_offset(qs: Dict[str, List[str]]) -> Tuple[int, int, Optional[str]]:
+    """Parses and bounds-checks a list endpoint's ?limit=&offset=
+    parameters - see repo.MAX_LIST_LIMIT/DEFAULT_LIST_LIMIT. Returns
+    (limit, offset, error_message); error_message is None on success, in
+    which case limit/offset are always valid, ready to pass straight to
+    repository.py - which re-validates its own bounds as the final
+    authority (this is only about turning a query string into a clean
+    400, never the source of truth for what is actually allowed, the
+    same division of labor _handle_job_submit() already applies to
+    mode/source)."""
+    limit_raw = (qs.get("limit") or [None])[0]
+    offset_raw = (qs.get("offset") or [None])[0]
+    try:
+        limit = int(limit_raw) if limit_raw is not None else repo.DEFAULT_LIST_LIMIT
+        offset = int(offset_raw) if offset_raw is not None else 0
+    except ValueError:
+        return 0, 0, "limit and offset must be integers"
+    if not (1 <= limit <= repo.MAX_LIST_LIMIT):
+        return 0, 0, "limit must be between 1 and %d" % repo.MAX_LIST_LIMIT
+    if offset < 0:
+        return 0, 0, "offset must be >= 0"
+    return limit, offset, None
 
 _SUBSCRIPTION_EVENT_TYPES = ("customer.subscription.updated", "customer.subscription.deleted")
 
@@ -532,8 +654,31 @@ def make_handler(
         # -------------------------------------------------------------
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
-            if parsed.path == "/auth/verify":
+            path = parsed.path
+            if path == "/auth/verify":
                 self._handle_verify_get(parsed)
+                return
+            if path == "/auth/login":
+                self._send_html(200, _LOGIN_PAGE)
+                return
+            if path == "/workspaces":
+                self._handle_workspace_list()
+                return
+            match = _JOBS_COLLECTION_RE.match(path)
+            if match:
+                self._handle_job_list(match.group("workspace_id"), parsed)
+                return
+            match = _REPORT_ITEM_RE.match(path)
+            if match:
+                self._handle_report_get(match.group("workspace_id"), match.group("report_id"))
+                return
+            match = _REPORTS_COLLECTION_RE.match(path)
+            if match:
+                self._handle_report_list(match.group("workspace_id"), parsed)
+                return
+            match = _WORKSPACE_ITEM_RE.match(path)
+            if match:
+                self._handle_workspace_get(match.group("workspace_id"))
                 return
             self._send_json(404, {"ok": False, "error": "not found"})
 
@@ -562,6 +707,8 @@ def make_handler(
                 self._handle_verify_post()
             elif path == "/auth/logout":
                 self._handle_logout()
+            elif path == "/workspaces":
+                self._handle_workspace_create()
             elif path == "/billing/checkout":
                 self._handle_billing_checkout()
             elif path == "/billing/portal":
@@ -586,28 +733,56 @@ def make_handler(
             if err_status:
                 self._send_json(err_status, {"ok": False, "error": err_msg})
                 return
-            try:
-                payload = json.loads(raw.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                self._send_json(400, {"ok": False, "error": "request body is not valid UTF-8 JSON"})
-                return
+            # Phase 5: _LOGIN_PAGE posts here as a plain, JS-free HTML
+            # form (application/x-www-form-urlencoded), the same way
+            # _render_confirm_page's form already posts to /auth/verify -
+            # every existing API/test caller keeps sending JSON
+            # unchanged, so this branches on Content-Type rather than
+            # replacing the JSON path.
+            content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            is_form = content_type == "application/x-www-form-urlencoded"
+            if is_form:
+                try:
+                    fields = parse_qs(raw.decode("utf-8"))
+                except UnicodeDecodeError:
+                    self._send_html(400, _INVALID_PAGE)
+                    return
+                payload: Any = {"email": (fields.get("email") or [None])[0]}
+            else:
+                try:
+                    payload = json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    self._send_json(400, {"ok": False, "error": "request body is not valid UTF-8 JSON"})
+                    return
             host = self.headers.get("Host", "")
             hostname_only = host.split(":")[0]
             if hostname_only not in host_allowlist:
-                self._send_json(400, {"ok": False, "error": "unrecognized host"})
+                if is_form:
+                    self._send_html(400, _INVALID_PAGE)
+                else:
+                    self._send_json(400, {"ok": False, "error": "unrecognized host"})
                 return
             email = payload.get("email") if isinstance(payload, dict) else None
             conn = connect_fn()
             try:
                 token = auth.request_magic_link(conn, email, self._client_ip())
             except auth.RateLimitExceeded as exc:
-                self._send_json(429, {"ok": False, "error": str(exc)})
+                if is_form:
+                    self._send_html(429, _render_request_link_sent_page(str(exc)))
+                else:
+                    self._send_json(429, {"ok": False, "error": str(exc)})
                 return
             except auth.AuthError as exc:
-                self._send_json(400, {"ok": False, "error": str(exc)})
+                if is_form:
+                    self._send_html(400, _render_request_link_sent_page(str(exc)))
+                else:
+                    self._send_json(400, {"ok": False, "error": str(exc)})
                 return
             except Exception:
-                self._send_json(500, {"ok": False, "error": "internal error"})
+                if is_form:
+                    self._send_html(500, _render_request_link_sent_page("internal error"))
+                else:
+                    self._send_json(500, {"ok": False, "error": "internal error"})
                 return
             finally:
                 conn.close()
@@ -618,7 +793,10 @@ def make_handler(
                 "Your sign-in link",
                 "Click to sign in (expires in 15 minutes): %s" % verify_url,
             )
-            self._send_json(200, {"ok": True, "message": "If that email is registered, a sign-in link has been sent."})
+            if is_form:
+                self._send_html(200, _render_request_link_sent_page("If that email is registered, a sign-in link has been sent."))
+            else:
+                self._send_json(200, {"ok": True, "message": "If that email is registered, a sign-in link has been sent."})
 
         def _handle_verify_post(self) -> None:
             # The blocker this fix closes: without this check, an
@@ -670,6 +848,182 @@ def make_handler(
                 conn.close()
             clear_cookie = _build_cookie_header(SESSION_COOKIE_NAME, "", 0, secure_cookies)
             self._send_json(200, {"ok": True}, extra_headers=[("Set-Cookie", clear_cookie)])
+
+        # -------------------------------------------------------------
+        # Workspaces (Phase 5) - see module docstring on workspace
+        # creation/read.
+        # -------------------------------------------------------------
+        def _handle_workspace_create(self) -> None:
+            if self._reject_if_cross_origin():
+                return
+            raw, err_status, err_msg = self._read_body()
+            if err_status:
+                self._send_json(err_status, {"ok": False, "error": err_msg})
+                return
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_json(400, {"ok": False, "error": "request body is not valid UTF-8 JSON"})
+                return
+            name = payload.get("name") if isinstance(payload, dict) else None
+            if not isinstance(name, str) or not name.strip() or len(name.strip()) > _MAX_WORKSPACE_NAME_LENGTH:
+                self._send_json(400, {"ok": False, "error": "name must be a non-empty string of at most %d characters" % _MAX_WORKSPACE_NAME_LENGTH})
+                return
+            conn = connect_fn()
+            try:
+                current_user_id = self._current_user_id(conn)
+                if current_user_id is None:
+                    self._send_json(401, {"ok": False, "error": "authentication required"})
+                    return
+                # Abuse-safety cap, never a uniqueness/idempotency check -
+                # workspace names are NOT required to be unique per owner
+                # (no such constraint on the workspaces table, unlike
+                # projects' own uq_projects_workspace_name_live), so a
+                # double-submitted form in the worst case creates two
+                # similarly-named workspaces the owner can trivially see
+                # and delete/rename later - never a security or data-
+                # integrity issue, so this endpoint deliberately does not
+                # add idempotency_key machinery for it (unlike job
+                # submission, where a duplicate has a real cost - spend,
+                # compute - this has none).
+                if len(repo.list_workspaces_by_user(conn, current_user_id)) >= _MAX_WORKSPACES_PER_USER:
+                    self._send_json(429, {"ok": False, "error": "workspace limit reached for this account"})
+                    return
+                workspace_id = repo.create_workspace(conn, name.strip(), current_user_id)
+                self._send_json(200, {"ok": True, "workspace_id": workspace_id})
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
+
+        def _handle_workspace_list(self) -> None:
+            conn = connect_fn()
+            try:
+                current_user_id = self._current_user_id(conn)
+                if current_user_id is None:
+                    self._send_json(401, {"ok": False, "error": "authentication required"})
+                    return
+                workspaces = repo.list_workspaces_by_user(conn, current_user_id)
+                self._send_json(200, {"ok": True, "workspaces": workspaces})
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
+
+        def _handle_workspace_get(self, workspace_id: str) -> None:
+            conn = connect_fn()
+            try:
+                current_user_id = self._current_user_id(conn)
+                if current_user_id is None:
+                    self._send_json(401, {"ok": False, "error": "authentication required"})
+                    return
+                try:
+                    role = tenant_scope.require_workspace_role(conn, current_user_id, workspace_id)
+                except tenant_scope.TenantScopeError:
+                    self._send_json(403, {"ok": False, "error": "forbidden"})
+                    return
+                workspace = repo.get_workspace(conn, workspace_id)
+                if workspace is None:
+                    self._send_json(404, {"ok": False, "error": "not found"})
+                    return
+                workspace["membership_role"] = role
+                entitlement = repo.get_entitlement_by_workspace(conn, workspace_id)
+                budget = repo.get_workspace_budget(conn, workspace_id)
+                limits = None
+                if entitlement is not None:
+                    modes_config = _load_modes_config()
+                    if modes_config is not None:
+                        limits = (modes_config.get("modes") or {}).get(entitlement["plan"])
+                self._send_json(200, {"ok": True, "workspace": workspace, "entitlement": entitlement, "budget": budget, "limits": limits})
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
+
+        def _handle_job_list(self, workspace_id: str, parsed: Any) -> None:
+            qs = parse_qs(parsed.query)
+            limit, offset, err = _parse_limit_offset(qs)
+            if err:
+                self._send_json(400, {"ok": False, "error": err})
+                return
+            status_filter = (qs.get("status") or [None])[0]
+            if status_filter is not None and status_filter not in repo.JOB_STATUSES:
+                self._send_json(400, {"ok": False, "error": "status must be one of %r" % (repo.JOB_STATUSES,)})
+                return
+            conn = connect_fn()
+            try:
+                current_user_id = self._current_user_id(conn)
+                if current_user_id is None:
+                    self._send_json(401, {"ok": False, "error": "authentication required"})
+                    return
+                try:
+                    tenant_scope.require_workspace_role(conn, current_user_id, workspace_id)
+                except tenant_scope.TenantScopeError:
+                    self._send_json(403, {"ok": False, "error": "forbidden"})
+                    return
+                jobs = repo.list_jobs_by_workspace(conn, workspace_id, limit=limit, offset=offset, status=status_filter)
+                self._send_json(200, {"ok": True, "jobs": jobs, "limit": limit, "offset": offset})
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
+
+        def _handle_report_list(self, workspace_id: str, parsed: Any) -> None:
+            qs = parse_qs(parsed.query)
+            limit, offset, err = _parse_limit_offset(qs)
+            if err:
+                self._send_json(400, {"ok": False, "error": err})
+                return
+            conn = connect_fn()
+            try:
+                current_user_id = self._current_user_id(conn)
+                if current_user_id is None:
+                    self._send_json(401, {"ok": False, "error": "authentication required"})
+                    return
+                try:
+                    tenant_scope.require_workspace_role(conn, current_user_id, workspace_id)
+                except tenant_scope.TenantScopeError:
+                    self._send_json(403, {"ok": False, "error": "forbidden"})
+                    return
+                reports = repo.list_reports_by_workspace(conn, workspace_id, limit=limit, offset=offset)
+                for report in reports:
+                    report.pop("storage_ref", None)  # never a raw storage path - see module docstring.
+                self._send_json(200, {"ok": True, "reports": reports, "limit": limit, "offset": offset})
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
+
+        def _handle_report_get(self, workspace_id: str, report_id: str) -> None:
+            conn = connect_fn()
+            try:
+                current_user_id = self._current_user_id(conn)
+                if current_user_id is None:
+                    self._send_json(401, {"ok": False, "error": "authentication required"})
+                    return
+                try:
+                    tenant_scope.require_workspace_role(conn, current_user_id, workspace_id)
+                except tenant_scope.TenantScopeError:
+                    self._send_json(403, {"ok": False, "error": "forbidden"})
+                    return
+                report = repo.get_report_by_id(conn, report_id)
+                if report is None or report["workspace_id"] != workspace_id:
+                    # Collapses "does not exist" and "belongs to a
+                    # different workspace" into the same 404 - the same
+                    # anti-enumeration property tenant_scope.py's own
+                    # docstring establishes for workspace_id itself; a
+                    # cross-tenant report_id guess must be
+                    # indistinguishable from a nonexistent one.
+                    self._send_json(404, {"ok": False, "error": "not found"})
+                    return
+                storage_ref = report.pop("storage_ref", None)
+                if storage is not None and storage_ref:
+                    report["report_url"] = storage.generate_signed_url(storage_ref, expires_in_seconds=_REPORT_SIGNED_URL_TTL_SECONDS)
+                self._send_json(200, {"ok": True, "report": report})
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
 
         def _handle_member_add(self, workspace_id: str) -> None:
             if self._reject_if_cross_origin():
@@ -790,6 +1144,23 @@ def make_handler(
                     job_id = repo.enqueue_job(conn, workspace_id, contract_id, current_user_id, mode, idempotency_key=idempotency_key)
                 except db.integrity_error_class(conn):
                     # A concurrent identical submission won the idempotency_key race - same job, not an error.
+                    # On Postgres, the IntegrityError above already aborted
+                    # the whole transaction (unlike SQLite) - rollback()
+                    # ends that aborted transaction and returns this SAME
+                    # connection to a clean, usable state before the
+                    # recovery lookup below, exactly the same fix already
+                    # applied once in this codebase for the same bug class
+                    # (repository.mark_webhook_event_processed()'s own
+                    # docstring, backend/http_app.py's _handle_billing_
+                    # webhook()). Without this, the SELECT below itself
+                    # raises InFailedSqlTransaction on real Postgres
+                    # (confirmed empirically - a real concurrent duplicate
+                    # submission was turning into a spurious 500 for every
+                    # losing request instead of the intended clean 200
+                    # duplicate:true response) - a harmless no-op on
+                    # SQLite, which never aborts a transaction on error in
+                    # the first place.
+                    conn.rollback()
                     winner = repo.get_job_by_idempotency_key(conn, idempotency_key)
                     self._send_json(200, {"ok": True, "job_id": winner["id"], "status": winner["status"], "duplicate": True})
                     return

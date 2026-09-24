@@ -15,10 +15,14 @@ inline "Evidence" note on each entry. Nothing here describes a capability
 that does not exist yet (no hosted accounts, no dashboard, no automated
 alerts/monitoring service - see FEATURES_PARTIAL["monitoring"]).
 
-Pricing is centralized but UNPUBLISHED (PRICING_PUBLISHED = False): amounts
-in capafy/pricing.md are still marked [CAPAFY-VERIFY] ("Draft only"), so this
-module holds tier names/features only, ready for later activation once Diego
-confirms real numbers - flip PRICING_PUBLISHED and fill in each tier's
+Pricing is centralized but UNPUBLISHED (PRICING_PUBLISHED = False): no real
+dollar amounts have been confirmed for either potential distribution path -
+capafy/pricing.md still marks its own amounts [CAPAFY-VERIFY] ("Draft only"),
+and the independent standalone-SaaS backend (backend/billing.py, Phase 3-4,
+docs/decisiones.md D-077) has its own Stripe Price ID configuration that is
+equally unconfirmed/unset today. This module holds tier names/features only,
+ready for later activation once Diego confirms real numbers for whichever
+path is actually live - flip PRICING_PUBLISHED and fill in each tier's
 "price"/"billing_period" when that happens. No other code path needs to
 change.
 
@@ -272,7 +276,7 @@ PIPELINE_STEPS: List[Tuple[str, str]] = [
 # Pricing - centralized, UNPUBLISHED. See module docstring.
 # ---------------------------------------------------------------------------
 
-PRICING_PUBLISHED = False  # Flip only once capafy/pricing.md's [CAPAFY-VERIFY] items are confirmed.
+PRICING_PUBLISHED = False  # Flip only once real prices are confirmed for whichever distribution path (Capafy or the independent standalone backend, backend/billing.py) is actually live - see module docstring.
 
 PRICING_TIERS: List[Dict[str, Optional[str]]] = [
     {"mode": "quick", "display_name": "Quick", "price": None, "billing_period": None},

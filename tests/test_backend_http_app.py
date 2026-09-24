@@ -23,6 +23,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import threading
@@ -31,6 +32,7 @@ import unittest
 from urllib.parse import urlencode
 
 import backend.http_app as http_app
+import backend.object_storage as object_storage
 import backend.repository as repo
 import backend.tenant_scope as tenant_scope
 
@@ -696,6 +698,399 @@ class RedactQueryStringUnitTests(unittest.TestCase):
         for query in ("not_token=X", "tokens=X", "my_token=X", "redirect=/dashboard"):
             path = "/auth/verify?%s" % query
             self.assertEqual(http_app._redact_query_string(path), path, "should NOT have redacted %r" % query)
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 (docs/decisiones.md D-077 follow-up): workspace creation/read, job
+# and report read, and the new /auth/login entry point.
+# ---------------------------------------------------------------------------
+
+class LoginEntryPointTests(_HttpAppTestCase):
+    def test_login_page_renders_a_form(self):
+        status, headers, body = self.get("/auth/login")
+        self.assertEqual(status, 200)
+        self.assertIn("text/html", headers.get("Content-Type", ""))
+        self.assertIn(b'action="/auth/request-link"', body)
+
+    def test_form_encoded_request_link_returns_an_html_confirmation(self):
+        body = urlencode({"email": "form-user@example.com"}).encode("ascii")
+        conn = self._conn()
+        hdrs = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Content-Length": str(len(body)),
+            "Host": self.host_header,
+            "Origin": self.same_origin,
+        }
+        conn.request("POST", "/auth/request-link", body=body, headers=hdrs)
+        resp = conn.getresponse()
+        data = resp.read()
+        conn.close()
+        self.assertEqual(resp.status, 200)
+        self.assertIn("text/html", resp.getheader("Content-Type", ""))
+        self.assertIn(b"Check your email", data)
+        self.assertEqual(len(self.email_sender.sent), 1)
+
+    def test_json_request_link_behavior_is_unchanged_by_the_new_form_path(self):
+        status, headers, body = self.post_json("/auth/request-link", {"email": "json-user@example.com"})
+        self.assertEqual(status, 200)
+        self.assertIn("application/json", headers.get("Content-Type", ""))
+        self.assertEqual(json.loads(body), {"ok": True, "message": "If that email is registered, a sign-in link has been sent."})
+
+
+class WorkspaceCreationTests(_HttpAppTestCase):
+    def _user_id_for(self, conn, email):
+        return repo.get_user_by_email(conn, email)["id"]
+
+    def test_create_requires_authentication(self):
+        status, _, _ = self.post_json("/workspaces", {"name": "My Workspace"})
+        self.assertEqual(status, 401)
+
+    def test_authenticated_user_can_create_a_workspace_as_owner(self):
+        cookie = self.request_and_confirm_login("creator@example.com")
+        status, _, body = self.post_json("/workspaces", {"name": "My Workspace"}, headers={"Cookie": cookie})
+        self.assertEqual(status, 200)
+        result = json.loads(body)
+        self.assertTrue(result["ok"])
+        conn = repo.connect(self.db_path)
+        role = tenant_scope.resolve_workspace_role(conn, self._user_id_for(conn, "creator@example.com"), result["workspace_id"])
+        conn.close()
+        self.assertEqual(role, "owner")
+
+    def test_owner_is_always_the_authenticated_caller_never_client_supplied(self):
+        cookie = self.request_and_confirm_login("real-owner@example.com")
+        conn = repo.connect(self.db_path)
+        impostor_id = repo.create_user(conn, "impostor@example.com")
+        conn.close()
+        status, _, body = self.post_json(
+            "/workspaces", {"name": "WS", "owner_user_id": impostor_id, "user_id": impostor_id}, headers={"Cookie": cookie}
+        )
+        self.assertEqual(status, 200)
+        workspace_id = json.loads(body)["workspace_id"]
+        conn = repo.connect(self.db_path)
+        role_real_owner = tenant_scope.resolve_workspace_role(conn, self._user_id_for(conn, "real-owner@example.com"), workspace_id)
+        role_impostor = tenant_scope.resolve_workspace_role(conn, impostor_id, workspace_id)
+        conn.close()
+        self.assertEqual(role_real_owner, "owner")
+        self.assertIsNone(role_impostor)
+
+    def test_blank_or_non_string_name_is_rejected(self):
+        cookie = self.request_and_confirm_login("badname@example.com")
+        for bad_name in ("", "   ", None, 123, ["x"]):
+            status, _, _ = self.post_json("/workspaces", {"name": bad_name}, headers={"Cookie": cookie})
+            self.assertEqual(status, 400, "bad_name=%r" % (bad_name,))
+
+    def test_overlong_name_is_rejected(self):
+        cookie = self.request_and_confirm_login("longname@example.com")
+        status, _, _ = self.post_json("/workspaces", {"name": "x" * 201}, headers={"Cookie": cookie})
+        self.assertEqual(status, 400)
+
+    def test_workspace_creation_cap_returns_429_once_exceeded(self):
+        cookie = self.request_and_confirm_login("prolific@example.com")
+        for i in range(http_app._MAX_WORKSPACES_PER_USER):
+            status, _, _ = self.post_json("/workspaces", {"name": "WS %d" % i}, headers={"Cookie": cookie})
+            self.assertEqual(status, 200)
+        status, _, _ = self.post_json("/workspaces", {"name": "one too many"}, headers={"Cookie": cookie})
+        self.assertEqual(status, 429)
+
+    def test_repeated_magic_link_verification_never_creates_a_workspace(self):
+        # The explicit design choice this phase made instead of auto-
+        # provision-on-first-login - see http_app.py's own module
+        # docstring: /auth/verify's POST handler only ever creates a
+        # session, regardless of how many times it is called for the
+        # same or a fresh token.
+        for _ in range(3):
+            self.request_and_confirm_login("repeat-login@example.com")
+        conn = repo.connect(self.db_path)
+        user_id = self._user_id_for(conn, "repeat-login@example.com")
+        workspaces = repo.list_workspaces_by_user(conn, user_id)
+        conn.close()
+        self.assertEqual(workspaces, [])
+
+
+class WorkspaceReadTests(_HttpAppTestCase):
+    def _user_id_for(self, conn, email):
+        return repo.get_user_by_email(conn, email)["id"]
+
+    def test_list_requires_authentication(self):
+        status, _, _ = self.get("/workspaces")
+        self.assertEqual(status, 401)
+
+    def test_list_returns_only_the_callers_own_workspaces(self):
+        cookie_a = self.request_and_confirm_login("list-a@example.com")
+        self.post_json("/workspaces", {"name": "A1"}, headers={"Cookie": cookie_a})
+        self.post_json("/workspaces", {"name": "A2"}, headers={"Cookie": cookie_a})
+        cookie_b = self.request_and_confirm_login("list-b@example.com")
+        self.post_json("/workspaces", {"name": "B1"}, headers={"Cookie": cookie_b})
+
+        status, _, body = self.get("/workspaces", headers={"Cookie": cookie_a})
+        self.assertEqual(status, 200)
+        names = {w["name"] for w in json.loads(body)["workspaces"]}
+        self.assertEqual(names, {"A1", "A2"})
+
+    def test_get_requires_authentication(self):
+        cookie = self.request_and_confirm_login("owner-g@example.com")
+        _, _, body = self.post_json("/workspaces", {"name": "G"}, headers={"Cookie": cookie})
+        workspace_id = json.loads(body)["workspace_id"]
+        status, _, _ = self.get("/workspaces/%s" % workspace_id)
+        self.assertEqual(status, 401)
+
+    def test_get_returns_workspace_entitlement_and_limits(self):
+        cookie = self.request_and_confirm_login("owner-h@example.com")
+        _, _, body = self.post_json("/workspaces", {"name": "H"}, headers={"Cookie": cookie})
+        workspace_id = json.loads(body)["workspace_id"]
+        conn = repo.connect(self.db_path)
+        repo.create_entitlement(conn, workspace_id, "standard", "active")
+        conn.close()
+
+        status, _, body = self.get("/workspaces/%s" % workspace_id, headers={"Cookie": cookie})
+        self.assertEqual(status, 200)
+        result = json.loads(body)
+        self.assertEqual(result["workspace"]["name"], "H")
+        self.assertEqual(result["workspace"]["membership_role"], "owner")
+        self.assertEqual(result["entitlement"]["plan"], "standard")
+        self.assertEqual(result["entitlement"]["status"], "active")
+        # No job has ever been submitted for this brand-new workspace -
+        # workspace_budgets is lazily created on first spend (see
+        # repository._ensure_workspace_budget_row's own docstring), so
+        # there is genuinely nothing to report yet.
+        self.assertIsNone(result["budget"])
+
+    def test_get_without_entitlement_has_null_entitlement_and_limits(self):
+        cookie = self.request_and_confirm_login("owner-i@example.com")
+        _, _, body = self.post_json("/workspaces", {"name": "I"}, headers={"Cookie": cookie})
+        workspace_id = json.loads(body)["workspace_id"]
+        status, _, body = self.get("/workspaces/%s" % workspace_id, headers={"Cookie": cookie})
+        result = json.loads(body)
+        self.assertIsNone(result["entitlement"])
+        self.assertIsNone(result["limits"])
+
+    def test_cross_tenant_get_is_forbidden_and_indistinguishable_from_nonexistent(self):
+        cookie_a = self.request_and_confirm_login("cross-a@example.com")
+        _, _, body = self.post_json("/workspaces", {"name": "CrossA"}, headers={"Cookie": cookie_a})
+        workspace_id = json.loads(body)["workspace_id"]
+        cookie_b = self.request_and_confirm_login("cross-b@example.com")
+
+        status_real, _, body_real = self.get("/workspaces/%s" % workspace_id, headers={"Cookie": cookie_b})
+        status_fake, _, body_fake = self.get("/workspaces/does-not-exist-at-all", headers={"Cookie": cookie_b})
+        self.assertEqual(status_real, 403)
+        self.assertEqual(status_fake, 403)
+        self.assertEqual(json.loads(body_real), json.loads(body_fake))
+
+
+class _WorkspaceStorageTestCase(_HttpAppTestCase):
+    """Same fixture as _HttpAppTestCase, plus real object storage
+    (LocalFilesystemStorage - see backend/object_storage.py) wired into
+    the server, needed for report signed-URL tests below."""
+
+    def setUp(self):
+        fd, self.db_path = tempfile.mkstemp(suffix=".sqlite3")
+        os.close(fd)
+        os.remove(self.db_path)
+        seed_conn = repo.connect(self.db_path)
+        repo.init_schema(seed_conn)
+        seed_conn.close()
+
+        self.storage_dir = tempfile.mkdtemp(prefix="http-app-ws-tests-")
+        self.storage = object_storage.LocalFilesystemStorage(self.storage_dir, sign_secret="test-only-secret")
+
+        self.email_sender = _CapturingEmailSender()
+        self.httpd = http_app.run_server(
+            connect_fn=lambda: repo.connect(self.db_path),
+            email_sender=self.email_sender,
+            host_allowlist=[HOST],
+            host=HOST,
+            port=0,
+            secure_cookies=False,
+            storage=self.storage,
+        )
+        self.port = self.httpd.server_address[1]
+        self.host_header = "%s:%d" % (HOST, self.port)
+        self.same_origin = "http://%s" % self.host_header
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        time.sleep(0.05)
+        self.addCleanup(lambda: shutil.rmtree(self.storage_dir, ignore_errors=True))
+        self.addCleanup(lambda: os.remove(self.db_path) if os.path.exists(self.db_path) else None)
+        self.addCleanup(self._shutdown)
+
+
+class JobReadTests(_WorkspaceStorageTestCase):
+    def _seed_workspace_with_job(self, email):
+        cookie = self.request_and_confirm_login(email)
+        conn = repo.connect(self.db_path)
+        user_id = repo.get_user_by_email(conn, email)["id"]
+        workspace_id = repo.create_workspace(conn, "Seeded WS", user_id)
+        contract_id = repo.create_contract(conn, workspace_id, "sources/x/seed", "hash", "A.sol")
+        job_id = repo.enqueue_job(conn, workspace_id, contract_id, user_id, "quick")
+        repo.transition_job_status(conn, job_id, "queued", "claimed")
+        conn.close()
+        return cookie, workspace_id, job_id
+
+    def test_list_requires_authentication(self):
+        _, workspace_id, _ = self._seed_workspace_with_job("jl-1@example.com")
+        status, _, _ = self.get("/workspaces/%s/jobs" % workspace_id)
+        self.assertEqual(status, 401)
+
+    def test_list_returns_the_seeded_job(self):
+        cookie, workspace_id, job_id = self._seed_workspace_with_job("jl-2@example.com")
+        status, _, body = self.get("/workspaces/%s/jobs" % workspace_id, headers={"Cookie": cookie})
+        self.assertEqual(status, 200)
+        jobs = json.loads(body)["jobs"]
+        self.assertEqual([j["id"] for j in jobs], [job_id])
+        self.assertEqual(jobs[0]["status"], "claimed")
+
+    def test_list_cross_tenant_is_forbidden(self):
+        _, workspace_id, _ = self._seed_workspace_with_job("jl-3@example.com")
+        cookie_b = self.request_and_confirm_login("jl-3b@example.com")
+        status, _, _ = self.get("/workspaces/%s/jobs" % workspace_id, headers={"Cookie": cookie_b})
+        self.assertEqual(status, 403)
+
+    def test_nonexistent_workspace_returns_403_never_404(self):
+        # Same anti-enumeration property as workspace GET - a made-up
+        # workspace_id must never be distinguishable from a real one the
+        # caller simply isn't a member of.
+        cookie = self.request_and_confirm_login("jl-nonexist@example.com")
+        status, _, _ = self.get("/workspaces/totally-made-up/jobs", headers={"Cookie": cookie})
+        self.assertEqual(status, 403)
+
+    def test_rejects_invalid_status_filter(self):
+        cookie, workspace_id, _ = self._seed_workspace_with_job("jl-4@example.com")
+        status, _, _ = self.get("/workspaces/%s/jobs?status=not-a-real-status" % workspace_id, headers={"Cookie": cookie})
+        self.assertEqual(status, 400)
+
+    def test_status_filter_narrows_results(self):
+        cookie, workspace_id, job_id = self._seed_workspace_with_job("jl-5@example.com")
+        status, _, body = self.get("/workspaces/%s/jobs?status=claimed" % workspace_id, headers={"Cookie": cookie})
+        self.assertEqual([j["id"] for j in json.loads(body)["jobs"]], [job_id])
+        status, _, body = self.get("/workspaces/%s/jobs?status=succeeded" % workspace_id, headers={"Cookie": cookie})
+        self.assertEqual(json.loads(body)["jobs"], [])
+
+    def test_pagination_is_deterministic_and_non_overlapping(self):
+        cookie = self.request_and_confirm_login("jl-6@example.com")
+        conn = repo.connect(self.db_path)
+        user_id = repo.get_user_by_email(conn, "jl-6@example.com")["id"]
+        workspace_id = repo.create_workspace(conn, "Pagination WS", user_id)
+        contract_id = repo.create_contract(conn, workspace_id, "sources/x/pg", "hash", "A.sol")
+        for _ in range(5):
+            repo.enqueue_job(conn, workspace_id, contract_id, user_id, "quick")
+        conn.close()
+
+        _, _, body = self.get("/workspaces/%s/jobs?limit=2&offset=0" % workspace_id, headers={"Cookie": cookie})
+        page1 = [j["id"] for j in json.loads(body)["jobs"]]
+        _, _, body = self.get("/workspaces/%s/jobs?limit=2&offset=2" % workspace_id, headers={"Cookie": cookie})
+        page2 = [j["id"] for j in json.loads(body)["jobs"]]
+        _, _, body = self.get("/workspaces/%s/jobs?limit=2&offset=0" % workspace_id, headers={"Cookie": cookie})
+        page1_again = [j["id"] for j in json.loads(body)["jobs"]]
+
+        self.assertEqual(len(page1), 2)
+        self.assertEqual(len(page2), 2)
+        self.assertEqual(page1, page1_again)  # deterministic across repeated, identical calls.
+        self.assertEqual(len(set(page1) & set(page2)), 0)  # non-overlapping pages.
+
+    def test_invalid_pagination_params_return_400(self):
+        cookie, workspace_id, _ = self._seed_workspace_with_job("jl-7@example.com")
+        for query in ("limit=0", "limit=101", "limit=abc", "offset=-1"):
+            status, _, _ = self.get("/workspaces/%s/jobs?%s" % (workspace_id, query), headers={"Cookie": cookie})
+            self.assertEqual(status, 400, "query=%r" % query)
+
+
+class ReportReadTests(_WorkspaceStorageTestCase):
+    def _seed_workspace_with_report(self, email):
+        cookie = self.request_and_confirm_login(email)
+        conn = repo.connect(self.db_path)
+        user_id = repo.get_user_by_email(conn, email)["id"]
+        workspace_id = repo.create_workspace(conn, "Report WS", user_id)
+        contract_id = repo.create_contract(conn, workspace_id, "sources/x/rep", "hash", "A.sol")
+        job_id = repo.enqueue_job(conn, workspace_id, contract_id, user_id, "quick")
+        repo.transition_job_status(conn, job_id, "queued", "claimed")
+        repo.transition_job_status(conn, job_id, "claimed", "running")
+        storage_ref = object_storage.workspace_key(workspace_id, "reports", job_id)
+        self.storage.put_object(storage_ref, b"# Report\nSome content.", content_type="text/markdown")
+        report_id = repo.record_report(conn, job_id, workspace_id, storage_ref, score_status="computed", score=10, risk_band="LOW")
+        repo.transition_job_status(conn, job_id, "running", "succeeded")
+        conn.close()
+        return cookie, workspace_id, report_id
+
+    def test_list_requires_authentication(self):
+        _, workspace_id, _ = self._seed_workspace_with_report("rl-1@example.com")
+        status, _, _ = self.get("/workspaces/%s/reports" % workspace_id)
+        self.assertEqual(status, 401)
+
+    def test_list_never_includes_a_raw_storage_path(self):
+        cookie, workspace_id, report_id = self._seed_workspace_with_report("rl-2@example.com")
+        status, _, body = self.get("/workspaces/%s/reports" % workspace_id, headers={"Cookie": cookie})
+        self.assertEqual(status, 200)
+        reports = json.loads(body)["reports"]
+        self.assertEqual([r["id"] for r in reports], [report_id])
+        self.assertNotIn("storage_ref", reports[0])
+
+    def test_list_cross_tenant_is_forbidden(self):
+        _, workspace_id, _ = self._seed_workspace_with_report("rl-3@example.com")
+        cookie_b = self.request_and_confirm_login("rl-3b@example.com")
+        status, _, _ = self.get("/workspaces/%s/reports" % workspace_id, headers={"Cookie": cookie_b})
+        self.assertEqual(status, 403)
+
+    def test_get_returns_metadata_and_a_working_signed_url(self):
+        cookie, workspace_id, report_id = self._seed_workspace_with_report("rg-1@example.com")
+        status, _, body = self.get("/workspaces/%s/reports/%s" % (workspace_id, report_id), headers={"Cookie": cookie})
+        self.assertEqual(status, 200)
+        report = json.loads(body)["report"]
+        self.assertEqual(report["id"], report_id)
+        self.assertNotIn("storage_ref", report)
+        self.assertIn("report_url", report)
+        fetched = self.storage.verify_signed_url(report["report_url"])
+        self.assertEqual(fetched, b"# Report\nSome content.")
+
+    def test_get_nonexistent_report_id_returns_404(self):
+        cookie, workspace_id, _ = self._seed_workspace_with_report("rg-2@example.com")
+        status, _, _ = self.get("/workspaces/%s/reports/does-not-exist" % workspace_id, headers={"Cookie": cookie})
+        self.assertEqual(status, 404)
+
+    def test_get_cross_tenant_report_id_returns_404_never_leaks_existence(self):
+        # workspace A's real report_id, requested through workspace B's
+        # own (legitimate) URL - must be indistinguishable from a
+        # report_id that never existed anywhere at all.
+        cookie_a, workspace_a, report_id_a = self._seed_workspace_with_report("rg-3a@example.com")
+        cookie_b = self.request_and_confirm_login("rg-3b@example.com")
+        _, _, body_b_ws = self.post_json("/workspaces", {"name": "B WS"}, headers={"Cookie": cookie_b})
+        workspace_b = json.loads(body_b_ws)["workspace_id"]
+
+        status_cross, _, body_cross = self.get("/workspaces/%s/reports/%s" % (workspace_b, report_id_a), headers={"Cookie": cookie_b})
+        status_fake, _, body_fake = self.get("/workspaces/%s/reports/does-not-exist" % workspace_b, headers={"Cookie": cookie_b})
+        self.assertEqual(status_cross, 404)
+        self.assertEqual(json.loads(body_cross), json.loads(body_fake))
+
+    def test_get_requires_membership_in_the_url_workspace(self):
+        _, workspace_id, report_id = self._seed_workspace_with_report("rg-4@example.com")
+        cookie_stranger = self.request_and_confirm_login("rg-4-stranger@example.com")
+        status, _, _ = self.get("/workspaces/%s/reports/%s" % (workspace_id, report_id), headers={"Cookie": cookie_stranger})
+        self.assertEqual(status, 403)
+
+class ReportGetWithoutStorageTests(_HttpAppTestCase):
+    """_HttpAppTestCase (unlike _WorkspaceStorageTestCase above) never
+    configures storage - proves GET .../reports/<id> degrades cleanly
+    rather than 503ing when storage=None (see _handle_report_get()'s own
+    "when applicable" framing for report_url)."""
+
+    def test_get_without_storage_configured_omits_report_url_but_keeps_metadata(self):
+        cookie = self.request_and_confirm_login("rg-nostorage@example.com")
+        conn = repo.connect(self.db_path)
+        user_id = repo.get_user_by_email(conn, "rg-nostorage@example.com")["id"]
+        workspace_id = repo.create_workspace(conn, "No Storage WS", user_id)
+        contract_id = repo.create_contract(conn, workspace_id, "sources/x/ns", "hash", "A.sol")
+        job_id = repo.enqueue_job(conn, workspace_id, contract_id, user_id, "quick")
+        report_id = repo.record_report(
+            conn, job_id, workspace_id, "reports/%s/%s" % (workspace_id, job_id), score_status="computed", score=5, risk_band="LOW"
+        )
+        conn.close()
+
+        status, _, body = self.get("/workspaces/%s/reports/%s" % (workspace_id, report_id), headers={"Cookie": cookie})
+        self.assertEqual(status, 200)
+        report = json.loads(body)["report"]
+        self.assertEqual(report["score"], 5)
+        self.assertEqual(report["risk_band"], "LOW")
+        self.assertNotIn("storage_ref", report)
+        self.assertNotIn("report_url", report)
 
     def test_no_query_string_is_untouched(self):
         import backend.http_app as http_app

@@ -517,5 +517,186 @@ class WebhookHardeningIntegrationTests(unittest.TestCase):
         self.assertEqual(len(winners), 1, "expected exactly one claimant, got: %r" % (results,))
 
 
+class _CapturingEmailSender:
+    def __init__(self):
+        self.sent = []
+
+    def send(self, to_email, subject, body):
+        self.sent.append((to_email, subject, body))
+
+    def last_token(self):
+        _, _, body = self.sent[-1]
+        return body.rsplit("token=", 1)[-1]
+
+
+class HttpJobSubmitConcurrencyIntegrationTests(unittest.TestCase):
+    """Phase 5 blocker fix (docs/decisiones.md D-080 follow-up):
+    backend/http_app.py's _handle_job_submit() idempotency-conflict
+    recovery path against a REAL running server + real PostgreSQL -
+    through the actual HTTP layer, not just repository.py directly (the
+    bug lived specifically in the HTTP handler's own exception-recovery
+    code, so a repository-level test - the same level
+    ConcurrentClaimIntegrationTests/AuthTokenIntegrationTests already
+    cover their own races at - would never have caught it; see
+    WebhookHardeningIntegrationTests above for the identical bug CLASS,
+    caught the same way, in a different handler).
+
+    Bug (found during the Phase 5 final audit): a losing concurrent
+    submitter hits a real Postgres IntegrityError on the idempotency_key
+    UNIQUE constraint, which aborts the whole transaction; the recovery
+    SELECT that used to run immediately after it then itself raised
+    InFailedSqlTransaction, surfacing as a spurious HTTP 500 instead of
+    the intended clean 200 duplicate:true response - never reproducible
+    on SQLite (which never aborts a transaction on error), so invisible
+    to the entire SQLite-backed suite regardless of how many concurrent
+    threads it used."""
+
+    def setUp(self):
+        self.conn, _ = _reset_database_and_migrate()
+        self.addCleanup(self.conn.close)
+
+        import tempfile
+        import backend.object_storage as object_storage
+
+        self.storage_dir = tempfile.mkdtemp(prefix="pg-http-concurrency-")
+        self.addCleanup(shutil.rmtree, self.storage_dir, True)
+        self.storage = object_storage.LocalFilesystemStorage(self.storage_dir, sign_secret="pg-http-concurrency-secret")
+        self.email_sender = _CapturingEmailSender()
+
+        host = "127.0.0.1"
+        self.httpd = http_app.run_server(
+            connect_fn=lambda: db.connect_postgres(DSN),
+            email_sender=self.email_sender,
+            host_allowlist=[host],
+            host=host,
+            port=0,
+            secure_cookies=False,
+            storage=self.storage,
+        )
+        self.port = self.httpd.server_address[1]
+        self.host_header = "%s:%d" % (host, self.port)
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        time.sleep(0.05)
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+
+    def _request(self, method, path, body=None, cookie=None):
+        import http.client
+        import json as json_module
+
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        headers = {"Host": self.host_header, "Origin": "http://%s" % self.host_header}
+        data = None
+        if body is not None:
+            data = json_module.dumps(body).encode("utf-8")
+            headers["Content-Length"] = str(len(data))
+        if cookie:
+            headers["Cookie"] = cookie
+        conn.request(method, path, body=data, headers=headers)
+        resp = conn.getresponse()
+        raw = resp.read()
+        conn.close()
+        if not raw:
+            return resp.status, None
+        try:
+            return resp.status, json_module.loads(raw)
+        except json_module.JSONDecodeError:
+            return resp.status, raw  # e.g. GET /auth/verify's HTML confirm page - caller doesn't need it parsed.
+
+    def _login(self, email):
+        import json as json_module
+
+        self._request("POST", "/auth/request-link", {"email": email})
+        token = self.email_sender.last_token()
+        self._request("GET", "/auth/verify?token=%s" % token)
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        from urllib.parse import urlencode
+        body = urlencode({"token": token, "redirect": "/"}).encode("ascii")
+        headers = {
+            "Host": self.host_header, "Origin": "http://%s" % self.host_header,
+            "Content-Type": "application/x-www-form-urlencoded", "Content-Length": str(len(body)),
+        }
+        conn.request("POST", "/auth/verify", body=body, headers=headers)
+        resp = conn.getresponse()
+        resp.read()
+        cookie = resp.getheader("Set-Cookie").split(";")[0]
+        conn.close()
+        return cookie
+
+    def test_ten_concurrent_http_submits_same_idempotency_key_exactly_one_job_no_500s(self):
+        cookie = self._login("pg-http-idem@example.com")
+        status, payload = self._request("POST", "/workspaces", {"name": "PG HTTP Idem WS"}, cookie=cookie)
+        self.assertEqual(status, 200, payload)
+        workspace_id = payload["workspace_id"]
+        repo.create_entitlement(self.conn, workspace_id, "quick", "active")
+        self.conn.commit()
+
+        for round_number in range(3):  # "repeat several times" - a fresh idempotency_key per round, same workspace/server.
+            with self.subTest(round=round_number):
+                idem_key = "pg-http-concurrent-key-round-%d" % round_number
+                barrier = threading.Barrier(10)
+                results = []
+                lock = threading.Lock()
+
+                def _submit():
+                    barrier.wait(timeout=5)  # maximize the chance all 10 POSTs genuinely overlap.
+                    status, payload = self._request(
+                        "POST", "/workspaces/%s/jobs" % workspace_id,
+                        {"mode": "quick", "source": "contract Concurrent%d {}" % round_number, "idempotency_key": idem_key},
+                        cookie=cookie,
+                    )
+                    with lock:
+                        results.append((status, payload))
+
+                threads = [threading.Thread(target=_submit) for _ in range(10)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(timeout=15)
+
+                statuses = [r[0] for r in results]
+                self.assertEqual(len(results), 10, "not every thread finished: %r" % (results,))
+                self.assertTrue(all(s == 200 for s in statuses), "expected every response to be 200, never a 500 from the race - got: %r" % statuses)
+
+                job_ids = {r[1]["job_id"] for r in results}
+                self.assertEqual(len(job_ids), 1, "expected exactly one distinct job_id across all 10 submitters - got: %r" % (results,))
+
+                winners = [r for r in results if not r[1].get("duplicate")]
+                losers = [r for r in results if r[1].get("duplicate") is True]
+                self.assertEqual(len(winners), 1, "expected exactly one non-duplicate winner - got: %r" % (results,))
+                self.assertEqual(len(losers), 9, "expected exactly nine duplicate:true losers - got: %r" % (results,))
+                for _, payload in losers:
+                    self.assertEqual(payload["status"], "queued")
+                    self.assertEqual(payload["job_id"], list(job_ids)[0])
+
+                cur = db.execute(self.conn, "SELECT COUNT(*) AS n FROM analysis_jobs WHERE idempotency_key = %s", (idem_key,))
+                self.assertEqual(db.normalize_row(cur.fetchone())["n"], 1, "expected exactly one real row in analysis_jobs for this idempotency_key")
+
+    def test_different_idempotency_keys_create_separate_jobs(self):
+        cookie = self._login("pg-http-idem-2@example.com")
+        status, payload = self._request("POST", "/workspaces", {"name": "PG HTTP Idem WS 2"}, cookie=cookie)
+        self.assertEqual(status, 200, payload)
+        workspace_id = payload["workspace_id"]
+        repo.create_entitlement(self.conn, workspace_id, "quick", "active")
+        self.conn.commit()
+
+        status_1, payload_1 = self._request(
+            "POST", "/workspaces/%s/jobs" % workspace_id,
+            {"mode": "quick", "source": "contract One {}", "idempotency_key": "distinct-key-1"}, cookie=cookie,
+        )
+        status_2, payload_2 = self._request(
+            "POST", "/workspaces/%s/jobs" % workspace_id,
+            {"mode": "quick", "source": "contract Two {}", "idempotency_key": "distinct-key-2"}, cookie=cookie,
+        )
+        self.assertEqual((status_1, status_2), (200, 200), (payload_1, payload_2))
+        self.assertNotEqual(payload_1["job_id"], payload_2["job_id"])
+        self.assertNotIn("duplicate", payload_1)
+        self.assertNotIn("duplicate", payload_2)
+        cur = db.execute(self.conn, "SELECT COUNT(*) AS n FROM analysis_jobs WHERE workspace_id = %s", (workspace_id,))
+        self.assertEqual(db.normalize_row(cur.fetchone())["n"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3,18 +3,29 @@
 and 10-page expansion of the V2.12 site, docs/decisiones.md D-067 base;
 capabilities W-01, W-02, W-04 kept, extended with SEO/GEO output).
 
-Architecture is unchanged from V2.12 and is NOT rebuilt: a third-party
-marketplace (docs/capafy-notas.md, capafy/pricing.md) still owns auth,
-billing, tiers and execution behind the scenes. This generator remains a
-thin, PUBLIC, static layer in front of that - no accounts, no payment, no
-storage, no hosted analyzer execution. Per the SEO-fixes pass, the public
-site no longer names or links to that marketplace anywhere: every CTA is an
-internal Vericexa page (content.CTA_ANALYZE/CTA_DEMO/CTA_HOW_IT_WORKS), and
-the only remaining dynamic surface it links to is the stateless W-03 endpoint
-(server.py). The marketplace is still disclosed BY FACT (who processes LLM
-calls, who governs purchase terms) in legal.html/privacy.html, generically
-worded per content.py's LEGAL_SECTIONS/PRIVACY_SECTIONS - never removed,
-just no longer named or linked as a brand.
+Architecture is unchanged from V2.12 and is NOT rebuilt by this generator
+itself: this file still renders no accounts, no payment UI, no storage, no
+hosted-analyzer-execution UI of its own - it remains a thin, PUBLIC, static
+layer. Per the SEO-fixes pass, the public site names or links no external
+distribution mechanism anywhere: every CTA is an internal Vericexa page
+(content.CTA_ANALYZE/CTA_DEMO/CTA_HOW_IT_WORKS), and the only remaining
+dynamic surface it links to is the stateless W-03 endpoint (server.py).
+
+Phase 5 note (docs/decisiones.md D-077 follow-up): a THIRD-PARTY marketplace
+(docs/capafy-notas.md, capafy/pricing.md) is no longer the only mechanism
+that can own auth/billing/tiers/execution - an independent standalone-SaaS
+backend now exists (backend/http_app.py, backend/billing.py, backend/
+worker_supervisor.py, Phases 1-4). This generator is not wired to either one
+yet (still zero accounts/payment/execution UI here) - which mechanism is
+actually live, and whether/how a CTA here should eventually point at the
+standalone backend's own GET /auth/login entry point, is a business/legal
+decision Diego has not made yet (see legal.html/privacy.html's own current,
+unmodified claims that this site "does not process payments, create
+accounts, or run the analysis engine itself" - a live signup CTA on this
+site would need those claims revisited FIRST, not silently). Not decided by
+this pass. Whichever mechanism is confirmed, it is still disclosed BY FACT in
+legal.html/privacy.html, generically worded per content.py's LEGAL_SECTIONS/
+PRIVACY_SECTIONS - never removed, never named as a brand on the public site.
 
 All brand/copy/feature-status/pricing facts live in website/content.py (one
 place to edit, never restated here - same single-source-of-truth discipline
@@ -26,8 +37,9 @@ HTML, sitemap.xml and robots.txt. Neither live source is duplicated as a
 second hand-copied value anywhere in this file.
 
 Pricing (dollar amounts, billing cadence) is deliberately never rendered:
-content.PRICING_PUBLISHED is False because capafy/pricing.md still marks
-amounts `[CAPAFY-VERIFY]` ("Draft only"). The pricing page shows tier NAMES
+content.PRICING_PUBLISHED is False because no real amounts are confirmed yet
+for either potential distribution path - see content.py's own module
+docstring and PRICING_PUBLISHED comment. The pricing page shows tier NAMES
 and FEATURE differences only, with an internal CTA (content.CTA_ANALYZE) -
 see content.py for how to activate real prices later.
 

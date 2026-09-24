@@ -16,9 +16,13 @@ diff_reports/diff_preprocess are called exactly as they already exist; this
 module contains no preprocessing, scoring, validation, diffing or rendering
 logic of its own, and adds no detector.
 
-Capafy owns auth, billing, tiers and execution. This endpoint implements
-NONE of that: there is no login, no payment, no per-user quota - only a
-flat, anonymous, per-IP rate limit against abuse of a public endpoint.
+Neither Capafy nor the independent standalone-SaaS backend (backend/
+http_app.py, Phases 1-4, docs/decisiones.md D-077) is this endpoint's
+concern - it implements NONE of auth/billing/tiers/execution: there is no
+login, no payment, no per-user quota - only a flat, anonymous, per-IP rate
+limit against abuse of a public endpoint. This module stays exactly this
+narrow regardless of which mechanism ends up live (see website/build_site.py's
+own module docstring on that still-undecided question).
 
 Resource governance is this wrapper's job (api.py's own docstring already
 anticipates this): a request body over MAX_BODY_BYTES is rejected before

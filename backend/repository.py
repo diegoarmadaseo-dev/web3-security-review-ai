@@ -126,6 +126,31 @@ def create_workspace(conn: Any, name: str, owner_user_id: str) -> str:
     return workspace_id
 
 
+def get_workspace(conn: Any, workspace_id: str) -> Optional[Dict[str, Any]]:
+    cur = db.execute(conn, "SELECT * FROM workspaces WHERE id = ?", (workspace_id,))
+    return db.normalize_row(cur.fetchone())
+
+
+def list_workspaces_by_user(conn: Any, user_id: str) -> List[Dict[str, Any]]:
+    """Every workspace user_id is a MEMBER of (owner/admin/member alike),
+    resolved through workspace_members - never workspaces.owner_user_id
+    alone, since a user can belong to a workspace they don't own (see
+    add_workspace_member()). Each row carries its own membership_role
+    alongside the workspace's own columns, so a caller (backend/
+    http_app.py) never needs a second query to know what the caller can
+    do there. Deterministic order (created_at then id, the same tiebreak
+    list_jobs_by_workspace()/list_reports_by_workspace() below use) -
+    never left to whatever order the database happens to return."""
+    cur = db.execute(
+        conn,
+        "SELECT w.*, wm.role AS membership_role FROM workspaces w "
+        "JOIN workspace_members wm ON wm.workspace_id = w.id "
+        "WHERE wm.user_id = ? ORDER BY w.created_at, w.id",
+        (user_id,),
+    )
+    return [db.normalize_row(row) for row in cur.fetchall()]
+
+
 def add_workspace_member(conn: Any, workspace_id: str, user_id: str, role: str) -> None:
     if role not in ("owner", "admin", "member"):
         raise RepositoryError("role must be one of owner/admin/member, got %r" % role)
@@ -359,6 +384,51 @@ def get_job_by_idempotency_key(conn: Any, idempotency_key: str) -> Optional[Dict
     backend/http_app.py's _handle_job_submit()."""
     cur = db.execute(conn, "SELECT * FROM analysis_jobs WHERE idempotency_key = ?", (idempotency_key,))
     return db.normalize_row(cur.fetchone())
+
+
+DEFAULT_LIST_LIMIT = 20
+MAX_LIST_LIMIT = 100  # Phase 5 pagination bound - see list_jobs_by_workspace()/list_reports_by_workspace().
+JOB_STATUSES = ("queued", "claimed", "running", "succeeded", "failed", "canceled")  # analysis_jobs' own CHECK-constrained values, named once here so backend/http_app.py never hardcodes a second copy for its own filter validation.
+
+
+def list_jobs_by_workspace(
+    conn: Any,
+    workspace_id: str,
+    limit: int = DEFAULT_LIST_LIMIT,
+    offset: int = 0,
+    status: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Tenant-scoped by construction (workspace_id is a WHERE clause, not
+    a filter applied after a broader query) - the caller must still have
+    already resolved workspace_id against the authenticated user via
+    tenant_scope, same trust boundary as every other function in this
+    module (see module docstring). status, if given, must already be one
+    of JOB_STATUSES - this raises RepositoryError for anything else
+    rather than silently returning zero rows for a typo'd filter.
+    Deterministic order: created_at DESC (newest first, the useful order
+    for a history view) then id DESC as a tiebreaker - two jobs created
+    within the same wall-clock instant (this module's own timestamps
+    have real-world, not database-sequence, resolution) must still sort
+    identically on every call, including across pages."""
+    if not (1 <= limit <= MAX_LIST_LIMIT):
+        raise RepositoryError("limit must be between 1 and %d, got %r" % (MAX_LIST_LIMIT, limit))
+    if offset < 0:
+        raise RepositoryError("offset must be >= 0, got %r" % (offset,))
+    if status is not None and status not in JOB_STATUSES:
+        raise RepositoryError("status must be one of %r, got %r" % (JOB_STATUSES, status))
+    if status is None:
+        cur = db.execute(
+            conn,
+            "SELECT * FROM analysis_jobs WHERE workspace_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            (workspace_id, limit, offset),
+        )
+    else:
+        cur = db.execute(
+            conn,
+            "SELECT * FROM analysis_jobs WHERE workspace_id = ? AND status = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            (workspace_id, status, limit, offset),
+        )
+    return [db.normalize_row(row) for row in cur.fetchall()]
 
 
 LEASE_DURATION_SECONDS = 15 * 60  # generous for one analysis job; matches auth.py's own "short-lived by design" philosophy at job scale, not login-token scale.
@@ -611,6 +681,36 @@ def record_report(
     )
     conn.commit()
     return report_id
+
+
+def list_reports_by_workspace(conn: Any, workspace_id: str, limit: int = DEFAULT_LIST_LIMIT, offset: int = 0) -> List[Dict[str, Any]]:
+    """Same tenant-scoping trust, pagination bounds and deterministic
+    order as list_jobs_by_workspace() above - see that function's
+    docstring; not repeated here."""
+    if not (1 <= limit <= MAX_LIST_LIMIT):
+        raise RepositoryError("limit must be between 1 and %d, got %r" % (MAX_LIST_LIMIT, limit))
+    if offset < 0:
+        raise RepositoryError("offset must be >= 0, got %r" % (offset,))
+    cur = db.execute(
+        conn,
+        "SELECT * FROM reports WHERE workspace_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+        (workspace_id, limit, offset),
+    )
+    return [db.normalize_row(row) for row in cur.fetchall()]
+
+
+def get_report_by_id(conn: Any, report_id: str) -> Optional[Dict[str, Any]]:
+    """Returns this report's row regardless of workspace - the caller
+    (backend/http_app.py's report-detail handler) MUST compare the
+    returned row's own workspace_id against the URL's already-tenant-
+    scope-verified workspace_id itself before using anything else on it;
+    this function takes no workspace_id to filter by because a report is
+    looked up by its own id, exactly like get_job()/get_contract() above
+    - the tenant check is the caller's job, not a second, redundant WHERE
+    clause here (same division of responsibility this module's own
+    docstring already establishes)."""
+    cur = db.execute(conn, "SELECT * FROM reports WHERE id = ?", (report_id,))
+    return db.normalize_row(cur.fetchone())
 
 
 def append_audit_event(
