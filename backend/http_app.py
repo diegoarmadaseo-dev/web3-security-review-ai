@@ -139,6 +139,7 @@ Standard library only.
 """
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import re
@@ -151,6 +152,7 @@ from urllib.parse import parse_qs, quote, unquote_plus, urlparse
 import backend.auth as auth
 import backend.billing as billing_module
 import backend.db as db
+import backend.object_storage as object_storage
 import backend.repository as repo
 import backend.tenant_scope as tenant_scope
 
@@ -160,6 +162,16 @@ REQUEST_TIMEOUT_SECONDS = 10
 
 _MEMBER_COLLECTION_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/members$")
 _MEMBER_ITEM_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/members/(?P<user_id>[^/]+)$")
+_JOBS_COLLECTION_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/jobs$")
+
+# Phase 4: a raw-byte cap enforced HERE, synchronously, before anything is
+# queued - "no execution during HTTP request" means this handler never
+# runs preprocess.py's own (correct, authoritative) maxEffectiveLoc/
+# maxSourceFiles check itself; that happens inside the worker, which
+# already fails a job cleanly if exceeded (see backend/worker_entrypoint.py).
+# This is only a cheap, fast rejection of the obviously-oversized case
+# before it ever reaches the queue.
+MAX_RAW_SOURCE_BYTES = 512 * 1024
 
 # Query parameter names (decoded, lower-cased) this module never lets
 # reach an access log - see module docstring and _redact_query_string().
@@ -378,6 +390,7 @@ def make_handler(
     host_allowlist: Sequence[str],
     secure_cookies: bool = True,
     billing: Optional["billing_module.StripeBilling"] = None,
+    storage: Optional["object_storage.ObjectStorage"] = None,
 ) -> type:
     """Returns a fresh Handler class closed over this specific server
     instance's config - never module-level globals, so multiple servers
@@ -387,7 +400,9 @@ def make_handler(
     Stripe still gets every other endpoint working normally; the three
     /billing/* routes return a clean 503 rather than raising when it is
     None (see _handle_billing_checkout() etc.) - see module docstring on
-    billing for the security model those routes follow."""
+    billing for the security model those routes follow. storage is
+    likewise OPTIONAL (Phase 4) - POST /workspaces/<id>/jobs returns a
+    clean 503 when it is None, the same degrade-cleanly convention."""
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "backend-auth/2026.1"
@@ -557,8 +572,12 @@ def make_handler(
                 match = _MEMBER_COLLECTION_RE.match(path)
                 if match:
                     self._handle_member_add(match.group("workspace_id"))
-                else:
-                    self._send_json(404, {"ok": False, "error": "not found"})
+                    return
+                match = _JOBS_COLLECTION_RE.match(path)
+                if match:
+                    self._handle_job_submit(match.group("workspace_id"))
+                    return
+                self._send_json(404, {"ok": False, "error": "not found"})
 
         def _handle_request_link(self) -> None:
             if self._reject_if_cross_origin():
@@ -693,6 +712,88 @@ def make_handler(
                     self._send_json(409, {"ok": False, "error": "user is already a member of this workspace"})
                     return
                 self._send_json(200, {"ok": True, "user_id": target_user_id})
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
+
+        # -------------------------------------------------------------
+        # Jobs (Phase 4) - execution infrastructure. Submission only;
+        # this endpoint never executes/compiles the submitted source -
+        # see module docstring and backend/worker_supervisor.py.
+        # -------------------------------------------------------------
+        def _handle_job_submit(self, workspace_id: str) -> None:
+            if self._reject_if_cross_origin():
+                return
+            if storage is None:
+                self._send_json(503, {"ok": False, "error": "job execution is not configured"})
+                return
+            raw, err_status, err_msg = self._read_body()
+            if err_status:
+                self._send_json(err_status, {"ok": False, "error": err_msg})
+                return
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_json(400, {"ok": False, "error": "request body is not valid UTF-8 JSON"})
+                return
+            if not isinstance(payload, dict):
+                self._send_json(400, {"ok": False, "error": "request body must be a JSON object"})
+                return
+            mode = payload.get("mode")
+            source = payload.get("source")
+            client_idempotency_key = payload.get("idempotency_key")
+            if mode not in ("quick", "standard", "pro"):
+                self._send_json(400, {"ok": False, "error": "mode must be one of quick/standard/pro"})
+                return
+            if not isinstance(source, str) or not source.strip():
+                self._send_json(400, {"ok": False, "error": "source is required"})
+                return
+            # Cheap, fast rejection only - see MAX_RAW_SOURCE_BYTES's own
+            # comment on why the authoritative maxEffectiveLoc/
+            # maxSourceFiles check happens inside the worker, not here.
+            if len(source.encode("utf-8")) > MAX_RAW_SOURCE_BYTES:
+                self._send_json(413, {"ok": False, "error": "source exceeds the maximum submission size"})
+                return
+            if client_idempotency_key is not None and (not isinstance(client_idempotency_key, str) or not (1 <= len(client_idempotency_key) <= 200)):
+                self._send_json(400, {"ok": False, "error": "idempotency_key must be a string of 1-200 characters"})
+                return
+            conn = connect_fn()
+            try:
+                current_user_id = self._current_user_id(conn)
+                if current_user_id is None:
+                    self._send_json(401, {"ok": False, "error": "authentication required"})
+                    return
+                try:
+                    tenant_scope.require_workspace_role(conn, current_user_id, workspace_id, allowed_roles=("owner", "admin", "member"))
+                except tenant_scope.TenantScopeError:
+                    self._send_json(403, {"ok": False, "error": "forbidden"})
+                    return
+                entitlement = repo.get_entitlement_by_workspace(conn, workspace_id)
+                if entitlement is None or entitlement["status"] not in ("active", "trialing"):
+                    self._send_json(402, {"ok": False, "error": "this workspace has no active subscription"})
+                    return
+                idempotency_key = client_idempotency_key or repo.new_id()
+                existing = repo.get_job_by_idempotency_key(conn, idempotency_key)
+                if existing is not None:
+                    self._send_json(200, {"ok": True, "job_id": existing["id"], "status": existing["status"], "duplicate": True})
+                    return
+                content_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
+                # A fresh id for the storage OBJECT only - decoupled from
+                # the contract row's own id (create_contract() generates
+                # that itself and needs storage_ref as an input, so the
+                # two cannot be the same value chosen up front).
+                storage_ref = object_storage.workspace_key(workspace_id, "sources", repo.new_id())
+                storage.put_object(storage_ref, source.encode("utf-8"), content_type="text/plain")
+                contract_id = repo.create_contract(conn, workspace_id, storage_ref, content_hash, payload.get("filename") or "contract.sol")
+                try:
+                    job_id = repo.enqueue_job(conn, workspace_id, contract_id, current_user_id, mode, idempotency_key=idempotency_key)
+                except db.integrity_error_class(conn):
+                    # A concurrent identical submission won the idempotency_key race - same job, not an error.
+                    winner = repo.get_job_by_idempotency_key(conn, idempotency_key)
+                    self._send_json(200, {"ok": True, "job_id": winner["id"], "status": winner["status"], "duplicate": True})
+                    return
+                self._send_json(200, {"ok": True, "job_id": job_id, "status": "queued"})
             except Exception:
                 self._send_json(500, {"ok": False, "error": "internal error"})
             finally:
@@ -917,6 +1018,7 @@ def run_server(
     port: int = 0,
     secure_cookies: bool = True,
     billing: Optional["billing_module.StripeBilling"] = None,
+    storage: Optional["object_storage.ObjectStorage"] = None,
 ) -> ThreadingHTTPServer:
-    handler_cls = make_handler(connect_fn, email_sender, host_allowlist, secure_cookies, billing)
+    handler_cls = make_handler(connect_fn, email_sender, host_allowlist, secure_cookies, billing, storage)
     return ThreadingHTTPServer((host, port), handler_cls)

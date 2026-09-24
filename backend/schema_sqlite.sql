@@ -132,7 +132,9 @@ CREATE TABLE analysis_jobs (
     attempt_count           INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
     last_error              TEXT,
     idempotency_key         TEXT UNIQUE,
-    created_at              TEXT NOT NULL
+    created_at              TEXT NOT NULL,
+    -- Phase 4 (backend/migrations/0005_job_queue_hardening.sql's mirror).
+    lease_expires_at        TEXT
 );
 CREATE INDEX idx_analysis_jobs_workspace ON analysis_jobs(workspace_id);
 CREATE INDEX idx_analysis_jobs_claim_queue ON analysis_jobs(status, created_at);
@@ -192,3 +194,15 @@ CREATE TABLE auth_tokens (
 );
 CREATE INDEX idx_auth_tokens_email_created ON auth_tokens(email, created_at);
 CREATE INDEX idx_auth_tokens_ip_created ON auth_tokens(requested_ip, created_at);
+
+-- Phase 4 (backend/migrations/0005_job_queue_hardening.sql's mirror).
+CREATE TABLE workspace_budgets (
+    workspace_id     TEXT PRIMARY KEY REFERENCES workspaces(id),
+    period_start     TEXT NOT NULL,
+    limit_units      INTEGER NOT NULL,
+    reserved_units   INTEGER NOT NULL DEFAULT 0,
+    consumed_units   INTEGER NOT NULL DEFAULT 0,
+    updated_at       TEXT NOT NULL,
+    CHECK (reserved_units >= 0 AND consumed_units >= 0 AND limit_units >= 0),
+    CHECK (reserved_units + consumed_units <= limit_units)
+);

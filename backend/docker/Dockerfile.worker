@@ -1,0 +1,74 @@
+# Minimal, reproducible worker image (Phase 4 execution infrastructure,
+# docs/decisiones.md D-077/D-079 follow-up). Runs backend/worker_entrypoint.py
+# ONLY - the isolated per-job container backend/worker_supervisor.py launches
+# (see that module's own docstring for the full isolation model: --read-only
+# rootfs, no host mounts, no Docker socket, a dedicated network with egress
+# only through backend/egress_proxy.py, and job input/the LLM key delivered
+# over stdin/stdout, never `docker cp` - see D-079's own decision entry for
+# why `docker cp` cannot be used against this container's tmpfs mount).
+#
+# BUILD (from the REPO ROOT - this image needs both .claude/skills/web3-auditor/
+# and backend/ as build context, so the Dockerfile's own directory is NOT a
+# valid context by itself):
+#   docker build -f backend/docker/Dockerfile.worker -t web3-auditor-worker:local .
+#
+# BASE IMAGE: python:3.11-slim-bookworm - pinned to this specific tag family
+# (Debian 12 "bookworm", Python 3.11), not a floating `python:3-slim` or
+# `python:latest`. This is reproducible in the sense of "always the same
+# Debian release and Python minor version"; it is NOT byte-for-byte pinned to
+# one exact image digest (that would need `FROM python:3.11-slim-bookworm@
+# sha256:<digest>`, which requires resolving today's actual digest against
+# the registry - a build-time/CI concern, not something to hardcode here
+# without querying it, since a stale or invented digest would silently pin
+# the WRONG image). A deployer wanting byte-for-byte reproducibility should
+# resolve and pin the digest via their own CI, e.g.:
+#   docker pull python:3.11-slim-bookworm && \
+#     docker inspect --format '{{index .RepoDigests 0}}' python:3.11-slim-bookworm
+#
+# NO COMPILER, NO SOLC: this worker never compiles or executes submitted
+# Solidity/Vyper source - see backend/worker_entrypoint.py's own docstring
+# and backend/llm_client.py's - preprocess.py/analyze_pipeline.py treat
+# submitted source as DATA only. A Solidity toolchain has no reason to exist
+# in this image and is deliberately never installed.
+#
+# MINIMAL RUNTIME DEPENDENCIES: only the `anthropic` SDK is pip-installed
+# (needed for AnthropicLLMProvider's real, non-mock path - see
+# backend/llm_client.py). Neither `psycopg` (Postgres) nor `stripe` (billing)
+# is installed here - both are HOST-side-only dependencies (backend/db.py,
+# backend/billing.py) this container has no use for and never imports; the
+# worker's own imports are exactly backend/worker_entrypoint.py + backend/
+# llm_client.py + the analyzer's own scripts/ tree, confirmed by inspection.
+#
+# EXISTING ANALYZER CODE: the full .claude/skills/web3-auditor/ tree (scripts/
+# + config/ + references/) is copied in - not just scripts/. preprocess.py's
+# own load_modes_config() reads config/modes.json at runtime; omitting it
+# (an earlier build of this image did, for testing) makes every job fail
+# with ModesConfigError - confirmed empirically before settling on copying
+# the whole skill directory rather than cherry-picking scripts/ alone.
+#
+# NO CREDENTIALS BAKED IN: nothing below ever COPYs a credential or sets an
+# ENV/ARG with a real value - the LLM key arrives only at container RUNTIME,
+# over stdin, from backend/worker_supervisor.py (see that module's own
+# docstring on the credential boundary). This Dockerfile has no ARG/ENV for
+# it at all.
+#
+# MOCK PROVIDER FOR TESTS: no extra step needed - backend/llm_client.
+# MockLLMProvider is pure stdlib and is already included by copying backend/
+# llm_client.py wholesale; a test drives it by putting "mock_responses" in
+# the stdin envelope instead of "llm_api_key" (see backend/worker_entrypoint.py).
+
+FROM python:3.11-slim-bookworm
+
+WORKDIR /app
+
+# anthropic only - see "MINIMAL RUNTIME DEPENDENCIES" above. --no-cache-dir
+# keeps the image smaller; no compiler toolchain is invoked (anthropic's own
+# dependencies are pure-Python/pre-built wheels for this platform).
+RUN pip install --no-cache-dir "anthropic>=0.40,<1"
+
+COPY .claude/skills/web3-auditor/ /app/.claude/skills/web3-auditor/
+COPY backend/worker_entrypoint.py /app/backend/worker_entrypoint.py
+COPY backend/llm_client.py /app/backend/llm_client.py
+RUN touch /app/backend/__init__.py
+
+ENTRYPOINT ["python", "/app/backend/worker_entrypoint.py"]

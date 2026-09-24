@@ -38,7 +38,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import backend.db as db
@@ -317,6 +317,11 @@ def create_contract(
     return contract_id
 
 
+def get_contract(conn: Any, contract_id: str) -> Optional[Dict[str, Any]]:
+    cur = db.execute(conn, "SELECT * FROM contracts WHERE id = ?", (contract_id,))
+    return db.normalize_row(cur.fetchone())
+
+
 # ---------------------------------------------------------------------------
 # Job queue
 # ---------------------------------------------------------------------------
@@ -347,6 +352,18 @@ def get_job(conn: Any, job_id: str) -> Optional[Dict[str, Any]]:
     return db.normalize_row(cur.fetchone())
 
 
+def get_job_by_idempotency_key(conn: Any, idempotency_key: str) -> Optional[Dict[str, Any]]:
+    """Phase 4: lets a caller that hit enqueue_job()'s idempotency_key
+    UNIQUE constraint look up the job that already owns it, so a
+    duplicate submission returns the SAME job rather than an error - see
+    backend/http_app.py's _handle_job_submit()."""
+    cur = db.execute(conn, "SELECT * FROM analysis_jobs WHERE idempotency_key = ?", (idempotency_key,))
+    return db.normalize_row(cur.fetchone())
+
+
+LEASE_DURATION_SECONDS = 15 * 60  # generous for one analysis job; matches auth.py's own "short-lived by design" philosophy at job scale, not login-token scale.
+
+
 def claim_next_job(conn: Any, worker_id: str) -> Optional[Dict[str, Any]]:
     """Claims the oldest still-queued job for worker_id, or returns None
     if there is nothing queued OR another claimant won the race for the
@@ -356,10 +373,16 @@ def claim_next_job(conn: Any, worker_id: str) -> Optional[Dict[str, Any]]:
     Postgres gets the real, verified `FOR UPDATE SKIP LOCKED` claim query;
     SQLite keeps its existing conditional-UPDATE-and-check-rowcount
     pattern, which is the only claim safety SQLite's locking model can
-    express (see schema_sqlite.sql's docstring)."""
+    express (see schema_sqlite.sql's docstring). Stamps lease_expires_at
+    (Phase 4) so a crashed/hung worker's claim can later be found and
+    reclaimed by reap_expired_jobs() - see that function's docstring."""
     if db.is_postgres(conn):
         return _claim_next_job_postgres(conn, worker_id)
     return _claim_next_job_sqlite(conn, worker_id)
+
+
+def _lease_expiry(now: datetime) -> str:
+    return (now + timedelta(seconds=LEASE_DURATION_SECONDS)).isoformat()
 
 
 def _claim_next_job_sqlite(conn: Any, worker_id: str) -> Optional[Dict[str, Any]]:
@@ -368,11 +391,11 @@ def _claim_next_job_sqlite(conn: Any, worker_id: str) -> Optional[Dict[str, Any]
     if row is None:
         return None
     job_id = row["id"]
-    now = utcnow_iso()
+    now = datetime.now(timezone.utc)
     cur = db.execute(
         conn,
-        "UPDATE analysis_jobs SET status = 'claimed', claimed_by = ?, claimed_at = ? WHERE id = ? AND status = 'queued'",
-        (worker_id, now, job_id),
+        "UPDATE analysis_jobs SET status = 'claimed', claimed_by = ?, claimed_at = ?, lease_expires_at = ? WHERE id = ? AND status = 'queued'",
+        (worker_id, now.isoformat(), _lease_expiry(now), job_id),
     )
     conn.commit()
     if cur.rowcount == 0:
@@ -385,17 +408,140 @@ def _claim_next_job_postgres(conn: Any, worker_id: str) -> Optional[Dict[str, An
     # two-session concurrent race, exactly one winner) - RETURNING * in
     # place of a hardcoded column list so this never drifts from the
     # table's actual columns.
-    now = utcnow_iso()
+    now = datetime.now(timezone.utc)
     cur = db.execute(
         conn,
-        "UPDATE analysis_jobs SET status = 'claimed', claimed_by = ?, claimed_at = ? "
+        "UPDATE analysis_jobs SET status = 'claimed', claimed_by = ?, claimed_at = ?, lease_expires_at = ? "
         "WHERE id = (SELECT id FROM analysis_jobs WHERE status = 'queued' "
         "ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *",
-        (worker_id, now),
+        (worker_id, now.isoformat(), _lease_expiry(now)),
     )
     row = cur.fetchone()
     conn.commit()
     return db.normalize_row(row)
+
+
+_MAX_JOB_ATTEMPTS = 3  # matches analyze_pipeline.py's own documented "3 attempts total" cap - see backend/llm_client.py.
+
+
+def reap_expired_jobs(conn: Any, max_attempts: int = _MAX_JOB_ATTEMPTS) -> Dict[str, int]:
+    """Finds every claimed/running job whose lease has expired (a
+    crashed or hung worker never reported completion in time - Phase 4)
+    and either requeues it (attempt_count below max_attempts) or marks
+    it permanently failed (attempts exhausted). Both branches are plain
+    conditional UPDATEs keyed on the SAME status+lease_expires_at WHERE
+    clause already proven safe throughout this module: if the worker
+    that actually owns the job finishes (any terminal transition) at the
+    last moment, its UPDATE and this one cannot both match the same row
+    - whichever commits first wins, the other's WHERE clause no longer
+    matches, exactly claim_next_job()'s own race safety. Requeuing
+    counts as a failed attempt (attempt_count + 1) - a job that never
+    stops timing out must still eventually hit max_attempts, or it could
+    loop through the queue forever. Returns {"requeued": n, "failed": n}
+    for the caller (backend/worker_supervisor.py) to log."""
+    now = utcnow_iso()
+    requeue_cur = db.execute(
+        conn,
+        "UPDATE analysis_jobs SET status = 'queued', claimed_by = NULL, claimed_at = NULL, lease_expires_at = NULL, "
+        "attempt_count = attempt_count + 1 "
+        "WHERE status IN ('claimed', 'running') AND lease_expires_at IS NOT NULL AND lease_expires_at < ? AND attempt_count < ?",
+        (now, max_attempts),
+    )
+    conn.commit()
+    fail_cur = db.execute(
+        conn,
+        "UPDATE analysis_jobs SET status = 'failed', completed_at = ?, lease_expires_at = NULL, "
+        "attempt_count = attempt_count + 1, "
+        "last_error = 'lease expired: worker did not report completion within the allotted time' "
+        "WHERE status IN ('claimed', 'running') AND lease_expires_at IS NOT NULL AND lease_expires_at < ? AND attempt_count >= ?",
+        (now, now, max_attempts),
+    )
+    conn.commit()
+    return {"requeued": requeue_cur.rowcount, "failed": fail_cur.rowcount}
+
+
+# ---------------------------------------------------------------------------
+# Workspace spend control (Phase 4 - a units ledger, never money/billing;
+# Stripe/entitlements remain Phase 3 and are untouched by this section)
+# ---------------------------------------------------------------------------
+
+# Placeholders pending real per-plan business tiering (same caveat already
+# disclosed for Phase 3's own unset prices/currency/trial values) - a flat
+# default ceiling and a relative per-mode cost, not tied to any real
+# dollar figure.
+DEFAULT_BUDGET_LIMIT_UNITS = 100
+JOB_MODE_BUDGET_COST = {"quick": 1, "standard": 2, "pro": 4}
+
+
+def get_workspace_budget(conn: Any, workspace_id: str) -> Optional[Dict[str, Any]]:
+    cur = db.execute(conn, "SELECT * FROM workspace_budgets WHERE workspace_id = ?", (workspace_id,))
+    return db.normalize_row(cur.fetchone())
+
+
+def _ensure_workspace_budget_row(conn: Any, workspace_id: str, default_limit_units: int) -> None:
+    """Lazily creates a workspace's budget row on first use, exactly the
+    same try-INSERT/catch-conflict pattern record_webhook_event() already
+    uses for a different table - a concurrent double-create is expected
+    and harmless (the loser's row already exists, nothing to do)."""
+    try:
+        now = utcnow_iso()
+        db.execute(
+            conn,
+            "INSERT INTO workspace_budgets (workspace_id, period_start, limit_units, updated_at) VALUES (?, ?, ?, ?)",
+            (workspace_id, now, default_limit_units, now),
+        )
+        conn.commit()
+    except db.integrity_error_class(conn):
+        conn.rollback()
+
+
+def reserve_workspace_budget(conn: Any, workspace_id: str, units: int, default_limit_units: int = DEFAULT_BUDGET_LIMIT_UNITS) -> bool:
+    """Atomically reserves `units` against this workspace's ceiling
+    BEFORE the LLM call that would spend them - the same conditional-
+    UPDATE-and-check-rowcount claim pattern used throughout this module
+    (claim_next_job(), record_webhook_event()'s retry reclaim). Returns
+    True if the reservation fits (reserved+consumed+units <= limit_units,
+    checked in the WHERE clause itself, so two concurrent callers racing
+    for the last few units can never both succeed), False if it would
+    exceed the ceiling - the caller (backend/llm_client.py) must treat
+    False as "budget exhausted", never retry the same reservation in a
+    loop. Creates the workspace's budget row on first use."""
+    _ensure_workspace_budget_row(conn, workspace_id, default_limit_units)
+    cur = db.execute(
+        conn,
+        "UPDATE workspace_budgets SET reserved_units = reserved_units + ?, updated_at = ? "
+        "WHERE workspace_id = ? AND reserved_units + consumed_units + ? <= limit_units",
+        (units, utcnow_iso(), workspace_id, units),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def consume_reserved_workspace_budget(conn: Any, workspace_id: str, units: int) -> None:
+    """Converts a prior successful reservation into actual spend - called
+    only after the LLM call this units figure was reserved for actually
+    happened. The workspace_budgets_non_negative CHECK constraint is the
+    real backstop against a caller bug consuming more than was reserved
+    (see migration 0005's docstring) - this function trusts its own
+    caller the same way update_entitlement_status() trusts its own."""
+    db.execute(
+        conn,
+        "UPDATE workspace_budgets SET reserved_units = reserved_units - ?, consumed_units = consumed_units + ?, updated_at = ? WHERE workspace_id = ?",
+        (units, units, utcnow_iso(), workspace_id),
+    )
+    conn.commit()
+
+
+def release_workspace_budget(conn: Any, workspace_id: str, units: int) -> None:
+    """Gives back a reservation that was never spent - a job that failed,
+    was canceled, or never reached the LLM call at all. Same CHECK-
+    constraint backstop as consume_reserved_workspace_budget()."""
+    db.execute(
+        conn,
+        "UPDATE workspace_budgets SET reserved_units = reserved_units - ?, updated_at = ? WHERE workspace_id = ?",
+        (units, utcnow_iso(), workspace_id),
+    )
+    conn.commit()
 
 
 _VALID_TRANSITIONS = {

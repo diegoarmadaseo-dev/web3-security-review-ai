@@ -118,13 +118,17 @@ class MigrationIntegrationTests(unittest.TestCase):
         self.conn, self.applied = _reset_database_and_migrate()
         self.addCleanup(self.conn.close)
 
-    def test_fresh_database_applies_all_four_migrations_in_order(self):
+    def test_fresh_database_applies_all_five_migrations_in_order(self):
         # 0002_auth_tokens.sql (Phase 2), 0003_entitlement_status_expand.sql
-        # and 0004_entitlement_event_provenance.sql (Phase 3) added
-        # alongside 0001_initial_schema.sql (Phase 1).
+        # and 0004_entitlement_event_provenance.sql (Phase 3), and
+        # 0005_job_queue_hardening.sql (Phase 4, D-079) added alongside
+        # 0001_initial_schema.sql (Phase 1).
         self.assertEqual(
             self.applied,
-            ["0001_initial_schema", "0002_auth_tokens", "0003_entitlement_status_expand", "0004_entitlement_event_provenance"],
+            [
+                "0001_initial_schema", "0002_auth_tokens", "0003_entitlement_status_expand",
+                "0004_entitlement_event_provenance", "0005_job_queue_hardening",
+            ],
         )
 
     def test_entitlement_status_check_accepts_the_phase_3_expanded_values(self):
@@ -146,7 +150,7 @@ class MigrationIntegrationTests(unittest.TestCase):
             seen_statuses.add(repo.get_entitlement_by_workspace(self.conn, workspace_id)["status"])
         self.assertEqual(seen_statuses, {"incomplete_expired", "unpaid"})
 
-    def test_all_thirteen_tables_exist(self):
+    def test_all_fourteen_tables_exist(self):
         cur = db.execute(
             self.conn,
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
@@ -156,6 +160,7 @@ class MigrationIntegrationTests(unittest.TestCase):
             "schema_migrations", "users", "workspaces", "workspace_members", "sessions",
             "entitlements", "projects", "contracts", "analysis_jobs", "reports",
             "audit_events", "webhook_events", "auth_tokens",
+            "workspace_budgets",  # Phase 4, 0005_job_queue_hardening.sql (D-079).
         }
         self.assertEqual(tables, expected)
 
