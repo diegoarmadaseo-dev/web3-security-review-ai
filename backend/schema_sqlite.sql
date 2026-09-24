@@ -148,6 +148,8 @@ CREATE TABLE reports (
     score           INTEGER CHECK (score IS NULL OR (score BETWEEN 0 AND 100)),
     risk_band       TEXT CHECK (risk_band IS NULL OR risk_band IN ('LOW', 'MODERATE', 'HIGH', 'CRITICAL')),
     created_at      TEXT NOT NULL,
+    -- Phase 6A (backend/migrations/0006_retention_purge.sql's mirror).
+    purged_at       TEXT,
     -- Mirrors report-schema.json's R-08 exactly (see the same constraint,
     -- named, in the Postgres migration - docs/decisiones.md D-077
     -- follow-up): 'computed' REQUIRES score AND risk_band non-null,

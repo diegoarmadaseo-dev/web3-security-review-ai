@@ -51,6 +51,25 @@ concurrency-safe). A process that starts against a schema still missing
 a migration fails loudly on the first query that needs it - the correct,
 visible failure, never a silent partial-schema run.
 
+GRACEFUL SHUTDOWN (Phase 6A, docs/decisiones.md D-077 follow-up): both
+roles install SIGTERM/SIGINT handlers that only ever set a
+threading.Event, never act directly (see _install_shutdown_signal_
+handlers()'s own docstring on why). ROLE=web stops accepting new
+connections immediately, then gives in-flight HTTP handlers up to
+SHUTDOWN_GRACE_SECONDS (configurable, default 30) to finish naturally
+before closing anyway - see _serve_until_shutdown(). ROLE=worker stops
+claiming NEW jobs on its next loop iteration but never aborts a job it
+has already claimed - that job runs to its own existing terminal state
+(success/failure/timeout), the same lease/reaper recovery mechanism
+already in place for any other worker-process death remains the ONLY
+thing that recovers a job whose worker is killed before it finishes -
+see worker_supervisor.run_worker_supervisor_loop()'s own docstring.
+
+ALERTING (Phase 6A) is wired for both roles via backend/alerting.py -
+LoggingAlertSender is the only implementation this phase ships (same
+"known, explicit gap" shape as email delivery below); a real provider
+is a later, explicit deployment decision.
+
 EMAIL DELIVERY IS A KNOWN, EXPLICIT GAP, not an oversight: backend/
 email_sender.py ships exactly one implementation, LoggingEmailSender,
 whose own docstring says "Never use in production." This file wires it
@@ -70,10 +89,13 @@ never silently skipped).
 from __future__ import annotations
 
 import os
+import signal
 import sys
 import threading
+import time
 from typing import Any, Callable, Dict
 
+import backend.alerting as alerting
 import backend.billing as billing_module
 import backend.db as db
 import backend.egress_proxy as egress_proxy
@@ -150,6 +172,9 @@ def _load_web_config() -> Dict[str, Any]:
             "standard": _require_env("STRIPE_PRICE_STANDARD"),
             "pro": _require_env("STRIPE_PRICE_PRO"),
         },
+        # Phase 6A: bounded grace period for _serve_until_shutdown() below
+        # - "shutdown timeout is configurable" per that phase's own spec.
+        "shutdown_grace_seconds": _int_env("SHUTDOWN_GRACE_SECONDS", 30),
     }
 
 
@@ -196,6 +221,62 @@ def _build_billing(secret_key: str, webhook_secret: str, price_allowlist: Dict[s
     return billing_module.StripeBilling(secret_key=secret_key, webhook_secret=webhook_secret, price_allowlist=price_allowlist)
 
 
+def _install_shutdown_signal_handlers(shutdown_event: threading.Event) -> None:
+    """Phase 6A graceful shutdown. Registers SIGTERM (the signal a real
+    process orchestrator - Docker/systemd/k8s - sends to ask a process to
+    stop) and SIGINT (Ctrl+C, for a developer running this directly) to
+    both just set shutdown_event, never to act directly - all the actual
+    drain/stop logic lives in _serve_until_shutdown() (ROLE=web) or the
+    shutdown_event check inside worker_supervisor.run_worker_supervisor_
+    loop() (ROLE=worker), both already safely callable from any thread.
+    A signal handler itself must do as little as possible - this one
+    does the minimum possible amount of work (one Event.set() call).
+
+    PORTABILITY NOTE: signal.signal(SIGTERM, ...) is accepted on Windows
+    but the OS does not deliver a real SIGTERM there the way POSIX does
+    (only a same-process os.kill() call can trigger it) - this matters
+    for local testing on Windows, not for where this process actually
+    runs in production (Linux containers), where delivery is standard."""
+    def _on_signal(signum: int, frame: Any) -> None:
+        shutdown_event.set()
+
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
+
+
+def _serve_until_shutdown(httpd: Any, shutdown_event: threading.Event, grace_seconds: int) -> None:
+    """Phase 6A graceful shutdown for ROLE=web. Runs the server in a
+    background thread, blocks until shutdown_event is set, then: (1)
+    httpd.shutdown() - stops the accept loop, so no NEW connection/
+    request is ever accepted after this point; (2) polls backend.
+    http_app.get_in_flight_count() for up to grace_seconds, giving any
+    request already being processed (a handler that was mid-flight the
+    instant shutdown_event was set) a bounded window to finish naturally
+    rather than being cut off; (3) httpd.server_close() regardless of
+    whether every in-flight request finished in time - a request still
+    running after the grace period is logged and the process closes
+    anyway, matching "shutdown timeout is configurable" rather than
+    hanging forever on a single stuck handler.
+
+    Deliberately separated from run_web() so it is directly, portably
+    testable: a test sets shutdown_event programmatically instead of
+    needing a real OS signal delivered to this process (see
+    _install_shutdown_signal_handlers()'s own docstring on why that is
+    not portable to test against on Windows)."""
+    server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    server_thread.start()
+    shutdown_event.wait()
+    sys.stderr.write("shutdown signal received - draining in-flight requests (grace=%ds)\n" % grace_seconds)
+    httpd.shutdown()
+    deadline = time.monotonic() + grace_seconds
+    while http_app.get_in_flight_count(httpd) > 0 and time.monotonic() < deadline:
+        time.sleep(0.05)
+    remaining = http_app.get_in_flight_count(httpd)
+    if remaining:
+        sys.stderr.write("grace period expired with %d request(s) still in flight - closing anyway\n" % remaining)
+    httpd.server_close()
+
+
 def run_web() -> None:
     cfg = _load_web_config()
     storage = _build_storage(cfg["s3_bucket"], cfg["s3_region"])
@@ -203,6 +284,7 @@ def run_web() -> None:
     # See module docstring on email delivery - this is the only
     # implementation that exists anywhere in this codebase today.
     sender = email_sender_module.LoggingEmailSender()
+    alert_sender = alerting.LoggingAlertSender()
 
     httpd = http_app.run_server(
         connect_fn=_connect_fn(cfg["database_url"]),
@@ -213,19 +295,22 @@ def run_web() -> None:
         secure_cookies=cfg["secure_cookies"],
         billing=billing,
         storage=storage,
+        alert_sender=alert_sender,
     )
     sys.stderr.write("backend web process listening on %s:%d (secure_cookies=%s)\n" % (cfg["host"], cfg["port"], cfg["secure_cookies"]))
+    shutdown_event = threading.Event()
+    _install_shutdown_signal_handlers(shutdown_event)
     try:
-        httpd.serve_forever()
+        _serve_until_shutdown(httpd, shutdown_event, cfg["shutdown_grace_seconds"])
     except KeyboardInterrupt:
-        pass
-    finally:
         httpd.server_close()
+    sys.stderr.write("backend web process stopped\n")
 
 
 def run_worker() -> None:
     cfg = _load_worker_config()
     storage = _build_storage(cfg["s3_bucket"], cfg["s3_region"])
+    alert_sender = alerting.LoggingAlertSender()
 
     proxy = egress_proxy.run_egress_proxy(
         {(cfg["llm_allowlist_host"], cfg["llm_allowlist_port"])}, host="0.0.0.0", port=cfg["proxy_bind_port"]
@@ -251,18 +336,23 @@ def run_worker() -> None:
         llm_model=cfg["llm_model"],
     )
     sys.stderr.write("backend worker process %r starting (image=%s)\n" % (cfg["worker_id"], config.docker_image))
+    shutdown_event = threading.Event()
+    _install_shutdown_signal_handlers(shutdown_event)
     try:
         worker_supervisor.run_worker_supervisor_loop(
             connect_fn=_connect_fn(cfg["database_url"]),
             worker_id=cfg["worker_id"],
             config=config,
             storage=storage,
+            alert_sender=alert_sender,
+            shutdown_event=shutdown_event,
         )
     except KeyboardInterrupt:
         pass
     finally:
         proxy.shutdown()
         proxy.server_close()
+    sys.stderr.write("backend worker process %r stopped\n" % cfg["worker_id"])
 
 
 _ROLES: Dict[str, Callable[[], None]] = {"web": run_web, "worker": run_worker}

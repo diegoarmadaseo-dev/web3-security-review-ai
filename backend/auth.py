@@ -267,3 +267,19 @@ def revoke_session(conn: Any, session_token: str) -> bool:
     )
     conn.commit()
     return cur.rowcount > 0
+
+
+def revoke_all_sessions_for_user(conn: Any, user_id: str) -> int:
+    """Phase 6A (docs/decisiones.md D-077 follow-up) - backend/
+    retention.py's delete_workspace_data() is the one caller, for a
+    member left with zero remaining workspace memberships after a
+    workspace deletion (see that function's own docstring on why it is
+    scoped that narrowly rather than a broader "delete this account
+    everywhere" operation this module has no way to know is actually
+    wanted). Returns the number of sessions actually revoked - 0 for a
+    user with none active, never raises, same idempotent-by-WHERE-clause
+    shape as revoke_session() above; calling this twice in a row is
+    always safe (the second call revokes nothing further)."""
+    cur = db.execute(conn, "UPDATE sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL", (repo.utcnow_iso(), user_id))
+    conn.commit()
+    return cur.rowcount

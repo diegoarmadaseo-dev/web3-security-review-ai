@@ -30,6 +30,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import unittest
@@ -43,8 +44,10 @@ import backend.auth as auth
 import backend.db as db
 import backend.http_app as http_app
 import backend.migrate as migrate
+import backend.object_storage as object_storage
 import backend.repository as repo
 import backend.tenant_scope as tenant_scope
+import backend.verify_restore as verify_restore
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MIGRATIONS_DIR = os.path.join(REPO_ROOT, "backend", "migrations")
@@ -118,16 +121,17 @@ class MigrationIntegrationTests(unittest.TestCase):
         self.conn, self.applied = _reset_database_and_migrate()
         self.addCleanup(self.conn.close)
 
-    def test_fresh_database_applies_all_five_migrations_in_order(self):
+    def test_fresh_database_applies_all_six_migrations_in_order(self):
         # 0002_auth_tokens.sql (Phase 2), 0003_entitlement_status_expand.sql
-        # and 0004_entitlement_event_provenance.sql (Phase 3), and
-        # 0005_job_queue_hardening.sql (Phase 4, D-079) added alongside
+        # and 0004_entitlement_event_provenance.sql (Phase 3),
+        # 0005_job_queue_hardening.sql (Phase 4, D-079), and
+        # 0006_retention_purge.sql (Phase 6A, D-081) added alongside
         # 0001_initial_schema.sql (Phase 1).
         self.assertEqual(
             self.applied,
             [
                 "0001_initial_schema", "0002_auth_tokens", "0003_entitlement_status_expand",
-                "0004_entitlement_event_provenance", "0005_job_queue_hardening",
+                "0004_entitlement_event_provenance", "0005_job_queue_hardening", "0006_retention_purge",
             ],
         )
 
@@ -696,6 +700,84 @@ class HttpJobSubmitConcurrencyIntegrationTests(unittest.TestCase):
         self.assertNotIn("duplicate", payload_2)
         cur = db.execute(self.conn, "SELECT COUNT(*) AS n FROM analysis_jobs WHERE workspace_id = %s", (workspace_id,))
         self.assertEqual(db.normalize_row(cur.fetchone())["n"], 2)
+
+
+class RestoreVerificationIntegrationTests(unittest.TestCase):
+    """Phase 6A (docs/decisiones.md D-077 follow-up): backend/
+    verify_restore.py's own drill, proven end-to-end against a REAL
+    pg_dump of a REAL seeded database - not merely unit-tested against
+    fake inputs. This is the one place in the suite that actually
+    produces a dump (via `docker exec <container> pg_dump`, the module's
+    own module this test lives in already having a real, disposable
+    Postgres container running) purely to feed it to the tool under
+    test; backend/verify_restore.py itself never produces a dump on its
+    own - see that module's own docstring on why."""
+
+    def setUp(self):
+        self.conn, _ = _reset_database_and_migrate()
+        self.addCleanup(self.conn.close)
+        self.storage_dir = tempfile.mkdtemp(prefix="restore-verify-storage-")
+        self.addCleanup(shutil.rmtree, self.storage_dir, True)
+        self.storage = object_storage.LocalFilesystemStorage(self.storage_dir, sign_secret="restore-verify-secret")
+
+    def _seed_one_report(self):
+        user_id = repo.create_user(self.conn, "restore-verify@example.com")
+        workspace_id = repo.create_workspace(self.conn, "Restore Verify WS", user_id)
+        storage_ref = object_storage.workspace_key(workspace_id, "sources", repo.new_id())
+        self.storage.put_object(storage_ref, b"contract A {}", content_type="text/plain")
+        contract_id = repo.create_contract(self.conn, workspace_id, storage_ref, "hash", "A.sol")
+        job_id = repo.enqueue_job(self.conn, workspace_id, contract_id, user_id, "quick")
+        report_key = object_storage.workspace_key(workspace_id, "reports", job_id)
+        self.storage.put_object(report_key, b"# Report", content_type="text/markdown")
+        repo.record_report(self.conn, job_id, workspace_id, report_key, score_status="not_computed")
+        self.conn.commit()
+
+    def _dump_current_database(self) -> str:
+        result = subprocess.run(
+            ["docker", "exec", CONTAINER_NAME, "pg_dump", "-U", "postgres", "--format=plain", DB_NAME],
+            capture_output=True, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, "pg_dump itself failed: %r" % result.stderr[-500:])
+        fd, dump_path = tempfile.mkstemp(suffix=".sql")
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(result.stdout)
+        self.addCleanup(lambda: os.remove(dump_path) if os.path.exists(dump_path) else None)
+        return dump_path
+
+    def test_restore_verification_succeeds_against_a_real_dump_of_a_seeded_database(self):
+        self._seed_one_report()
+        dump_path = self._dump_current_database()
+
+        result = verify_restore.run_restore_verification(dump_path, storage_dir=self.storage_dir, port=55498)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["migrations_newly_applied_by_restore"], [])  # the dump was already fully migrated.
+        self.assertGreaterEqual(result["table_row_counts"]["workspaces"], 1)
+        self.assertGreaterEqual(result["table_row_counts"]["reports"], 1)
+        self.assertEqual(result["report_accessibility"]["reports_checked"], 1)
+        self.assertTrue(result["report_accessibility"]["storage_dir_checked"])
+
+    def test_restore_verification_fails_loudly_when_a_reports_object_is_missing_from_the_storage_backup(self):
+        self._seed_one_report()
+        dump_path = self._dump_current_database()
+        # Simulates a real, realistic failure mode: the database backup
+        # and the object-storage backup fell out of sync (e.g. taken at
+        # different times, or the storage backup itself failed) - the
+        # drill must catch this, never silently report success.
+        shutil.rmtree(self.storage_dir)
+        os.makedirs(self.storage_dir)
+
+        with self.assertRaises(verify_restore.RestoreVerificationError):
+            verify_restore.run_restore_verification(dump_path, storage_dir=self.storage_dir, port=55497)
+
+    def test_restore_verification_works_without_a_storage_dir_db_only_drill(self):
+        self._seed_one_report()
+        dump_path = self._dump_current_database()
+
+        result = verify_restore.run_restore_verification(dump_path, storage_dir=None, port=55496)
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["report_accessibility"]["storage_dir_checked"])
 
 
 if __name__ == "__main__":

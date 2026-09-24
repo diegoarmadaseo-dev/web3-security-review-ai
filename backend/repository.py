@@ -151,6 +151,24 @@ def list_workspaces_by_user(conn: Any, user_id: str) -> List[Dict[str, Any]]:
     return [db.normalize_row(row) for row in cur.fetchall()]
 
 
+def list_workspace_members(conn: Any, workspace_id: str) -> List[Dict[str, Any]]:
+    """Every membership row for workspace_id (user_id + role + created_at)
+    - used by backend/retention.py's delete_workspace_data() to find
+    every user who needs their membership removed as part of a workspace
+    deletion; not tenant-scoping-sensitive itself (workspace_id is
+    already a WHERE clause, and this returns no cross-workspace data)."""
+    cur = db.execute(conn, "SELECT * FROM workspace_members WHERE workspace_id = ?", (workspace_id,))
+    return [db.normalize_row(row) for row in cur.fetchall()]
+
+
+def mark_workspace_deleted(conn: Any, workspace_id: str) -> bool:
+    """Idempotent, same conditional-UPDATE pattern as
+    mark_contract_deleted()/mark_report_purged() above."""
+    cur = db.execute(conn, "UPDATE workspaces SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL", (utcnow_iso(), utcnow_iso(), workspace_id))
+    conn.commit()
+    return cur.rowcount > 0
+
+
 def add_workspace_member(conn: Any, workspace_id: str, user_id: str, role: str) -> None:
     if role not in ("owner", "admin", "member"):
         raise RepositoryError("role must be one of owner/admin/member, got %r" % role)
@@ -345,6 +363,35 @@ def create_contract(
 def get_contract(conn: Any, contract_id: str) -> Optional[Dict[str, Any]]:
     cur = db.execute(conn, "SELECT * FROM contracts WHERE id = ?", (contract_id,))
     return db.normalize_row(cur.fetchone())
+
+
+def list_workspace_contracts(conn: Any, workspace_id: str) -> List[Dict[str, Any]]:
+    """Every non-deleted contract belonging to workspace_id - used by
+    backend/retention.py's delete_workspace_data() (an explicit, whole-
+    workspace deletion), distinct from list_expired_contracts() below
+    (age-based, across every workspace uniformly)."""
+    cur = db.execute(conn, "SELECT * FROM contracts WHERE workspace_id = ? AND deleted_at IS NULL", (workspace_id,))
+    return [db.normalize_row(row) for row in cur.fetchall()]
+
+
+def list_expired_contracts(conn: Any, cutoff_iso: str) -> List[Dict[str, Any]]:
+    """Every contract created before cutoff_iso and not already marked
+    deleted - see backend/retention.py, the one caller. cutoff_iso is
+    always supplied by the caller (never computed here), the same
+    pure-function-of-its-inputs discipline utcnow_iso()'s own callers
+    already follow elsewhere in this module."""
+    cur = db.execute(conn, "SELECT * FROM contracts WHERE created_at < ? AND deleted_at IS NULL", (cutoff_iso,))
+    return [db.normalize_row(row) for row in cur.fetchall()]
+
+
+def mark_contract_deleted(conn: Any, contract_id: str) -> bool:
+    """Idempotent: returns True only if this call actually set
+    deleted_at (WHERE deleted_at IS NULL) - a second call on an already-
+    deleted contract returns False, never raises, same conditional-
+    UPDATE-and-check-rowcount pattern this module uses throughout."""
+    cur = db.execute(conn, "UPDATE contracts SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL", (utcnow_iso(), contract_id))
+    conn.commit()
+    return cur.rowcount > 0
 
 
 # ---------------------------------------------------------------------------
@@ -711,6 +758,35 @@ def get_report_by_id(conn: Any, report_id: str) -> Optional[Dict[str, Any]]:
     docstring already establishes)."""
     cur = db.execute(conn, "SELECT * FROM reports WHERE id = ?", (report_id,))
     return db.normalize_row(cur.fetchone())
+
+
+def list_workspace_reports(conn: Any, workspace_id: str) -> List[Dict[str, Any]]:
+    """Every non-purged report belonging to workspace_id - used by
+    backend/retention.py's delete_workspace_data(), distinct from
+    list_expired_reports() below (age-based, across every workspace)."""
+    cur = db.execute(conn, "SELECT * FROM reports WHERE workspace_id = ? AND purged_at IS NULL", (workspace_id,))
+    return [db.normalize_row(row) for row in cur.fetchall()]
+
+
+def list_expired_reports(conn: Any, cutoff_iso: str) -> List[Dict[str, Any]]:
+    """Every report created before cutoff_iso whose object-storage
+    CONTENT has not already been purged - see mark_report_purged()'s own
+    docstring on why the METADATA row is kept regardless."""
+    cur = db.execute(conn, "SELECT * FROM reports WHERE created_at < ? AND purged_at IS NULL", (cutoff_iso,))
+    return [db.normalize_row(row) for row in cur.fetchall()]
+
+
+def mark_report_purged(conn: Any, report_id: str) -> bool:
+    """Marks that this report's object-storage CONTENT has been deleted
+    - the row itself (score/risk_band/created_at/job_id) is deliberately
+    NEVER deleted by this function or by backend/retention.py, which is
+    the only caller: audit/job history stays queryable even once content
+    retention expires (Phase 6A's own explicit "audit/job history where
+    appropriate" scoping - see backend/migrations/0006_retention_purge.sql).
+    Idempotent, same conditional-UPDATE pattern as mark_contract_deleted()."""
+    cur = db.execute(conn, "UPDATE reports SET purged_at = ? WHERE id = ? AND purged_at IS NULL", (utcnow_iso(), report_id))
+    conn.commit()
+    return cur.rowcount > 0
 
 
 def append_audit_event(

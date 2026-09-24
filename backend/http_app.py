@@ -5,13 +5,26 @@ BaseHTTPRequestHandler + a route table, per-client IP taken ONLY from
 the socket peer address (self.client_address[0]), never a client-
 supplied X-Forwarded-For header (same rule website/server.py documents).
 
-Endpoints: GET /auth/login, POST /auth/request-link, GET+POST
-/auth/verify, POST /auth/logout, GET+POST /workspaces,
-GET /workspaces/<id>, POST /workspaces/<id>/members,
-DELETE /workspaces/<id>/members/<user_id>, POST /billing/checkout,
-POST /billing/portal, POST /billing/webhook,
+Endpoints: GET /health, GET /ready, GET /auth/login, POST
+/auth/request-link, GET+POST /auth/verify, POST /auth/logout,
+GET+POST /workspaces, GET /workspaces/<id>, POST
+/workspaces/<id>/members, DELETE /workspaces/<id>/members/<user_id>,
+POST /billing/checkout, POST /billing/portal, POST /billing/webhook,
 GET+POST /workspaces/<id>/jobs, GET /workspaces/<id>/reports,
 GET /workspaces/<id>/reports/<report_id>.
+
+HEALTH/READINESS (Phase 6A, docs/decisiones.md D-077 follow-up):
+GET /health is a bare liveness probe - always 200, touches nothing
+(no DB, no Stripe, no S3), exists only to answer "is this process
+still running at all". GET /ready is the stronger claim - it actually
+queries the database (SELECT 1, not merely "connect_fn() didn't
+raise at startup") and reports whether storage/billing are configured,
+returning 503 if any required dependency is not currently usable. Ready
+never returns a DSN, credential or any detail beyond three booleans -
+see _handle_ready()'s own docstring. Neither route is authenticated or
+CSRF-checked (same reasoning as GET /auth/verify: read-only, no side
+effect, meant for infrastructure polling that sends no Origin/cookie
+at all).
 
 WORKSPACE CREATION/READ (Phase 5, docs/decisiones.md D-077 follow-up):
 POST /workspaces is the ONLY place a workspace comes into existence
@@ -163,11 +176,13 @@ import json
 import os
 import re
 import sys
+import threading
 from http import cookies as http_cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, quote, unquote_plus, urlparse
 
+import backend.alerting as alerting
 import backend.auth as auth
 import backend.billing as billing_module
 import backend.db as db
@@ -194,6 +209,45 @@ _REPORT_ITEM_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/reports/(?P<
 _MAX_WORKSPACE_NAME_LENGTH = 200
 _MAX_WORKSPACES_PER_USER = 50  # abuse-safety cap on POST /workspaces - generous for any legitimate account.
 _REPORT_SIGNED_URL_TTL_SECONDS = 300  # short-lived by design, matches this codebase's other signed-URL/token TTL philosophy (auth.py's own TOKEN_TTL_SECONDS).
+
+
+class _InFlightTracker:
+    """Phase 6A graceful shutdown: counts requests currently being
+    processed by ONE server instance, right now - never module-level
+    (a fresh tracker per run_server() call, same "never module-level
+    globals" discipline make_handler() itself already documents, so
+    multiple servers - e.g. one per test - never share a counter).
+    Incremented/decremented around Handler.handle_one_request() (see
+    make_handler() below), the one method BaseHTTPRequestHandler already
+    calls exactly once per request regardless of which HTTP method it
+    is - so this needs no separate hook in do_GET/do_POST/do_DELETE.
+    backend/main.py's shutdown sequence polls .count via
+    get_in_flight_count() to decide when every in-flight request has
+    finished, bounded by its own configurable grace period."""
+
+    def __init__(self) -> None:
+        self._count = 0
+        self._lock = threading.Lock()
+
+    def increment(self) -> None:
+        with self._lock:
+            self._count += 1
+
+    def decrement(self) -> None:
+        with self._lock:
+            self._count -= 1
+
+    @property
+    def count(self) -> int:
+        with self._lock:
+            return self._count
+
+
+def get_in_flight_count(server: ThreadingHTTPServer) -> int:
+    """0 for a server with no tracker attached (e.g. one constructed
+    some other way than run_server() below) - never raises."""
+    tracker = getattr(server, "in_flight_tracker", None)
+    return tracker.count if tracker is not None else 0
 
 # Phase 4: a raw-byte cap enforced HERE, synchronously, before anything is
 # queued - "no execution during HTTP request" means this handler never
@@ -513,6 +567,8 @@ def make_handler(
     secure_cookies: bool = True,
     billing: Optional["billing_module.StripeBilling"] = None,
     storage: Optional["object_storage.ObjectStorage"] = None,
+    alert_sender: Optional["alerting.AlertSender"] = None,
+    in_flight: Optional[_InFlightTracker] = None,
 ) -> type:
     """Returns a fresh Handler class closed over this specific server
     instance's config - never module-level globals, so multiple servers
@@ -524,11 +580,34 @@ def make_handler(
     None (see _handle_billing_checkout() etc.) - see module docstring on
     billing for the security model those routes follow. storage is
     likewise OPTIONAL (Phase 4) - POST /workspaces/<id>/jobs returns a
-    clean 503 when it is None, the same degrade-cleanly convention."""
+    clean 503 when it is None, the same degrade-cleanly convention.
+    alert_sender is OPTIONAL (Phase 6A) - see backend/alerting.py's own
+    module docstring; every call site here uses alerting.emit_safe(),
+    which is already a no-op when it is None. in_flight is OPTIONAL,
+    normally supplied by run_server() below (never constructed directly
+    by a caller of make_handler() itself - see _InFlightTracker's own
+    docstring)."""
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "backend-auth/2026.1"
         timeout = REQUEST_TIMEOUT_SECONDS
+
+        def handle_one_request(self) -> None:
+            """Overridden ONLY to bracket the in-flight counter (Phase
+            6A graceful shutdown) around the base class's own request
+            handling - never changes what a request actually does. This
+            is the one method BaseHTTPRequestHandler already calls
+            exactly once per request on a keep-alive connection
+            (regardless of GET/POST/DELETE), so every request is counted
+            without a separate hook in each do_* method - see
+            _InFlightTracker's own docstring."""
+            if in_flight is not None:
+                in_flight.increment()
+            try:
+                super().handle_one_request()
+            finally:
+                if in_flight is not None:
+                    in_flight.decrement()
 
         def _client_ip(self) -> str:
             return self.client_address[0]
@@ -655,6 +734,12 @@ def make_handler(
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
             path = parsed.path
+            if path == "/health":
+                self._send_json(200, {"ok": True})
+                return
+            if path == "/ready":
+                self._handle_ready()
+                return
             if path == "/auth/verify":
                 self._handle_verify_get(parsed)
                 return
@@ -695,6 +780,48 @@ def make_handler(
                 self._send_html(200, _INVALID_PAGE)
                 return
             self._send_html(200, _render_confirm_page(token, redirect_path))
+
+        def _handle_ready(self) -> None:
+            """Phase 6A: verifies the dependencies this process actually
+            needs to serve PRODUCTION traffic are usable RIGHT NOW - a
+            weaker "config was present at startup" check (see backend/
+            main.py's own fail-fast validation) is not the same claim as
+            "still reachable this instant" (a database can fail well
+            after a healthy start). database is unconditionally checked
+            (connect_fn is a required argument to make_handler(), never
+            optional) via a trivial SELECT 1 - the cheapest real
+            liveness probe, not merely "did connect_fn() not raise".
+            storage/billing are reported as configured/not (both are
+            legitimately optional per this module's own degrade-cleanly
+            design for a dev/test deployment - see make_handler()'s own
+            docstring) - never independently mutated into a 503 reason
+            by themselves alone changing that existing contract, but
+            production (backend/main.py's run_web(), which always
+            constructs both) is never ready without them either, so both
+            ARE required for an overall 200 here. Never returns a DSN,
+            credential, or any value beyond these three booleans - see
+            module docstring on host/CSRF safety's own "never leak
+            internal detail" philosophy, applied here to config secrets
+            instead of a workspace's existence."""
+            database_ok = False
+            conn = None
+            try:
+                conn = connect_fn()
+                db.execute(conn, "SELECT 1")
+                database_ok = True
+            except Exception:
+                database_ok = False
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+            checks = {"database": database_ok, "storage": storage is not None, "billing": billing is not None}
+            ready = all(checks.values())
+            if not ready:
+                alerting.emit_safe(alert_sender, alerting.EVENT_READINESS_FAILURE, "error", {"checks": checks})
+            self._send_json(200 if ready else 503, {"ok": ready, "checks": checks})
 
         # -------------------------------------------------------------
         # POST
@@ -767,6 +894,7 @@ def make_handler(
             try:
                 token = auth.request_magic_link(conn, email, self._client_ip())
             except auth.RateLimitExceeded as exc:
+                alerting.emit_safe(alert_sender, alerting.EVENT_AUTH_RATE_LIMIT, "warning", {"ip": self._client_ip()})
                 if is_form:
                     self._send_html(429, _render_request_link_sent_page(str(exc)))
                 else:
@@ -1342,6 +1470,7 @@ def make_handler(
                     # error in the first place.
                     conn.rollback()
                     repo.mark_webhook_event_processed(conn, event_id, error=str(exc))
+                    alerting.emit_safe(alert_sender, alerting.EVENT_STRIPE_WEBHOOK_FAILURE, "error", {"event_type": event_type, "error_type": type(exc).__name__})
                     self._send_json(500, {"ok": False, "error": "internal error processing webhook"})
             finally:
                 conn.close()
@@ -1390,6 +1519,10 @@ def run_server(
     secure_cookies: bool = True,
     billing: Optional["billing_module.StripeBilling"] = None,
     storage: Optional["object_storage.ObjectStorage"] = None,
+    alert_sender: Optional["alerting.AlertSender"] = None,
 ) -> ThreadingHTTPServer:
-    handler_cls = make_handler(connect_fn, email_sender, host_allowlist, secure_cookies, billing, storage)
-    return ThreadingHTTPServer((host, port), handler_cls)
+    in_flight = _InFlightTracker()
+    handler_cls = make_handler(connect_fn, email_sender, host_allowlist, secure_cookies, billing, storage, alert_sender, in_flight)
+    server = ThreadingHTTPServer((host, port), handler_cls)
+    server.in_flight_tracker = in_flight  # see get_in_flight_count() and _InFlightTracker's own docstring.
+    return server

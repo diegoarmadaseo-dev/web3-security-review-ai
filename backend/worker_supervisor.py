@@ -76,9 +76,11 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
+import backend.alerting as alerting
 import backend.object_storage as object_storage
 import backend.repository as repo
 
@@ -283,6 +285,7 @@ def claim_and_run_one_job(
     worker_id: str,
     config: WorkerConfig,
     storage: object_storage.ObjectStorage,
+    alert_sender: Optional[alerting.AlertSender] = None,
 ) -> Optional[str]:
     """Claims at most one job and runs it to a terminal state. Returns
     the claimed job's id, or None if the queue was empty. Budget is
@@ -290,7 +293,17 @@ def claim_and_run_one_job(
     ceiling never pays for compute it can't afford) and released on any
     failure path, consumed only on a real success - see repository.py's
     reserve_workspace_budget()/consume_reserved_workspace_budget()/
-    release_workspace_budget()."""
+    release_workspace_budget().
+
+    Phase 6A hardening: object-storage calls (fetching the source,
+    storing the report) are now explicitly caught - previously, either
+    one raising (a transient S3/network failure, not hypothetical)
+    propagated uncaught all the way out of run_worker_supervisor_loop()
+    and killed the entire worker process instead of just failing this
+    one job. Both paths now release the reserved budget, transition the
+    job to a clean 'failed' terminal state, and emit a
+    alerting.EVENT_STORAGE_FAILURE alert (alert_sender is optional and
+    never required - see backend/alerting.py's own module docstring)."""
     job = repo.claim_next_job(conn, worker_id)
     if job is None:
         return None
@@ -305,7 +318,13 @@ def claim_and_run_one_job(
 
     repo.transition_job_status(conn, job_id, "claimed", "running")
     contract = repo.get_contract(conn, job["contract_id"])
-    source = storage.get_object(contract["storage_ref"]).decode("utf-8", "replace")
+    try:
+        source = storage.get_object(contract["storage_ref"]).decode("utf-8", "replace")
+    except Exception as exc:
+        alerting.emit_safe(alert_sender, alerting.EVENT_STORAGE_FAILURE, "error", {"job_id": job_id, "phase": "fetch_source", "error_type": type(exc).__name__})
+        repo.release_workspace_budget(conn, workspace_id, units)
+        repo.transition_job_status(conn, job_id, "running", "failed", error="object storage error fetching source: %s" % type(exc).__name__)
+        return job_id
 
     try:
         result = run_job_in_container(config, job_id, mode, source)
@@ -314,7 +333,13 @@ def claim_and_run_one_job(
 
     if result.get("status") == "succeeded":
         report_key = object_storage.workspace_key(workspace_id, "reports", job_id)
-        storage.put_object(report_key, result.get("rendered", "").encode("utf-8"), content_type="text/markdown")
+        try:
+            storage.put_object(report_key, result.get("rendered", "").encode("utf-8"), content_type="text/markdown")
+        except Exception as exc:
+            alerting.emit_safe(alert_sender, alerting.EVENT_STORAGE_FAILURE, "error", {"job_id": job_id, "phase": "store_report", "error_type": type(exc).__name__})
+            repo.release_workspace_budget(conn, workspace_id, units)
+            repo.transition_job_status(conn, job_id, "running", "failed", error="object storage error storing report: %s" % type(exc).__name__)
+            return job_id
         risk_indicator = result.get("risk_indicator") or {}
         repo.record_report(
             conn, job_id, workspace_id, report_key,
@@ -324,6 +349,7 @@ def claim_and_run_one_job(
         repo.consume_reserved_workspace_budget(conn, workspace_id, units)
         repo.transition_job_status(conn, job_id, "running", "succeeded")
     else:
+        alerting.emit_safe(alert_sender, alerting.EVENT_WORKER_JOB_FAILED, "warning", {"job_id": job_id, "workspace_id": workspace_id, "error": str(result.get("error", ""))[:200]})
         repo.release_workspace_budget(conn, workspace_id, units)
         repo.transition_job_status(conn, job_id, "running", "failed", error=str(result.get("error", "unknown worker failure"))[:500])
     return job_id
@@ -336,18 +362,42 @@ def run_worker_supervisor_loop(
     storage: object_storage.ObjectStorage,
     poll_interval_seconds: float = 2.0,
     max_iterations: Optional[int] = None,
+    alert_sender: Optional[alerting.AlertSender] = None,
+    shutdown_event: Optional[threading.Event] = None,
 ) -> None:
     """Thin polling wrapper - reaps expired leases, then claims/runs at
     most one job, repeating forever (max_iterations=None) or a bounded
     number of times (tests only - see tests/test_backend_worker_
     supervisor.py). A fresh connection per iteration, matching this
-    codebase's own connection-per-unit-of-work discipline."""
+    codebase's own connection-per-unit-of-work discipline.
+
+    GRACEFUL SHUTDOWN (Phase 6A): shutdown_event, if given, is checked
+    ONLY at the top of each iteration, BEFORE reaping or claiming a new
+    job - so once set, this loop stops claiming new work but never
+    aborts a job it has already claimed and started; that job runs to
+    its own natural terminal state exactly as if no shutdown were in
+    progress (claim_and_run_one_job's own per-job wall-clock timeout is
+    what already bounds how long that can take - see backend/
+    worker_supervisor.py's module docstring - no separate shutdown-
+    specific job timeout is added here). If the process is killed before
+    that job finishes despite this, its lease eventually expires and
+    repo.reap_expired_jobs() (called by whichever worker starts next)
+    requeues or fails it exactly as it already does for any other
+    process death - lease/reaper semantics remain the ONE recovery
+    mechanism for a job in flight when its worker disappears, unchanged
+    by this shutdown path."""
     iterations = 0
     while max_iterations is None or iterations < max_iterations:
+        if shutdown_event is not None and shutdown_event.is_set():
+            break
         conn = connect_fn()
         try:
-            repo.reap_expired_jobs(conn)
-            claimed = claim_and_run_one_job(conn, worker_id, config, storage)
+            reap_result = repo.reap_expired_jobs(conn)
+            if reap_result.get("requeued"):
+                alerting.emit_safe(alert_sender, alerting.EVENT_WORKER_REPEATED_RETRY, "warning", {"requeued": reap_result["requeued"]})
+            if reap_result.get("failed"):
+                alerting.emit_safe(alert_sender, alerting.EVENT_WORKER_JOB_FAILED, "error", {"permanently_failed_by_reaper": reap_result["failed"]})
+            claimed = claim_and_run_one_job(conn, worker_id, config, storage, alert_sender=alert_sender)
         finally:
             conn.close()
         iterations += 1

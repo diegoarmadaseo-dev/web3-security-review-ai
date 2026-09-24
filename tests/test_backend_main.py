@@ -18,13 +18,20 @@ Run from the repository root: python -m unittest
 """
 from __future__ import annotations
 
+import http.client
 import io
 import os
+import signal
 import sys
+import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
+import backend.http_app as http_app
 import backend.main as main
+import backend.repository as repo
 
 
 def _boto3_available() -> bool:
@@ -199,6 +206,102 @@ class WorkerRoleFailFastTests(unittest.TestCase):
 
     def test_missing_llm_api_key_fails_fast(self):
         self._assert_missing_var_fails_fast("LLM_API_KEY")
+
+
+# ---------------------------------------------------------------------------
+# Phase 6A (docs/decisiones.md D-077 follow-up): graceful shutdown.
+# _serve_until_shutdown() is tested directly (never via a real OS signal -
+# see _install_shutdown_signal_handlers()'s own docstring on why SIGTERM
+# delivery is not portable to test against on Windows, which is where this
+# suite actually runs); shutdown_event is set programmatically, exactly the
+# way that function is deliberately structured to be tested.
+# ---------------------------------------------------------------------------
+
+class _CapturingEmailSender:
+    def send(self, to_email, subject, body):
+        pass
+
+
+class ServeUntilShutdownTests(unittest.TestCase):
+    def _start_server(self):
+        fd, db_path = tempfile.mkstemp(suffix=".sqlite3")
+        os.close(fd)
+        os.remove(db_path)
+        seed_conn = repo.connect(db_path)
+        repo.init_schema(seed_conn)
+        seed_conn.close()
+        self.addCleanup(lambda: os.remove(db_path) if os.path.exists(db_path) else None)
+        httpd = http_app.run_server(
+            connect_fn=lambda: repo.connect(db_path), email_sender=_CapturingEmailSender(),
+            host_allowlist=["127.0.0.1"], host="127.0.0.1", port=0, secure_cookies=False,
+        )
+        return httpd
+
+    def test_shutdown_during_idle_stops_the_server_promptly(self):
+        httpd = self._start_server()
+        port = httpd.server_address[1]
+        shutdown_event = threading.Event()
+        shutdown_event.set()  # already idle, nothing in flight - "SIGTERM during idle".
+
+        start = time.monotonic()
+        main._serve_until_shutdown(httpd, shutdown_event, grace_seconds=5)
+        elapsed = time.monotonic() - start
+        self.assertLess(elapsed, 2, "idle shutdown should not wait out any meaningful part of the grace period")
+
+        with self.assertRaises(OSError):
+            http.client.HTTPConnection("127.0.0.1", port, timeout=1).connect()
+
+    def test_in_flight_request_completes_before_the_server_closes(self):
+        httpd = self._start_server()
+        port = httpd.server_address[1]
+        shutdown_event = threading.Event()
+        results = []
+
+        def _request_then_signal_shutdown():
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("GET", "/health", headers={"Host": "127.0.0.1:%d" % port})
+            resp = conn.getresponse()
+            results.append(resp.status)
+            resp.read()
+            conn.close()
+
+        server_side_thread = threading.Thread(target=main._serve_until_shutdown, args=(httpd, shutdown_event, 5))
+        server_side_thread.start()
+        time.sleep(0.1)  # let the accept loop actually start.
+        _request_then_signal_shutdown()
+        shutdown_event.set()
+        server_side_thread.join(timeout=10)
+
+        self.assertEqual(results, [200])  # the request completed successfully, not cut off mid-flight.
+
+    def test_grace_period_is_bounded_even_if_in_flight_count_never_reaches_zero(self):
+        httpd = self._start_server()
+
+        class _AlwaysBusyTracker:
+            count = 1  # simulates a handler that never finishes.
+
+        httpd.in_flight_tracker = _AlwaysBusyTracker()
+        shutdown_event = threading.Event()
+        shutdown_event.set()
+
+        start = time.monotonic()
+        main._serve_until_shutdown(httpd, shutdown_event, grace_seconds=1)
+        elapsed = time.monotonic() - start
+        self.assertGreaterEqual(elapsed, 1)
+        self.assertLess(elapsed, 3, "must close anyway once the grace period expires, never hang forever")
+
+
+class WorkerShutdownWiringTests(unittest.TestCase):
+    def test_install_shutdown_signal_handlers_sets_the_event_when_invoked(self):
+        # Exercises the handler function itself (never a real OS signal -
+        # see module docstring) - proves it does the one thing it should
+        # and nothing else.
+        event = threading.Event()
+        main._install_shutdown_signal_handlers(event)
+        handler = signal.getsignal(signal.SIGINT)
+        self.assertFalse(event.is_set())
+        handler(signal.SIGINT, None)
+        self.assertTrue(event.is_set())
 
 
 if __name__ == "__main__":

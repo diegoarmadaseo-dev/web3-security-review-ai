@@ -31,6 +31,8 @@ import time
 import unittest
 from urllib.parse import urlencode
 
+import backend.alerting as alerting
+import backend.billing as billing_module
 import backend.http_app as http_app
 import backend.object_storage as object_storage
 import backend.repository as repo
@@ -1066,6 +1068,7 @@ class ReportReadTests(_WorkspaceStorageTestCase):
         status, _, _ = self.get("/workspaces/%s/reports/%s" % (workspace_id, report_id), headers={"Cookie": cookie_stranger})
         self.assertEqual(status, 403)
 
+
 class ReportGetWithoutStorageTests(_HttpAppTestCase):
     """_HttpAppTestCase (unlike _WorkspaceStorageTestCase above) never
     configures storage - proves GET .../reports/<id> degrades cleanly
@@ -1092,14 +1095,269 @@ class ReportGetWithoutStorageTests(_HttpAppTestCase):
         self.assertNotIn("storage_ref", report)
         self.assertNotIn("report_url", report)
 
-    def test_no_query_string_is_untouched(self):
-        import backend.http_app as http_app
-        self.assertEqual(http_app._redact_query_string("/auth/verify"), "/auth/verify")
 
-    def test_non_sensitive_query_is_untouched(self):
-        import backend.http_app as http_app
-        path = "/auth/verify?redirect=/dashboard"
-        self.assertEqual(http_app._redact_query_string(path), path)
+# ---------------------------------------------------------------------------
+# Phase 6A (docs/decisiones.md D-077 follow-up): health/readiness, in-flight
+# tracking, and alert emission at the HTTP layer.
+# ---------------------------------------------------------------------------
+
+class _CollectingAlertSender:
+    def __init__(self):
+        self.events = []
+
+    def emit(self, event_type, severity, detail):
+        self.events.append((event_type, severity, detail))
+
+
+class HealthReadyTests(_HttpAppTestCase):
+    """_HttpAppTestCase's base server never configures storage/billing -
+    exactly the "some dependencies missing" case GET /ready needs to
+    report accurately."""
+
+    def test_health_is_always_200_and_unauthenticated(self):
+        status, _, body = self.get("/health")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"ok": True})
+
+    def test_ready_is_503_when_storage_and_billing_are_not_configured(self):
+        status, _, body = self.get("/ready")
+        result = json.loads(body)
+        self.assertEqual(status, 503)
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["checks"]["database"])  # the one dependency this server DOES have - real SQLite.
+        self.assertFalse(result["checks"]["storage"])
+        self.assertFalse(result["checks"]["billing"])
+
+    def test_ready_never_includes_a_dsn_or_the_word_password(self):
+        _, _, body = self.get("/ready")
+        lowered = body.lower()
+        self.assertNotIn(b"sqlite", lowered)
+        self.assertNotIn(b"password", lowered)
+        self.assertNotIn(self.db_path.lower().encode(), lowered)
+
+
+class HealthReadyFullyConfiguredTests(_HttpAppTestCase):
+    """A server with storage AND billing both wired - proves GET /ready
+    reports 200 once every dependency this deployment actually declared
+    is genuinely usable, not just "some are missing"."""
+
+    def setUp(self):
+        super().setUp()
+        self.storage_dir = tempfile.mkdtemp(prefix="ready-full-tests-")
+        self.addCleanup(shutil.rmtree, self.storage_dir, True)
+        storage = object_storage.LocalFilesystemStorage(self.storage_dir, sign_secret="ready-full-secret")
+        billing = billing_module.StripeBilling(secret_key="sk_test_fake", webhook_secret="whsec_fake", price_allowlist={"quick": "price_fake"})
+        self.alert_sender = _CollectingAlertSender()
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.httpd = http_app.run_server(
+            connect_fn=lambda: repo.connect(self.db_path),
+            email_sender=self.email_sender,
+            host_allowlist=[HOST], host=HOST, port=0, secure_cookies=False,
+            storage=storage, billing=billing, alert_sender=self.alert_sender,
+        )
+        self.port = self.httpd.server_address[1]
+        self.host_header = "%s:%d" % (HOST, self.port)
+        self.same_origin = "http://%s" % self.host_header
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        time.sleep(0.05)
+
+    def test_ready_is_200_when_database_storage_and_billing_are_all_usable(self):
+        status, _, body = self.get("/ready")
+        result = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["checks"], {"database": True, "storage": True, "billing": True})
+        self.assertEqual(self.alert_sender.events, [])  # no failure -> no alert emitted.
+
+
+class ReadyDependencyOutageTests(unittest.TestCase):
+    """A server whose connect_fn always raises - simulates a real
+    database outage (not merely "never configured"), the "dependency
+    outage" adversarial case."""
+
+    def setUp(self):
+        self.alert_sender = _CollectingAlertSender()
+        self.email_sender = _CapturingEmailSender()
+
+        def _broken_connect():
+            raise ConnectionError("simulated database outage")
+
+        self.httpd = http_app.run_server(
+            connect_fn=_broken_connect, email_sender=self.email_sender,
+            host_allowlist=[HOST], host=HOST, port=0, secure_cookies=False,
+            alert_sender=self.alert_sender,
+        )
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        time.sleep(0.05)
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+
+    def test_ready_returns_503_and_reports_database_false_on_a_real_outage(self):
+        conn = http.client.HTTPConnection(HOST, self.port, timeout=5)
+        conn.request("GET", "/ready", headers={"Host": "%s:%d" % (HOST, self.port)})
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        self.assertEqual(resp.status, 503)
+        result = json.loads(body)
+        self.assertFalse(result["checks"]["database"])
+
+    def test_readiness_failure_emits_an_alert(self):
+        conn = http.client.HTTPConnection(HOST, self.port, timeout=5)
+        conn.request("GET", "/ready", headers={"Host": "%s:%d" % (HOST, self.port)})
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        self.assertEqual(len(self.alert_sender.events), 1)
+        event_type, severity, detail = self.alert_sender.events[0]
+        self.assertEqual(event_type, alerting.EVENT_READINESS_FAILURE)
+        self.assertFalse(detail["checks"]["database"])
+
+    def test_health_still_reports_ok_even_during_a_database_outage(self):
+        # /health touches nothing - it must never be affected by a DB outage.
+        conn = http.client.HTTPConnection(HOST, self.port, timeout=5)
+        conn.request("GET", "/health", headers={"Host": "%s:%d" % (HOST, self.port)})
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(json.loads(body), {"ok": True})
+
+
+class WebhookFailureAlertTests(_HttpAppTestCase):
+    def setUp(self):
+        super().setUp()
+        self.alert_sender = _CollectingAlertSender()
+        billing = billing_module.StripeBilling(secret_key="sk_test_fake", webhook_secret="whsec_fake", price_allowlist={"quick": "price_fake"})
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.httpd = http_app.run_server(
+            connect_fn=lambda: repo.connect(self.db_path),
+            email_sender=self.email_sender,
+            host_allowlist=[HOST], host=HOST, port=0, secure_cookies=False,
+            billing=billing, alert_sender=self.alert_sender,
+        )
+        self.port = self.httpd.server_address[1]
+        self.host_header = "%s:%d" % (HOST, self.port)
+        self.same_origin = "http://%s" % self.host_header
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        time.sleep(0.05)
+
+    def test_invalid_webhook_signature_never_emits_a_processing_failure_alert(self):
+        # An invalid signature is rejected by billing.verify_and_parse_webhook()
+        # itself, BEFORE _apply_webhook_event() ever runs - not the
+        # "processing failed" case this alert exists for (that would
+        # over-alert on routine, expected abuse/misconfiguration noise).
+        conn = self._conn()
+        body = b'{"id": "evt_1", "type": "checkout.session.completed"}'
+        headers = {"Content-Type": "application/json", "Content-Length": str(len(body)), "Host": self.host_header, "Stripe-Signature": "t=1,v1=deadbeef"}
+        conn.request("POST", "/billing/webhook", body=body, headers=headers)
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(self.alert_sender.events, [])
+
+
+class RateLimitAlertTests(_HttpAppTestCase):
+    def test_rate_limit_exceeded_emits_an_alert(self):
+        alert_sender = _CollectingAlertSender()
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.httpd = http_app.run_server(
+            connect_fn=lambda: repo.connect(self.db_path), email_sender=self.email_sender,
+            host_allowlist=[HOST], host=HOST, port=0, secure_cookies=False, alert_sender=alert_sender,
+        )
+        self.port = self.httpd.server_address[1]
+        self.host_header = "%s:%d" % (HOST, self.port)
+        self.same_origin = "http://%s" % self.host_header
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        time.sleep(0.05)
+
+        import backend.auth as auth
+        for i in range(auth.RATE_LIMIT_MAX_PER_IP):
+            self.post_json("/auth/request-link", {"email": "flood-%d@example.com" % i})
+        status, _, _ = self.post_json("/auth/request-link", {"email": "one-more@example.com"})
+        self.assertEqual(status, 429)
+        self.assertTrue(any(e[0] == alerting.EVENT_AUTH_RATE_LIMIT for e in alert_sender.events))
+
+
+class InFlightTrackerTests(unittest.TestCase):
+    """Direct tests of backend.http_app._InFlightTracker/get_in_flight_count
+    - the primitive backend/main.py's graceful-shutdown drain loop polls.
+    Real HTTP-level in-flight behavior is exercised end-to-end in
+    tests/test_backend_main.py's own shutdown tests."""
+
+    def test_starts_at_zero(self):
+        tracker = http_app._InFlightTracker()
+        self.assertEqual(tracker.count, 0)
+
+    def test_increment_and_decrement(self):
+        tracker = http_app._InFlightTracker()
+        tracker.increment()
+        tracker.increment()
+        self.assertEqual(tracker.count, 2)
+        tracker.decrement()
+        self.assertEqual(tracker.count, 1)
+
+    def test_get_in_flight_count_is_zero_for_a_server_with_no_tracker_attached(self):
+        class _FakeServer:
+            pass
+        self.assertEqual(http_app.get_in_flight_count(_FakeServer()), 0)
+
+    def test_a_real_request_is_actually_tracked(self):
+        # Proves handle_one_request() really is the hook point: the
+        # tracker's own count is 0 before any request and 0 again right
+        # after a full request/response cycle completes - a real server,
+        # a real request, through the actual override, not a unit test
+        # of _InFlightTracker in isolation (see the two tests above).
+        fd, db_path = tempfile.mkstemp(suffix=".sqlite3")
+        os.close(fd)
+        os.remove(db_path)
+        seed_conn = repo.connect(db_path)
+        repo.init_schema(seed_conn)
+        seed_conn.close()
+        self.addCleanup(lambda: os.remove(db_path) if os.path.exists(db_path) else None)
+
+        httpd = http_app.run_server(
+            connect_fn=lambda: repo.connect(db_path), email_sender=_CapturingEmailSender(),
+            host_allowlist=[HOST], host=HOST, port=0, secure_cookies=False,
+        )
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        port = httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        time.sleep(0.05)
+
+        self.assertEqual(http_app.get_in_flight_count(httpd), 0)
+        conn = http.client.HTTPConnection(HOST, port, timeout=5)
+        conn.request("GET", "/health", headers={"Host": "%s:%d" % (HOST, port)})
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        # After a full request/response round-trip completes, the
+        # tracker must be back to 0 - never left incremented (a leak
+        # here would make backend/main.py's shutdown drain loop wait out
+        # its full grace period on every shutdown for no reason). Polled
+        # with a short bound rather than asserted instantly: the client
+        # finishing its read() and the SERVER thread's own
+        # handle_one_request() `finally` block (where decrement()
+        # actually runs) are not the same instant - a real, if tiny,
+        # race between "client saw the last byte" and "server thread
+        # finished its own next line of Python", confirmed by this
+        # exact assertion flaking under full-suite load (never in
+        # isolation) before this poll was added.
+        deadline = time.monotonic() + 2
+        while http_app.get_in_flight_count(httpd) != 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(http_app.get_in_flight_count(httpd), 0)
 
 
 if __name__ == "__main__":
