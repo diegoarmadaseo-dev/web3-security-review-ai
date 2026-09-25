@@ -916,6 +916,83 @@ class _WorkspaceStorageTestCase(_HttpAppTestCase):
         self.addCleanup(self._shutdown)
 
 
+class JobSubmitAuthorizationTests(_WorkspaceStorageTestCase):
+    """P0 (D-086): repo.PLAN_ALLOWED_MODES is enforced server-side in
+    _handle_job_submit() - a plan may never run a mode above its own
+    tier, regardless of what the client requests. Never trusts the
+    frontend - every case here is a raw HTTP POST, no UI involved."""
+
+    def _workspace_with_plan(self, email, plan, status="active"):
+        cookie = self.request_and_confirm_login(email)
+        conn = repo.connect(self.db_path)
+        user_id = repo.get_user_by_email(conn, email)["id"]
+        workspace_id = repo.create_workspace(conn, "Plan WS", user_id)
+        repo.create_entitlement(conn, workspace_id, plan, status)
+        conn.close()
+        return cookie, workspace_id
+
+    def _submit(self, cookie, workspace_id, mode):
+        return self.post_json(
+            "/workspaces/%s/jobs" % workspace_id, {"mode": mode, "source": "contract A {}"}, headers={"Cookie": cookie}
+        )
+
+    def test_quick_plan_can_request_quick(self):
+        cookie, workspace_id = self._workspace_with_plan("job-auth-1@example.com", "quick")
+        status, _, _ = self._submit(cookie, workspace_id, "quick")
+        self.assertEqual(status, 200)
+
+    def test_quick_plan_cannot_request_standard(self):
+        cookie, workspace_id = self._workspace_with_plan("job-auth-2@example.com", "quick")
+        status, _, body = self._submit(cookie, workspace_id, "standard")
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body)["error"], "mode not included in the current plan")
+
+    def test_quick_plan_cannot_request_pro(self):
+        cookie, workspace_id = self._workspace_with_plan("job-auth-3@example.com", "quick")
+        status, _, _ = self._submit(cookie, workspace_id, "pro")
+        self.assertEqual(status, 403)
+
+    def test_standard_plan_can_request_quick_and_standard(self):
+        cookie, workspace_id = self._workspace_with_plan("job-auth-4@example.com", "standard")
+        self.assertEqual(self._submit(cookie, workspace_id, "quick")[0], 200)
+        self.assertEqual(self._submit(cookie, workspace_id, "standard")[0], 200)
+
+    def test_standard_plan_cannot_request_pro(self):
+        cookie, workspace_id = self._workspace_with_plan("job-auth-5@example.com", "standard")
+        status, _, _ = self._submit(cookie, workspace_id, "pro")
+        self.assertEqual(status, 403)
+
+    def test_pro_plan_can_request_every_mode(self):
+        cookie, workspace_id = self._workspace_with_plan("job-auth-6@example.com", "pro")
+        for mode in ("quick", "standard", "pro"):
+            with self.subTest(mode=mode):
+                status, _, _ = self._submit(cookie, workspace_id, mode)
+                self.assertEqual(status, 200)
+
+    def test_inactive_subscription_is_denied_before_the_plan_check_even_runs(self):
+        cookie, workspace_id = self._workspace_with_plan("job-auth-7@example.com", "pro", status="canceled")
+        status, _, body = self._submit(cookie, workspace_id, "quick")
+        self.assertEqual(status, 402)
+        self.assertEqual(json.loads(body)["error"], "this workspace has no active subscription")
+
+    def test_trialing_status_uses_the_same_plan_authorization_as_active(self):
+        cookie, workspace_id = self._workspace_with_plan("job-auth-8@example.com", "quick", status="trialing")
+        self.assertEqual(self._submit(cookie, workspace_id, "quick")[0], 200)
+        self.assertEqual(self._submit(cookie, workspace_id, "pro")[0], 403)
+
+    def test_client_cannot_bypass_by_sending_an_extra_plan_field(self):
+        # _handle_job_submit() never reads a client-supplied "plan" at
+        # all - the entitlement's OWN stored plan (a database fact) is
+        # the only thing consulted. This proves that explicitly.
+        cookie, workspace_id = self._workspace_with_plan("job-auth-9@example.com", "quick")
+        status, _, _ = self.post_json(
+            "/workspaces/%s/jobs" % workspace_id,
+            {"mode": "pro", "source": "contract A {}", "plan": "pro"},
+            headers={"Cookie": cookie},
+        )
+        self.assertEqual(status, 403)
+
+
 class JobReadTests(_WorkspaceStorageTestCase):
     def _seed_workspace_with_job(self, email):
         cookie = self.request_and_confirm_login(email)

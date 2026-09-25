@@ -22,7 +22,9 @@
 #     -e DATABASE_URL=... -e HOST_ALLOWLIST=... \
 #     -e S3_BUCKET=... -e S3_REGION=... \
 #     -e STRIPE_SECRET_KEY=... -e STRIPE_WEBHOOK_SECRET=... \
-#     -e STRIPE_PRICE_QUICK=... -e STRIPE_PRICE_STANDARD=... -e STRIPE_PRICE_PRO=... \
+#     -e STRIPE_PRICE_QUICK_MONTHLY=... -e STRIPE_PRICE_QUICK_ANNUAL=... \
+#     -e STRIPE_PRICE_STANDARD_MONTHLY=... -e STRIPE_PRICE_STANDARD_ANNUAL=... \
+#     -e STRIPE_PRICE_PRO_MONTHLY=... -e STRIPE_PRICE_PRO_ANNUAL=... \
 #     vericexa-web:local
 #
 # BASE IMAGE: python:3.11-slim-bookworm - same pinned tag family as

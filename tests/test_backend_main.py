@@ -49,9 +49,12 @@ _FAKE_WEB_ENV = {
     "HOST_ALLOWLIST": "example.com,app.example.com",
     "STRIPE_SECRET_KEY": "sk_test_fake",
     "STRIPE_WEBHOOK_SECRET": "whsec_fake",
-    "STRIPE_PRICE_QUICK": "price_quick",
-    "STRIPE_PRICE_STANDARD": "price_standard",
-    "STRIPE_PRICE_PRO": "price_pro",
+    "STRIPE_PRICE_QUICK_MONTHLY": "price_quick_monthly",
+    "STRIPE_PRICE_QUICK_ANNUAL": "price_quick_annual",
+    "STRIPE_PRICE_STANDARD_MONTHLY": "price_standard_monthly",
+    "STRIPE_PRICE_STANDARD_ANNUAL": "price_standard_annual",
+    "STRIPE_PRICE_PRO_MONTHLY": "price_pro_monthly",
+    "STRIPE_PRICE_PRO_ANNUAL": "price_pro_annual",
     "S3_BUCKET": "fake-bucket",
     "S3_REGION": "us-east-1",
 }
@@ -138,11 +141,18 @@ class WebRoleFailFastTests(unittest.TestCase):
     def test_missing_stripe_secret_key_fails_fast(self):
         self._assert_missing_var_fails_fast("STRIPE_SECRET_KEY")
 
-    def test_missing_stripe_price_for_one_plan_fails_fast(self):
-        # Confirms the price allowlist is built explicitly per plan - a
-        # single missing plan's Price ID must fail startup, never silently
-        # sell only two of three plans.
-        self._assert_missing_var_fails_fast("STRIPE_PRICE_PRO")
+    def test_missing_stripe_price_for_one_plan_interval_fails_fast(self):
+        # D-086: 6 logical Prices now (3 plans x 2 intervals) - confirms
+        # the allowlist is built explicitly per (plan, interval) pair, one
+        # var each - a single missing combination must fail startup,
+        # never silently sell only 5 of 6 plan/interval combinations.
+        for var in (
+            "STRIPE_PRICE_QUICK_MONTHLY", "STRIPE_PRICE_QUICK_ANNUAL",
+            "STRIPE_PRICE_STANDARD_MONTHLY", "STRIPE_PRICE_STANDARD_ANNUAL",
+            "STRIPE_PRICE_PRO_MONTHLY", "STRIPE_PRICE_PRO_ANNUAL",
+        ):
+            with self.subTest(var=var):
+                self._assert_missing_var_fails_fast(var)
 
     def test_missing_s3_bucket_fails_fast_before_boto3_is_needed(self):
         self._assert_missing_var_fails_fast("S3_BUCKET")
@@ -179,7 +189,108 @@ class WebRoleFailFastTests(unittest.TestCase):
             storage = main._build_storage(cfg["s3_bucket"], cfg["s3_region"])
             billing = main._build_billing(cfg["stripe_secret_key"], cfg["stripe_webhook_secret"], cfg["stripe_price_allowlist"])
         self.assertIsNotNone(storage)
-        self.assertEqual(billing.resolve_price_id("quick"), "price_quick")
+        self.assertEqual(billing.resolve_price_id("quick", "monthly"), "price_quick_monthly")
+        self.assertEqual(billing.resolve_price_id("quick", "annual"), "price_quick_annual")
+        self.assertEqual(billing.resolve_price_id("pro", "annual"), "price_pro_annual")
+
+
+class UtcDatetimeEnvTests(unittest.TestCase):
+    def test_parses_a_valid_aware_timestamp(self):
+        with patch.dict(os.environ, {"X_TS": "2026-11-23T00:00:00+00:00"}, clear=False):
+            parsed = main._utc_datetime_env("X_TS")
+        self.assertEqual(parsed.isoformat(), "2026-11-23T00:00:00+00:00")
+
+    def test_accepts_a_trailing_z(self):
+        with patch.dict(os.environ, {"X_TS": "2026-11-30T23:59:59Z"}, clear=False):
+            parsed = main._utc_datetime_env("X_TS")
+        self.assertEqual(parsed.hour, 23)
+
+    def test_missing_raises_config_error(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(main.ConfigError):
+                main._utc_datetime_env("X_TS_MISSING")
+
+    def test_malformed_value_raises_config_error(self):
+        with patch.dict(os.environ, {"X_TS": "not-a-date"}, clear=False):
+            with self.assertRaises(main.ConfigError):
+                main._utc_datetime_env("X_TS")
+
+    def test_naive_timestamp_without_a_utc_offset_raises_config_error(self):
+        # Deliberately rejected, not defaulted to UTC - see the helper's
+        # own docstring on why guessing here would be worse than failing.
+        with patch.dict(os.environ, {"X_TS": "2026-11-23T00:00:00"}, clear=False):
+            with self.assertRaises(main.ConfigError):
+                main._utc_datetime_env("X_TS")
+
+
+class BlackFridayConfigTests(unittest.TestCase):
+    _BASE = {
+        "BLACK_FRIDAY_ENABLED": "true",
+        "BLACK_FRIDAY_START": "2026-11-23T00:00:00+00:00",
+        "BLACK_FRIDAY_END": "2026-11-30T23:59:59+00:00",
+        "BLACK_FRIDAY_PROMOTION_CODE_ID": "promo_bf_real",
+    }
+
+    def test_disabled_by_default_returns_all_none_reads_nothing_else(self):
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = main._load_black_friday_config()
+        self.assertEqual(cfg, {"black_friday_enabled": False, "black_friday_start": None, "black_friday_end": None, "black_friday_promotion_code_id": None})
+
+    def test_enabled_with_complete_config_resolves_every_field(self):
+        with patch.dict(os.environ, self._BASE, clear=True):
+            cfg = main._load_black_friday_config()
+        self.assertTrue(cfg["black_friday_enabled"])
+        self.assertEqual(cfg["black_friday_start"].isoformat(), "2026-11-23T00:00:00+00:00")
+        self.assertEqual(cfg["black_friday_end"].isoformat(), "2026-11-30T23:59:59+00:00")
+        self.assertEqual(cfg["black_friday_promotion_code_id"], "promo_bf_real")
+
+    def test_enabled_without_start_fails_fast(self):
+        env = dict(self._BASE)
+        del env["BLACK_FRIDAY_START"]
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(main.ConfigError):
+                main._load_black_friday_config()
+
+    def test_enabled_without_end_fails_fast(self):
+        env = dict(self._BASE)
+        del env["BLACK_FRIDAY_END"]
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(main.ConfigError):
+                main._load_black_friday_config()
+
+    def test_enabled_without_promotion_code_id_fails_fast(self):
+        env = dict(self._BASE)
+        del env["BLACK_FRIDAY_PROMOTION_CODE_ID"]
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(main.ConfigError):
+                main._load_black_friday_config()
+
+    def test_end_before_start_fails_fast(self):
+        env = dict(self._BASE)
+        env["BLACK_FRIDAY_START"], env["BLACK_FRIDAY_END"] = env["BLACK_FRIDAY_END"], env["BLACK_FRIDAY_START"]
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(main.ConfigError):
+                main._load_black_friday_config()
+
+    def test_end_equal_to_start_fails_fast(self):
+        env = dict(self._BASE)
+        env["BLACK_FRIDAY_END"] = env["BLACK_FRIDAY_START"]
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(main.ConfigError):
+                main._load_black_friday_config()
+
+    def test_web_config_includes_black_friday_disabled_by_default(self):
+        with patch.dict(os.environ, _FAKE_WEB_ENV, clear=True):
+            cfg = main._load_web_config()
+        self.assertFalse(cfg["black_friday_enabled"])
+
+    def test_web_config_includes_black_friday_when_enabled(self):
+        env = dict(_FAKE_WEB_ENV)
+        env.update(self._BASE)
+        with patch.dict(os.environ, env, clear=True):
+            cfg = main._load_web_config()
+        self.assertTrue(cfg["black_friday_enabled"])
+        self.assertEqual(cfg["black_friday_promotion_code_id"], "promo_bf_real")
 
 
 class WorkerRoleFailFastTests(unittest.TestCase):

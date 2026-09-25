@@ -121,17 +121,19 @@ class MigrationIntegrationTests(unittest.TestCase):
         self.conn, self.applied = _reset_database_and_migrate()
         self.addCleanup(self.conn.close)
 
-    def test_fresh_database_applies_all_six_migrations_in_order(self):
+    def test_fresh_database_applies_all_seven_migrations_in_order(self):
         # 0002_auth_tokens.sql (Phase 2), 0003_entitlement_status_expand.sql
         # and 0004_entitlement_event_provenance.sql (Phase 3),
-        # 0005_job_queue_hardening.sql (Phase 4, D-079), and
-        # 0006_retention_purge.sql (Phase 6A, D-081) added alongside
+        # 0005_job_queue_hardening.sql (Phase 4, D-079),
+        # 0006_retention_purge.sql (Phase 6A, D-081), and
+        # 0007_billing_interval.sql (Phase 7, D-086) added alongside
         # 0001_initial_schema.sql (Phase 1).
         self.assertEqual(
             self.applied,
             [
                 "0001_initial_schema", "0002_auth_tokens", "0003_entitlement_status_expand",
                 "0004_entitlement_event_provenance", "0005_job_queue_hardening", "0006_retention_purge",
+                "0007_billing_interval",
             ],
         )
 

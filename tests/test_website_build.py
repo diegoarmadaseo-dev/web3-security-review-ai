@@ -16,6 +16,7 @@ import re
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -149,11 +150,23 @@ class ContentCentralizationTests(unittest.TestCase):
         self.assertEqual(len(content.PAGE_TITLES.values()), len(set(content.PAGE_TITLES.values())))
         self.assertEqual(len(content.PAGE_DESCRIPTIONS.values()), len(set(content.PAGE_DESCRIPTIONS.values())))
 
-    def test_pricing_is_unpublished_and_has_no_amounts(self):
-        self.assertFalse(content.PRICING_PUBLISHED)
+    def test_pricing_is_published_with_the_confirmed_d086_amounts(self):
+        self.assertTrue(content.PRICING_PUBLISHED)
+        expected = {
+            "quick": ("$19/month", "$190/year"),
+            "standard": ("$39/month", "$390/year"),
+            "pro": ("$79/month", "$790/year"),
+        }
         for tier in content.PRICING_TIERS:
-            self.assertIsNone(tier["price"])
-            self.assertIsNone(tier["billing_period"])
+            monthly, annual = expected[tier["mode"]]
+            self.assertEqual(tier["price_monthly"], monthly)
+            self.assertEqual(tier["price_annual"], annual)
+
+    def test_black_friday_first_year_prices_match_the_confirmed_d086_amounts(self):
+        self.assertEqual(
+            content.BLACK_FRIDAY_FIRST_YEAR_PRICES,
+            {"quick": "$133", "standard": "$273", "pro": "$553"},
+        )
 
     def test_feature_lists_are_grounded_with_evidence(self):
         for f in content.FEATURES_AVAILABLE + content.FEATURES_PARTIAL:
@@ -212,11 +225,20 @@ class BuildSiteOutputTests(unittest.TestCase):
                 with self.subTest(page=name, href=href):
                     self.fail("external anchor link found: %s" % href)
 
-    def test_pricing_page_never_shows_a_dollar_amount(self):
+    def test_pricing_page_shows_only_the_confirmed_d086_dollar_amounts(self):
+        # D-086: pricing is now published - this guards against a DIFFERENT
+        # or invented amount ever appearing, not against dollar amounts
+        # existing at all (see tests.test_website_build.ContentCentralization
+        # Tests.test_pricing_is_published_with_the_confirmed_d086_amounts).
+        # D-087: the Black Friday first-year prices are now ALWAYS present
+        # in the raw HTML too (hidden by default, revealed at runtime) -
+        # see tests.test_website_build.BlackFridayWebsiteTests.
         written = _build(self._tmp.name)
         pricing_html = Path(written["pricing.html"]).read_text(encoding="utf-8")
-        self.assertNotIn("$", pricing_html)
-        self.assertFalse(re.search(r"\b\d+\s*(usd|dollars)\b", pricing_html, re.IGNORECASE))
+        found = set(re.findall(r"\$\d[\d,]*(?:/\w+)?", pricing_html))
+        allowed = {"$19/month", "$190/year", "$39/month", "$390/year", "$79/month", "$790/year", "$133", "$273", "$553"}
+        self.assertTrue(found, "expected at least one confirmed price on the pricing page")
+        self.assertTrue(found <= allowed, "unexpected/invented price(s) found: %r" % (found - allowed))
 
     def test_home_uses_approved_positioning_verbatim(self):
         written = _build(self._tmp.name)
@@ -516,8 +538,14 @@ class CommercialClaimsSweepTests(unittest.TestCase):
     def test_never_exposes_capafy_verify_markers(self):
         self.assertNotIn("capafy-verify", self.all_text)
 
-    def test_never_exposes_a_dollar_price_anywhere_on_the_site(self):
-        self.assertNotIn("$", self.all_text)
+    def test_only_the_confirmed_d086_dollar_amounts_appear_anywhere_on_the_site(self):
+        # D-086: pricing is now published - this guards against a
+        # DIFFERENT/invented amount appearing anywhere on the site
+        # (pricing.html and faq.html both legitimately mention real
+        # prices today), never against "$" existing at all.
+        found = set(re.findall(r"\$\d[\d,]*(?:/\w+)?", self.all_text))
+        allowed = {"$19/month", "$190/year", "$39/month", "$390/year", "$79/month", "$790/year", "$133", "$273", "$553"}
+        self.assertTrue(found <= allowed, "unexpected/invented price(s) found: %r" % (found - allowed))
 
     def test_never_names_a_specific_llm_provider_or_model(self):
         for banned in ("anthropic", "claude", "gpt", "openai", "gemini"):
@@ -742,6 +770,138 @@ class LegalAccountClaimCorrectionTests(unittest.TestCase):
         for forbidden in ("30 days", "90 days", "days of retention", "refund within", "money-back"):
             with self.subTest(term=forbidden):
                 self.assertNotIn(forbidden, lowered)
+
+
+class IsBlackFridayWindowTests(unittest.TestCase):
+    """Pure-function tests for build_site.is_black_friday_window() (D-086)
+    - no build, no I/O. PRESENTATION ONLY, see that function's own
+    docstring; backend/black_friday.py has the equivalent real-enforcement
+    tests."""
+
+    def setUp(self):
+        self.now = datetime(2026, 11, 25, 12, 0, 0, tzinfo=timezone.utc)
+        self.start = "2026-11-23T00:00:00+00:00"
+        self.end = "2026-11-30T23:59:59+00:00"
+
+    def test_inside_window_and_enabled_is_true(self):
+        self.assertTrue(bs.is_black_friday_window(self.now, True, self.start, self.end))
+
+    def test_disabled_is_false_even_inside_the_window(self):
+        self.assertFalse(bs.is_black_friday_window(self.now, False, self.start, self.end))
+
+    def test_before_window_is_false(self):
+        self.assertFalse(bs.is_black_friday_window(datetime(2026, 11, 22, tzinfo=timezone.utc), True, self.start, self.end))
+
+    def test_after_window_is_false(self):
+        self.assertFalse(bs.is_black_friday_window(datetime(2026, 12, 1, tzinfo=timezone.utc), True, self.start, self.end))
+
+    def test_missing_start_or_end_is_false_never_a_crash(self):
+        self.assertFalse(bs.is_black_friday_window(self.now, True, None, self.end))
+        self.assertFalse(bs.is_black_friday_window(self.now, True, self.start, None))
+
+    def test_malformed_date_string_is_false_never_a_crash(self):
+        self.assertFalse(bs.is_black_friday_window(self.now, True, "not-a-date", self.end))
+
+    def test_naive_start_or_end_is_false_never_a_silent_misfire(self):
+        self.assertFalse(bs.is_black_friday_window(self.now, True, "2026-11-23T00:00:00", self.end))
+
+
+class BlackFridayWebsiteTests(unittest.TestCase):
+    """D-087 (supersedes D-086's build-time-only design, which had a real
+    staleness bug - see build_site.py's own module docstring). BUILD-TIME
+    STRUCTURAL VALIDATION ONLY: the campaign markup/script must always be
+    present, safe-by-default (hidden), and correctly wired - actual
+    show/hide is a RUNTIME concern now, covered by tests/
+    test_website_black_friday_runtime.py's real Node execution of the
+    exact shipped JS, never re-tested here with a fake build clock."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        written = bs.build_site(self._tmp.name, base_url=TEST_BASE_URL)
+        self.pricing_html = Path(written["pricing.html"]).read_text(encoding="utf-8")
+
+    def test_black_friday_markup_is_always_present_regardless_of_build_time(self):
+        # The exact bug this phase fixes: a build must NEVER omit this
+        # markup just because "now" (at build time) was outside the
+        # window - omitting it would leave the runtime script with
+        # nothing to reveal later.
+        self.assertIn("Black Friday", self.pricing_html)
+        self.assertIn("$133", self.pricing_html)
+        self.assertIn("$273", self.pricing_html)
+        self.assertIn("$553", self.pricing_html)
+        self.assertIn(content.BLACK_FRIDAY_RENEWAL_NOTE, self.pricing_html)
+
+    def test_every_black_friday_presentation_element_starts_hidden(self):
+        # Fail-hidden default: if the script never runs (JS blocked/
+        # fails), a visitor sees the ordinary pricing page, never a
+        # stale/incorrect Black Friday claim.
+        for match in re.finditer(r'<[^>]*data-bf-presentation[^>]*>', self.pricing_html):
+            with self.subTest(tag=match.group(0)):
+                self.assertIn("hidden", match.group(0))
+
+    def test_normal_annual_price_element_has_no_hidden_attribute_by_default(self):
+        # The normal price (data-bf-normal) is what a visitor sees unless
+        # the runtime script confirms the campaign and hides it.
+        normal_price_tags = re.findall(r'<span data-bf-normal>[^<]*</span>', self.pricing_html)
+        self.assertEqual(len(normal_price_tags), 3)  # quick/standard/pro.
+        for tag in normal_price_tags:
+            self.assertNotIn("hidden", tag)
+
+    def test_monthly_price_cells_have_neither_bf_attribute_structurally_incapable_of_a_discount(self):
+        monthly_row = re.search(r'<tr><th scope="row">Price \(monthly\)</th>(.*?)</tr>', self.pricing_html, re.S).group(1)
+        self.assertNotIn("data-bf-presentation", monthly_row)
+        self.assertNotIn("data-bf-normal", monthly_row)
+        self.assertNotIn("$133", monthly_row)
+        self.assertNotIn("$273", monthly_row)
+        self.assertNotIn("$553", monthly_row)
+
+    def test_script_is_present_exactly_once_with_the_confirmed_boundaries(self):
+        self.assertEqual(self.pricing_html.count("<script>"), 1)
+        self.assertIn(json.dumps(content.BLACK_FRIDAY_START_UTC), self.pricing_html)
+        self.assertIn(json.dumps(content.BLACK_FRIDAY_END_UTC), self.pricing_html)
+
+    def test_cta_area_carries_an_optional_black_friday_badge_also_hidden_by_default(self):
+        cta_section = re.search(r'<p class="cta">(.*?)</p>', self.pricing_html, re.S).group(1)
+        self.assertIn("data-bf-presentation", cta_section)
+        self.assertIn("hidden", cta_section)
+
+    def test_black_friday_cta_badge_text_renders_a_single_percent_sign(self):
+        # Regression guard for a real formatting defect the final audit
+        # found: bf_cta_badge is a plain conditional string, never passed
+        # through Python's own `%` operator - a `%%` escape (correct
+        # inside black_friday_notice, which IS `%`-formatted) is wrong
+        # here and renders as a literal double percent sign instead of
+        # collapsing to one.
+        cta_section = re.search(r'<p class="cta">(.*?)</p>', self.pricing_html, re.S).group(1)
+        self.assertIn("30% off annual", cta_section)
+        self.assertNotIn("%%", cta_section)
+
+
+class NoTrialMessagingTests(unittest.TestCase):
+    """Section 8's own explicit requirement: no trial claim anywhere, and
+    an explicit no-trial statement is present (D-086)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.written = _build(self._tmp.name)
+        self.all_text = "".join(
+            Path(p).read_text(encoding="utf-8") for name, p in self.written.items() if name.endswith(".html")
+        ).lower()
+
+    def test_no_trial_note_appears_on_the_pricing_page(self):
+        pricing_html = Path(self.written["pricing.html"]).read_text(encoding="utf-8")
+        self.assertIn("no free trial", pricing_html.lower())
+
+    def test_no_page_ever_claims_a_trial_is_offered(self):
+        for phrase in ("start your free trial", "try free", "free trial available", "14-day trial", "30-day trial"):
+            with self.subTest(phrase=phrase):
+                self.assertNotIn(phrase, self.all_text)
+
+    def test_demo_page_is_never_described_as_a_trial(self):
+        demo_html = Path(self.written["demo.html"]).read_text(encoding="utf-8").lower()
+        self.assertNotIn("trial", demo_html)
 
 
 class KeywordPlacementTests(unittest.TestCase):

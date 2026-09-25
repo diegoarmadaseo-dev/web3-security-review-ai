@@ -15,16 +15,30 @@ inline "Evidence" note on each entry. Nothing here describes a capability
 that does not exist yet (no hosted accounts, no dashboard, no automated
 alerts/monitoring service - see FEATURES_PARTIAL["monitoring"]).
 
-Pricing is centralized but UNPUBLISHED (PRICING_PUBLISHED = False): no real
-dollar amounts have been confirmed for either potential distribution path -
-capafy/pricing.md still marks its own amounts [CAPAFY-VERIFY] ("Draft only"),
-and the independent standalone-SaaS backend (backend/billing.py, Phase 3-4,
-docs/decisiones.md D-077) has its own Stripe Price ID configuration that is
-equally unconfirmed/unset today. This module holds tier names/features only,
-ready for later activation once Diego confirms real numbers for whichever
-path is actually live - flip PRICING_PUBLISHED and fill in each tier's
-"price"/"billing_period" when that happens. No other code path needs to
-change.
+Pricing is centralized and PUBLISHED as of Phase 7 (D-086,
+docs/decisiones.md): Diego confirmed real monthly/annual amounts for the
+independent standalone-SaaS backend (backend/billing.py) - see
+PRICING_TIERS below. capafy/pricing.md remains historical only (its own
+amounts are still marked [CAPAFY-VERIFY], a separate, never-launched
+channel - see that file's own docstring); nothing here republishes or
+depends on it. Publishing a PRICE is a marketing/content decision,
+independent of whether Stripe Checkout is actually live - the real CTA
+that would let a visitor act on these numbers stays exactly as gated as
+it already was (website/build_site.py's APP_BASE_URL_ENV, off by
+default) - see that module's own docstring.
+
+BLACK FRIDAY (D-086, RUNTIME FIX D-087): BLACK_FRIDAY_START_UTC/END_UTC
+below are fixed, confirmed literals (see their own comment for why a
+build-time env var was replaced with a constant). The website's own use
+of them is PRESENTATION ONLY, evaluated by a small inline script AT
+RUNTIME, in the visitor's own browser (see build_site.py's own docstring
+on why a static site's BUILD-time clock cannot be the enforcement point
+- a page built before 2026-11-23 must still correctly show/hide the
+campaign on 2026-11-23 without a rebuild). backend/black_friday.py
+independently re-checks the real window on every Checkout request
+regardless of what the page currently shows or what a visitor's own
+browser clock/DOM says - see that module's own docstring; a manipulated
+client can change what they SEE, never what they can actually buy.
 
 Standard library only. No network access, no LLM calls, no accounts.
 Python 3.8+.
@@ -304,21 +318,47 @@ PIPELINE_STEPS: List[Tuple[str, str]] = [
 ]
 
 # ---------------------------------------------------------------------------
-# Pricing - centralized, UNPUBLISHED. See module docstring.
+# Pricing - centralized, PUBLISHED (D-086). See module docstring.
 # ---------------------------------------------------------------------------
 
-PRICING_PUBLISHED = False  # Flip only once real prices are confirmed for whichever distribution path (Capafy or the independent standalone backend, backend/billing.py) is actually live - see module docstring.
+PRICING_PUBLISHED = True
 
 PRICING_TIERS: List[Dict[str, Optional[str]]] = [
-    {"mode": "quick", "display_name": "Quick", "price": None, "billing_period": None},
-    {"mode": "standard", "display_name": "Standard", "price": None, "billing_period": None},
-    {"mode": "pro", "display_name": "Pro", "price": None, "billing_period": None},
+    {"mode": "quick", "display_name": "Quick", "price_monthly": "$19/month", "price_annual": "$190/year"},
+    {"mode": "standard", "display_name": "Standard", "price_monthly": "$39/month", "price_annual": "$390/year"},
+    {"mode": "pro", "display_name": "Pro", "price_monthly": "$79/month", "price_annual": "$790/year"},
 ]
 
-PRICING_UNCONFIRMED_NOTE = (
-    "Pricing is not yet finalized. Tier names above match the product's own analysis "
-    "modes one-to-one; pricing and checkout details will be published here once confirmed."
+# D-086/D-087: 30% off the FIRST annual invoice only - renews at the
+# normal annual price above (PRICING_TIERS' own price_annual). Keyed by
+# mode to reuse the same iteration PRICING_TIERS already uses, never a
+# fourth hand-typed tier list.
+BLACK_FRIDAY_FIRST_YEAR_PRICES: Dict[str, str] = {"quick": "$133", "standard": "$273", "pro": "$553"}
+BLACK_FRIDAY_RENEWAL_NOTE = "Renews at the standard annual price."
+
+# D-087: the ONE place these two fixed, confirmed UTC timestamps are
+# written as a literal - build_site.py's inline runtime script reads
+# them from here (via Python string formatting) rather than a build-time
+# env var, and never re-types them. This is a real, already-decided,
+# one-time campaign (not a per-deployment setting like VERICEXA_APP_URL),
+# so a source-controlled constant is the correct "single configuration
+# source" here - see docs/decisiones.md D-087 for why the earlier
+# build-time-env-var design (D-086) was replaced: a static site built
+# before 2026-11-23 would otherwise never show the campaign at all
+# without a rebuild exactly at the boundary. MUST match backend/main.py's
+# own BLACK_FRIDAY_START/END env vars (operationally, not by import - the
+# two processes stay decoupled) - see docs/production-config.md.
+# ISO-8601 with an explicit "Z" (UTC) suffix - required for both Python's
+# own datetime.fromisoformat() (backend/black_friday.py) and JavaScript's
+# Date.parse() to agree unambiguously.
+BLACK_FRIDAY_START_UTC = "2026-11-23T00:00:00Z"
+BLACK_FRIDAY_END_UTC = "2026-11-30T23:59:59Z"
+
+PRICING_NOTE = (
+    "Tier names match the product's own analysis modes one-to-one. Billed monthly or annually - "
+    "no free trial."
 )
+NO_TRIAL_NOTE = "There is no free trial. The Demo page shows an illustrative example only, not a trial of the product."
 
 # ---------------------------------------------------------------------------
 # FAQ - real, repository-grounded questions only (used for on-page copy and
@@ -362,7 +402,8 @@ FAQ_ITEMS: List[Tuple[str, str]] = [
     ),
     (
         "What does Vericexa cost?",
-        PRICING_UNCONFIRMED_NOTE,
+        "Quick is $19/month or $190/year, Standard is $39/month or $390/year, and Pro is $79/month or "
+        "$790/year. " + NO_TRIAL_NOTE,
     ),
     (
         "Who is Vericexa for?",

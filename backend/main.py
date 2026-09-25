@@ -101,6 +101,7 @@ import signal
 import sys
 import threading
 import time
+from datetime import datetime
 from typing import Any, Callable, Dict, Optional
 
 import backend.alerting as alerting
@@ -239,6 +240,51 @@ def _load_alert_config() -> Dict[str, Any]:
     return {"alert_sender_mode": mode, "alert_webhook_url": webhook_url}
 
 
+def _utc_datetime_env(name: str) -> datetime:
+    """A required, timezone-AWARE ISO-8601 timestamp - e.g.
+    "2026-11-23T00:00:00+00:00" or "...Z". Phase 7 (D-086): backend/
+    black_friday.py's own docstring requires an aware datetime for its
+    start/end comparison; a bare "2026-11-23T00:00:00" (no offset) would
+    silently compare as naive-vs-aware and raise at comparison time
+    instead of at startup - rejected HERE, with a clear message, instead
+    of failing deep inside a request handler."""
+    value = _require_env(name)
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise ConfigError("environment variable %s must be an ISO-8601 timestamp, got %r" % (name, value))
+    if parsed.tzinfo is None:
+        raise ConfigError("environment variable %s must include a UTC offset (e.g. a trailing Z or +00:00), got %r" % (name, value))
+    return parsed
+
+
+_BLACK_FRIDAY_ENABLED_DEFAULT = False
+
+
+def _load_black_friday_config() -> Dict[str, Any]:
+    """Shared by ROLE=web only (the checkout endpoint is the one and only
+    caller of backend.black_friday.resolve_promotion_code() - see
+    backend/http_app.py). BLACK_FRIDAY_ENABLED (default False) is the
+    explicit gate, same "never infer from whether the other values
+    happen to be set" discipline as _load_alert_config()/_load_email_
+    config() above - disabled means start/end/promotion_code_id are never
+    even read, so an operator preparing next year's values ahead of time
+    cannot accidentally half-activate the campaign early."""
+    enabled = _bool_env("BLACK_FRIDAY_ENABLED", _BLACK_FRIDAY_ENABLED_DEFAULT)
+    if not enabled:
+        return {"black_friday_enabled": False, "black_friday_start": None, "black_friday_end": None, "black_friday_promotion_code_id": None}
+    start = _utc_datetime_env("BLACK_FRIDAY_START")
+    end = _utc_datetime_env("BLACK_FRIDAY_END")
+    if end <= start:
+        raise ConfigError("BLACK_FRIDAY_END must be after BLACK_FRIDAY_START")
+    return {
+        "black_friday_enabled": True,
+        "black_friday_start": start,
+        "black_friday_end": end,
+        "black_friday_promotion_code_id": _require_env("BLACK_FRIDAY_PROMOTION_CODE_ID"),
+    }
+
+
 def _build_alert_sender(mode: str, webhook_url: Optional[str]) -> "alerting.AlertSender":
     if mode == "webhook":
         return alerting.WebhookAlertSender(webhook_url)
@@ -310,10 +356,16 @@ def _load_web_config() -> Dict[str, Any]:
         "s3_region": _require_env("S3_REGION"),
         "stripe_secret_key": _require_env("STRIPE_SECRET_KEY"),
         "stripe_webhook_secret": _require_env("STRIPE_WEBHOOK_SECRET"),
+        # Phase 7 (D-086): 6 logical Prices (3 plans x 2 intervals), keyed
+        # via billing_module.price_key() - the SAME function backend/
+        # billing.py's own resolve_price_id() uses to look this dict back
+        # up, so the key FORMAT is never hand-typed in two places. Every
+        # one of the 6 env vars is required - there is no partial/
+        # monthly-only or annual-only deployment shape.
         "stripe_price_allowlist": {
-            "quick": _require_env("STRIPE_PRICE_QUICK"),
-            "standard": _require_env("STRIPE_PRICE_STANDARD"),
-            "pro": _require_env("STRIPE_PRICE_PRO"),
+            billing_module.price_key(plan, interval): _require_env("STRIPE_PRICE_%s_%s" % (plan.upper(), interval.upper()))
+            for plan in ("quick", "standard", "pro")
+            for interval in ("monthly", "annual")
         },
         # Phase 6A: bounded grace period for _serve_until_shutdown() below
         # - "shutdown timeout is configurable" per that phase's own spec.
@@ -321,6 +373,7 @@ def _load_web_config() -> Dict[str, Any]:
     }
     cfg.update(_load_alert_config())
     cfg.update(_load_email_config())
+    cfg.update(_load_black_friday_config())
     return cfg
 
 
@@ -474,8 +527,14 @@ def run_web() -> None:
         billing=billing,
         storage=storage,
         alert_sender=alert_sender,
+        black_friday_enabled=cfg["black_friday_enabled"],
+        black_friday_start=cfg["black_friday_start"],
+        black_friday_end=cfg["black_friday_end"],
+        black_friday_promotion_code_id=cfg["black_friday_promotion_code_id"],
     )
     sys.stderr.write("backend web process listening on %s:%d (secure_cookies=%s)\n" % (cfg["host"], cfg["port"], cfg["secure_cookies"]))
+    if cfg["black_friday_enabled"]:
+        sys.stderr.write("Black Friday campaign ENABLED: %s -> %s\n" % (cfg["black_friday_start"].isoformat(), cfg["black_friday_end"].isoformat()))
     shutdown_event = threading.Event()
     _install_shutdown_signal_handlers(shutdown_event)
     try:

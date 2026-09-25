@@ -47,11 +47,25 @@ what the code actually reads.
 |---|---|---|---|
 | `STRIPE_SECRET_KEY` | Stripe API secret key. | Yes | **Yes** |
 | `STRIPE_WEBHOOK_SECRET` | Verifies `Stripe-Signature` on `/billing/webhook`. | Yes | **Yes** |
-| `STRIPE_PRICE_QUICK` / `STRIPE_PRICE_STANDARD` / `STRIPE_PRICE_PRO` | The only plan-name -> Stripe Price ID mapping (`backend/billing.py`'s `resolve_price_id()`). IDs, not amounts - no price/currency is set anywhere in code. | Yes (all 3) | No |
+| `STRIPE_PRICE_QUICK_MONTHLY` / `_ANNUAL`, `STRIPE_PRICE_STANDARD_MONTHLY` / `_ANNUAL`, `STRIPE_PRICE_PRO_MONTHLY` / `_ANNUAL` | The only (plan, interval) -> Stripe Price ID mapping (`backend/billing.py`'s `resolve_price_id()`/`price_key()`, D-086). 6 IDs, not amounts - no price/currency is set anywhere in code (the confirmed $19/$39/$79 monthly, $190/$390/$790 annual - D-086 - live only in `website/content.py`'s marketing copy and in whatever amount each real Stripe Price object is configured with). | Yes (all 6) | No |
 
-Business decisions NOT in code (see `docs/decisiones.md`'s Phase 6 audit
-entries): final prices, currency, billing interval, trial period,
+Business decisions confirmed in D-086 (prices, billing interval, Black
+Friday) are no longer open - see that entry. Still NOT in code: currency,
 cancellation/refund policy, VAT handling.
+
+## Black Friday campaign (ROLE=web, Phase 7, D-086)
+
+| Variable | Purpose | Required? | Default |
+|---|---|---|---|
+| `BLACK_FRIDAY_ENABLED` | Explicit gate - **disabled means START/END/PROMOTION_CODE_ID are never even read**, so preparing next year's values ahead of time can never half-activate the campaign early. | No | `false` |
+| `BLACK_FRIDAY_START` / `BLACK_FRIDAY_END` | ISO-8601 timestamps, MUST include a UTC offset (`+00:00` or `Z`) - a naive value fails fast rather than being guessed as UTC. Required only if enabled; END must be strictly after START. | Conditional | - |
+| `BLACK_FRIDAY_PROMOTION_CODE_ID` | A real Stripe PromotionCode id (not a Coupon id) - expected to already carry `restrictions.first_time_transaction=True` and its own `expires_at` (both configured directly in Stripe, never in this codebase). Required only if enabled. | Conditional | - |
+
+Re-evaluated fresh on every `/billing/checkout` request
+(`backend/black_friday.py`'s `resolve_promotion_code()`) - never cached,
+never trusted from a client-supplied field. Annual-interval-only is
+enforced in code, not just by this config - see that module's own
+docstring.
 
 ## LLM provider (ROLE=worker)
 

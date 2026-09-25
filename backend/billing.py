@@ -14,12 +14,23 @@ code). This also makes every function here trivially testable with fake
 config and no real network access.
 
 PRICE SECURITY: create_checkout_session() takes an internal PLAN NAME
-("quick"/"standard"/"pro"), never a Stripe Price ID - resolve_price_id()
-is the one place a plan name is looked up against the server-supplied
-price_allowlist (Stripe Price ID -> plan name mapping is the caller's
-config, not this module's). An unrecognized plan raises
+("quick"/"standard"/"pro") and INTERVAL ("monthly"/"annual"), never a
+Stripe Price ID - resolve_price_id() is the one place a (plan, interval)
+pair is looked up (via price_key()) against the server-supplied
+price_allowlist, now 6 entries deep (D-086, docs/decisiones.md) - Stripe
+Price ID -> plan/interval mapping is the caller's config, not this
+module's. An unrecognized plan, interval, or combination raises
 PriceNotAllowedError; there is no code path that accepts a client-
 supplied Price ID at all, so there is nothing to tamper with.
+
+BLACK FRIDAY DISCOUNT SECURITY (D-086): create_checkout_session()'s
+black_friday_promotion_code_id parameter is likewise never client-
+supplied - it is an already-resolved PromotionCode id the CALLER decided
+to pass after checking eligibility (annual interval, campaign window,
+enabled) itself; see that function's own docstring. This module does no
+eligibility reasoning and accepts no client-shaped discount/coupon/
+campaign-flag parameter of any kind - there is equally nothing to tamper
+with here.
 
 WEBHOOK SIGNATURE: verify_and_parse_webhook() calls
 stripe.Webhook.construct_event(), which verifies the signature over the
@@ -71,6 +82,18 @@ except ImportError:  # optional - see module docstring.
     stripe = None
 
 _ALLOWED_PLANS = ("quick", "standard", "pro")
+_ALLOWED_INTERVALS = ("monthly", "annual")
+
+
+def price_key(plan: str, interval: str) -> str:
+    """The ONE place a (plan, interval) pair becomes a price_allowlist
+    key (D-086) - "quick_monthly", "quick_annual", etc. Used both here
+    (resolve_price_id) and by backend/main.py when building the
+    allowlist from 6 STRIPE_PRICE_* env vars, so the key FORMAT itself
+    is never hand-typed twice. Does not validate plan/interval itself -
+    resolve_price_id() below is the one place that raises for an
+    unrecognized pair; this is a pure string-formatting helper only."""
+    return "%s_%s" % (plan, interval)
 
 
 class BillingError(Exception):
@@ -152,50 +175,70 @@ class StripeBilling:
         if not isinstance(webhook_secret, str) or not webhook_secret:
             raise BillingError("webhook_secret is required")
         if not price_allowlist:
-            raise BillingError("price_allowlist must contain at least one plan -> Price ID mapping")
+            raise BillingError("price_allowlist must contain at least one plan_interval -> Price ID mapping")
         self._client = stripe.StripeClient(secret_key)
         self._webhook_secret = webhook_secret
         self._price_allowlist: Dict[str, str] = dict(price_allowlist)
 
-    def resolve_price_id(self, plan: str) -> str:
-        """The ONE place a plan name becomes a Stripe Price ID - see
-        module docstring on price security."""
-        if plan not in _ALLOWED_PLANS or plan not in self._price_allowlist:
-            raise PriceNotAllowedError("plan %r is not an allowlisted, sellable plan" % (plan,))
-        return self._price_allowlist[plan]
+    def resolve_price_id(self, plan: str, interval: str) -> str:
+        """The ONE place a (plan, interval) pair becomes a Stripe Price
+        ID - see module docstring on price security. price_key() is the
+        single source of truth for how the pair becomes an allowlist
+        key; this is the only function that ever looks one up."""
+        if plan not in _ALLOWED_PLANS or interval not in _ALLOWED_INTERVALS:
+            raise PriceNotAllowedError("plan %r / interval %r is not an allowlisted, sellable combination" % (plan, interval))
+        key = price_key(plan, interval)
+        if key not in self._price_allowlist:
+            raise PriceNotAllowedError("plan %r / interval %r is not an allowlisted, sellable combination" % (plan, interval))
+        return self._price_allowlist[key]
 
     def create_checkout_session(
         self,
         plan: str,
+        interval: str,
         workspace_id: str,
         success_url: str,
         cancel_url: str,
         customer_id: Optional[str] = None,
         customer_email: Optional[str] = None,
+        black_friday_promotion_code_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Raises PriceNotAllowedError for an unrecognized plan (the
-        caller turns this into a clean 400 - see http_app.py). Always
-        stamps workspace_id (and the resolved plan) onto BOTH the
+        """Raises PriceNotAllowedError for an unrecognized plan/interval
+        pair (the caller turns this into a clean 400 - see http_app.py).
+        Always stamps workspace_id, plan AND interval onto BOTH the
         Checkout Session itself (client_reference_id/metadata - read by
         the checkout.session.completed handler) and the resulting
         Subscription (subscription_data.metadata - read by the
         customer.subscription.* handlers) so every later webhook event
-        can resolve its workspace without this module needing a
-        database lookup of its own."""
-        price_id = self.resolve_price_id(plan)
+        can resolve its workspace/plan/interval without this module
+        needing a database lookup of its own.
+
+        BLACK FRIDAY (D-086): black_friday_promotion_code_id is an
+        ALREADY-RESOLVED, already-eligibility-checked Stripe PromotionCode
+        id - this function does no eligibility reasoning of its own
+        (annual-only, campaign window, first-time-customer are all the
+        CALLER's job, see backend/http_app.py's own docstring on why that
+        logic lives there, never here). When given, it is attached via
+        the native `discounts` Checkout param - never `allow_promotion_
+        codes` (that renders a customer-facing code-entry field; this
+        product's Black Friday offer is automatic, no code the customer
+        ever sees or types - see docs/decisiones.md D-086)."""
+        price_id = self.resolve_price_id(plan, interval)
         params: Dict[str, Any] = {
             "mode": "subscription",
             "line_items": [{"price": price_id, "quantity": 1}],
             "success_url": success_url,
             "cancel_url": cancel_url,
             "client_reference_id": workspace_id,
-            "metadata": {"workspace_id": workspace_id, "plan": plan},
-            "subscription_data": {"metadata": {"workspace_id": workspace_id, "plan": plan}},
+            "metadata": {"workspace_id": workspace_id, "plan": plan, "interval": interval},
+            "subscription_data": {"metadata": {"workspace_id": workspace_id, "plan": plan, "interval": interval}},
         }
         if customer_id:
             params["customer"] = customer_id
         elif customer_email:
             params["customer_email"] = customer_email
+        if black_friday_promotion_code_id:
+            params["discounts"] = [{"promotion_code": black_friday_promotion_code_id}]
         return self._client.checkout.sessions.create(params)
 
     def create_portal_session(self, customer_id: str, return_url: str) -> Dict[str, Any]:

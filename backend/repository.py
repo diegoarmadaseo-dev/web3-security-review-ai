@@ -247,6 +247,7 @@ def create_entitlement(
     stripe_subscription_id: Optional[str] = None,
     current_period_end: Optional[str] = None,
     stripe_event_created_at: Optional[str] = None,
+    billing_interval: Optional[str] = None,
 ) -> str:
     """stripe_event_created_at (docs/decisiones.md D-077 follow-up,
     Phase 3 webhook hardening) establishes the ordering baseline this
@@ -255,15 +256,24 @@ def create_entitlement(
     None for callers that don't have a Stripe event to attribute this
     creation to (e.g. existing tests) - a NULL baseline is treated as
     "no provenance yet, any event supersedes it", never as a reason to
-    reject a legitimate first update."""
+    reject a legitimate first update.
+
+    billing_interval ('monthly'/'annual', migrations/0007_billing_interval.sql,
+    docs/decisiones.md D-086) is likewise optional/None - a checkout.
+    session.completed event that predates this column's own deploy, or a
+    test that doesn't care about interval, leaves it NULL rather than
+    guessing one. The caller (backend/http_app.py's webhook dispatch) is
+    the only place allowed to derive a real value, and only ever from the
+    Stripe event's own metadata - see that module's own docstring on why
+    interval, like plan, can never be client-supplied."""
     entitlement_id = new_id()
     now = utcnow_iso()
     db.execute(
         conn,
         "INSERT INTO entitlements "
-        "(id, workspace_id, plan, status, stripe_customer_id, stripe_subscription_id, current_period_end, stripe_event_created_at, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (entitlement_id, workspace_id, plan, status, stripe_customer_id, stripe_subscription_id, current_period_end, stripe_event_created_at, now, now),
+        "(id, workspace_id, plan, status, stripe_customer_id, stripe_subscription_id, current_period_end, stripe_event_created_at, billing_interval, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (entitlement_id, workspace_id, plan, status, stripe_customer_id, stripe_subscription_id, current_period_end, stripe_event_created_at, billing_interval, now, now),
     )
     conn.commit()
     return entitlement_id
@@ -275,6 +285,7 @@ def update_entitlement_status(
     status: str,
     current_period_end: Optional[str] = None,
     stripe_event_created_at: Optional[str] = None,
+    billing_interval: Optional[str] = None,
 ) -> bool:
     """Returns True if a row was updated, False if this workspace has no
     entitlement row yet (caller must create one via create_entitlement()
@@ -299,20 +310,27 @@ def update_entitlement_status(
     applied at all (the pre-Phase-3-hardening behavior) - existing
     callers that never had a Stripe event to attribute an update to
     (there are none in this codebase today outside tests) keep working
-    unchanged."""
+    unchanged.
+
+    billing_interval (D-086) uses the same COALESCE-on-None pattern as
+    current_period_end - a status-only update (e.g. invoice.paid, which
+    carries no interval of its own) never wipes out a previously-recorded
+    value."""
     if stripe_event_created_at is None:
         cur = db.execute(
             conn,
-            "UPDATE entitlements SET status = ?, current_period_end = COALESCE(?, current_period_end), updated_at = ? WHERE workspace_id = ?",
-            (status, current_period_end, utcnow_iso(), workspace_id),
+            "UPDATE entitlements SET status = ?, current_period_end = COALESCE(?, current_period_end), "
+            "billing_interval = COALESCE(?, billing_interval), updated_at = ? WHERE workspace_id = ?",
+            (status, current_period_end, billing_interval, utcnow_iso(), workspace_id),
         )
     else:
         cur = db.execute(
             conn,
             "UPDATE entitlements SET status = ?, current_period_end = COALESCE(?, current_period_end), "
+            "billing_interval = COALESCE(?, billing_interval), "
             "stripe_event_created_at = ?, updated_at = ? "
             "WHERE workspace_id = ? AND (stripe_event_created_at IS NULL OR stripe_event_created_at < ?)",
-            (status, current_period_end, stripe_event_created_at, utcnow_iso(), workspace_id, stripe_event_created_at),
+            (status, current_period_end, billing_interval, stripe_event_created_at, utcnow_iso(), workspace_id, stripe_event_created_at),
         )
     conn.commit()
     return cur.rowcount > 0
@@ -578,14 +596,34 @@ def reap_expired_jobs(conn: Any, max_attempts: int = _MAX_JOB_ATTEMPTS) -> Dict[
 
 
 # ---------------------------------------------------------------------------
+# Plan authorization (D-086) - P0: an entitlement's own plan is the ONLY
+# thing that decides which analysis modes a workspace may request. Quick
+# unlocks quick only; Standard adds patch/gas via the standard mode;
+# Pro adds every currently-implemented mode/capability - cumulative by
+# design, matching the commercial model confirmed in docs/decisiones.md
+# D-086, never merely a single exact-match mode. The one enforcement
+# point is backend/http_app.py's _handle_job_submit() - see that
+# function's own docstring; this mapping is the single source of truth
+# it reads, never a second hand-copied version.
+# ---------------------------------------------------------------------------
+
+PLAN_ALLOWED_MODES = {
+    "quick": frozenset({"quick"}),
+    "standard": frozenset({"quick", "standard"}),
+    "pro": frozenset({"quick", "standard", "pro"}),
+}
+
+# ---------------------------------------------------------------------------
 # Workspace spend control (Phase 4 - a units ledger, never money/billing;
 # Stripe/entitlements remain Phase 3 and are untouched by this section)
 # ---------------------------------------------------------------------------
 
-# Placeholders pending real per-plan business tiering (same caveat already
-# disclosed for Phase 3's own unset prices/currency/trial values) - a flat
-# default ceiling and a relative per-mode cost, not tied to any real
-# dollar figure.
+# An INTERNAL cost/abuse safeguard only - never a commercial monthly
+# allowance, never advertised as one (docs/decisiones.md D-086 reconfirms
+# this explicitly). Flat across every plan and never reset on any cycle -
+# a relative per-mode cost against one shared ceiling per workspace, not
+# tied to any real dollar figure or to the (now confirmed, D-086) plan
+# prices at all.
 DEFAULT_BUDGET_LIMIT_UNITS = 100
 JOB_MODE_BUDGET_COST = {"quick": 1, "standard": 2, "pro": 4}
 

@@ -48,19 +48,33 @@ modes.json) and each script's own --help text (V2.11 cli.py) - into static
 HTML, sitemap.xml and robots.txt. Neither live source is duplicated as a
 second hand-copied value anywhere in this file.
 
-Pricing (dollar amounts, billing cadence) is deliberately never rendered:
-content.PRICING_PUBLISHED is False because no real amounts are confirmed yet
-for either potential distribution path - see content.py's own module
-docstring and PRICING_PUBLISHED comment. The pricing page shows tier NAMES
-and FEATURE differences only, with an internal CTA (content.CTA_ANALYZE) -
-see content.py for how to activate real prices later.
+Pricing (D-086, docs/decisiones.md): content.PRICING_PUBLISHED is True -
+Diego confirmed real monthly/annual amounts, rendered from content.
+PRICING_TIERS (see content.py's own module docstring on why publishing a
+price is a content decision, independent of whether Checkout is live).
+The pricing page shows tier NAMES, FEATURE differences AND real prices.
 
-Standard library only. No network access, no LLM calls, no accounts,
-no payment logic. Python 3.8+.
+BLACK FRIDAY IS A RUNTIME, NOT BUILD-TIME, PRESENTATION CONCERN (D-087 -
+this replaced an earlier build-time-only design, D-086, that had a real
+staleness bug: a site built before 2026-11-23 would never show the
+campaign at all without a rebuild exactly at the boundary). This
+generator now emits ONE small, inline, vanilla-JS snippet - the site's
+first and only JavaScript - see render_black_friday_script()'s own
+docstring for the full design (fail-hidden default, UTC-safe by
+construction, no discount logic of any kind, structurally incapable of
+discounting a monthly price). is_black_friday_window() below remains a
+correct, independently tested pure function but is no longer used to
+gate anything rendered here - kept as a small reusable utility, not
+dead code removed for its own sake.
+
+Standard library only (Python side - no new pip dependency). No network
+access, no accounts, no payment logic, no discount mechanism of any
+kind. Python 3.8+.
 """
 from __future__ import annotations
 
 import argparse
+import datetime
 import importlib
 import json
 import os
@@ -400,6 +414,27 @@ def _cta_link(cta: "tuple[str, str]", css_class: str = "button secondary") -> st
     return '<a class="%s" href="%s">%s</a>' % (css_class, escape(href), escape(label))
 
 
+def is_black_friday_window(now: "datetime.datetime", enabled: bool, start: Optional[str], end: Optional[str]) -> bool:
+    """D-086: PRESENTATION ONLY - whether THIS BUILD should show the Black
+    Friday notice, decided once at build time (a static site has no
+    per-request clock - see module docstring). start/end are raw
+    BLACK_FRIDAY_START/END env var strings (ISO-8601, matching backend/
+    main.py's own _utc_datetime_env() format) - malformed/missing values
+    resolve to "not shown" rather than failing the whole site build, since
+    getting this wrong has no security consequence (backend/black_friday.py
+    is the real, independently-re-checked enforcement point)."""
+    if not enabled or not start or not end:
+        return False
+    try:
+        start_dt = datetime.datetime.fromisoformat(start)
+        end_dt = datetime.datetime.fromisoformat(end)
+    except ValueError:
+        return False
+    if start_dt.tzinfo is None or end_dt.tzinfo is None:
+        return False
+    return start_dt <= now <= end_dt
+
+
 def render_app_cta(app_base_url: Optional[str], label: str, css_class: str = "button") -> str:
     """The ONE conditional external link this site ever renders - see
     module docstring's Phase 6C note and content.py's own comment above
@@ -587,6 +622,53 @@ def render_developers_html(cli_entries: List[Dict[str, str]]) -> str:
     )
 
 
+# D-087: the pure boundary check, shipped verbatim inside the inline
+# <script> render_pricing_html() emits below AND executed as-is (via
+# Node, no browser needed) by tests/test_website_black_friday_runtime.py
+# - the tested code IS the shipped code, never a hand-copied second
+# version that could drift. Deliberately takes nowMs as a parameter
+# (never reads Date.now() itself) so it stays a pure, trivially testable
+# function; the tiny caller below it is the only place that touches the
+# real clock or the DOM.
+BLACK_FRIDAY_BOUNDARY_CHECK_JS = (
+    "function isBlackFridayActive(nowMs, startMs, endMs) { return nowMs >= startMs && nowMs <= endMs; }"
+)
+
+
+def render_black_friday_script() -> str:
+    """D-087: RUNTIME (not build-time) Black Friday presentation - fixes
+    the staleness bug a build-time-only check had (see content.py's own
+    comment above BLACK_FRIDAY_START_UTC and build_site.py's module
+    docstring). Every element that should only be visible during the
+    campaign carries data-bf-presentation and starts `hidden` (the safe,
+    fail-hidden default if JS never runs - "before/after campaign: no
+    banner" is what a visitor sees either way); every element that should
+    be hidden ONCE the campaign is confirmed active (the normal annual
+    price, replaced by the first-year price) carries data-bf-normal.
+    Monthly price cells carry NEITHER attribute anywhere in this file -
+    structurally incapable of ever presenting a discount, not merely
+    prevented by this check. Date.now()/Date.parse() are both inherently
+    UTC (epoch milliseconds) regardless of the visitor's own browser
+    timezone - no separate UTC handling is needed or done here. This
+    script only ever changes what is SHOWN - it has no reference to
+    Stripe, a Price ID, a coupon, or any discount MECHANISM; the actual
+    discount is decided exclusively by backend/black_friday.py on the
+    server, re-checked on every real Checkout request - see that
+    module's own docstring."""
+    return (
+        "<script>\n(function() {\n"
+        '  var BF_START = Date.parse(%s);\n'
+        '  var BF_END = Date.parse(%s);\n'
+        "  %s\n"
+        "  if (!isBlackFridayActive(Date.now(), BF_START, BF_END)) { return; }\n"
+        '  var show = document.querySelectorAll("[data-bf-presentation]");\n'
+        "  for (var i = 0; i < show.length; i++) { show[i].hidden = false; }\n"
+        '  var hide = document.querySelectorAll("[data-bf-normal]");\n'
+        "  for (var j = 0; j < hide.length; j++) { hide[j].hidden = true; }\n"
+        "})();\n</script>\n"
+    ) % (json.dumps(c.BLACK_FRIDAY_START_UTC), json.dumps(c.BLACK_FRIDAY_END_UTC), BLACK_FRIDAY_BOUNDARY_CHECK_JS)
+
+
 def render_pricing_html(tiers: List[Dict[str, Any]], app_base_url: Optional[str] = None) -> str:
     rows = []
     for key, label in _FEATURE_LABELS:
@@ -602,28 +684,61 @@ def render_pricing_html(tiers: List[Dict[str, Any]], app_base_url: Optional[str]
             cells.append("<td>%s</td>" % escape(text))
         rows.append('<tr><th scope="row">%s</th>%s</tr>' % (escape(label), "".join(cells)))
     header_cells = "".join('<th scope="col">%s</th>' % escape(t["mode"].capitalize()) for t in tiers)
-    price_row = ""
+    price_rows = ""
+    black_friday_notice = ""
+    black_friday_script = ""
     if c.PRICING_PUBLISHED:
-        price_cells = []
+        monthly_cells, annual_cells = [], []
         for tier in tiers:
             cfg = next((p for p in c.PRICING_TIERS if p["mode"] == tier["mode"]), None)
-            price = cfg["price"] if cfg else None
-            price_cells.append("<td>%s</td>" % escape(price if price else "Contact"))
-        price_row = '<tr><th scope="row">Price</th>%s</tr>\n' % "".join(price_cells)
+            monthly_price = escape(cfg["price_monthly"] if cfg else "Contact")
+            monthly_cells.append("<td>%s</td>" % monthly_price)
+            annual_price = escape(cfg["price_annual"] if cfg else "Contact")
+            if cfg and tier["mode"] in c.BLACK_FRIDAY_FIRST_YEAR_PRICES:
+                bf_price = escape(c.BLACK_FRIDAY_FIRST_YEAR_PRICES[tier["mode"]])
+                annual_cells.append(
+                    '<td><span data-bf-normal>%s</span>'
+                    '<span data-bf-presentation hidden>%s first year (%s)</span></td>'
+                    % (annual_price, bf_price, escape(c.BLACK_FRIDAY_RENEWAL_NOTE))
+                )
+            else:
+                annual_cells.append("<td>%s</td>" % annual_price)
+        price_rows = (
+            '<tr><th scope="row">Price (monthly)</th>%s</tr>\n'
+            '<tr><th scope="row">Price (annual)</th>%s</tr>\n'
+        ) % ("".join(monthly_cells), "".join(annual_cells))
+        # D-087: ALWAYS rendered (never gated on this build's own clock -
+        # see render_black_friday_script()'s own docstring) - `hidden` by
+        # default, revealed only by that script, only inside a visitor's
+        # own browser, only during the real campaign window.
+        black_friday_notice = (
+            '<div class="notice" data-bf-presentation hidden>\n<h2>Black Friday - 30%% off the first year</h2>\n'
+            "<p>Annual plans only. %s</p>\n</div>\n"
+        ) % escape(c.BLACK_FRIDAY_RENEWAL_NOTE)
+        black_friday_script = render_black_friday_script()
     app_cta = render_app_cta(app_base_url, c.APP_CTA_GET_STARTED_LABEL, "button")
+    bf_cta_badge = (
+        '<span class="notice" data-bf-presentation hidden>Black Friday: 30% off annual</span>' if c.PRICING_PUBLISHED else ""
+    )
     return (
         '<section class="section wrap">\n<h1>Pricing</h1>\n'
-        '<p class="section-intro">Tier names match the product\'s own analysis modes one-to-one.</p>\n'
+        '<p class="section-intro">%s</p>\n'
         '<div class="notice">%s</div>\n'
+        "%s"
         "</section>\n"
         '<section class="section wrap">\n'
         '<div class="table-scroll"><table class="tier-comparison">\n'
         '<thead><tr><th scope="col">Feature</th>%s</tr></thead>\n'
         "<tbody>\n%s%s\n</tbody>\n"
         "</table></div>\n"
-        '<p class="cta">%s %s</p>\n'
+        '<p class="cta">%s %s %s</p>\n'
+        "%s"
         "</section>\n"
-    ) % (escape(c.PRICING_UNCONFIRMED_NOTE), header_cells, price_row, "\n".join(rows), _cta_link(c.CTA_ANALYZE, "button"), app_cta)
+    ) % (
+        escape(c.PRICING_NOTE), escape(c.NO_TRIAL_NOTE), black_friday_notice,
+        header_cells, price_rows, "\n".join(rows), _cta_link(c.CTA_ANALYZE, "button"), app_cta, bf_cta_badge,
+        black_friday_script,
+    )
 
 
 def render_faq_html() -> str:
@@ -668,7 +783,9 @@ def render_refund_html() -> str:
 _BUILD_ENVS = ("dev", "staging", "production")
 
 
-def build_site(out_dir: str, base_url: Optional[str] = None, app_url: Optional[str] = None, env: str = "dev") -> Dict[str, str]:
+def build_site(
+    out_dir: str, base_url: Optional[str] = None, app_url: Optional[str] = None, env: str = "dev",
+) -> Dict[str, str]:
     """Generates the static site into out_dir. Returns {relative_path: absolute_path}
     for every file written (pages + sitemap.xml + robots.txt + static assets).
     Pure function of content.py + config/modes.json + each script's own
@@ -686,7 +803,14 @@ def build_site(out_dir: str, base_url: Optional[str] = None, app_url: Optional[s
     BuildSiteError immediately if missing - a staging/production build must
     never silently ship without knowing where its own login CTA points, and
     must never silently fall back to a guessed/hardcoded domain either (see
-    content.py's own comment above APP_BASE_URL_ENV)."""
+    content.py's own comment above APP_BASE_URL_ENV).
+
+    D-087: this function is NOT parameterized by "now" for Black Friday
+    presentation - that would reintroduce the exact staleness bug D-087
+    fixes (a build's own clock, frozen at build time, going stale the
+    moment real time crosses the campaign boundary). Black Friday
+    presentation is entirely a RUNTIME concern now - see
+    render_pricing_html()/render_black_friday_script()."""
     if env not in _BUILD_ENVS:
         raise BuildSiteError("env must be one of %r, got %r" % (_BUILD_ENVS, env))
     site_base_url = (base_url or os.environ.get(c.BASE_URL_ENV) or c.DEFAULT_BASE_URL).rstrip("/")

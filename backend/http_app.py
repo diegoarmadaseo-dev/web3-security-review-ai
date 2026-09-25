@@ -177,6 +177,7 @@ import os
 import re
 import sys
 import threading
+from datetime import datetime, timezone
 from http import cookies as http_cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -185,6 +186,7 @@ from urllib.parse import parse_qs, quote, unquote_plus, urlparse
 import backend.alerting as alerting
 import backend.auth as auth
 import backend.billing as billing_module
+import backend.black_friday as black_friday
 import backend.db as db
 import backend.object_storage as object_storage
 import backend.repository as repo
@@ -456,6 +458,7 @@ def _upsert_entitlement(
     stripe_subscription_id: Optional[str],
     current_period_end: Optional[str],
     event_created_at: Optional[str],
+    interval: Optional[str] = None,
 ) -> None:
     """Shared by every branch of _apply_webhook_event() below that carries
     an authoritative subscription status. Checks existence FIRST (rather
@@ -472,14 +475,22 @@ def _upsert_entitlement(
     row to update (should never happen for a session/subscription this
     backend itself created, since billing.StripeBilling.
     create_checkout_session() always stamps workspace_id/plan into
-    metadata) is silently skipped rather than guessed at."""
+    metadata) is silently skipped rather than guessed at.
+
+    interval (D-086) is validated here - not just plan - before ever
+    reaching repository.py: an unrecognized/missing value is passed
+    through as None (repository.py's own CHECK constraint would reject
+    anything else at the CREATE path anyway; validating here keeps a
+    malformed metadata value from ever reaching that far)."""
     if not workspace_id:
         return
+    if interval not in ("monthly", "annual"):
+        interval = None
     if repo.get_entitlement_by_workspace(conn, workspace_id) is None:
         if plan in ("quick", "standard", "pro"):
-            repo.create_entitlement(conn, workspace_id, plan, status, stripe_customer_id, stripe_subscription_id, current_period_end, event_created_at)
+            repo.create_entitlement(conn, workspace_id, plan, status, stripe_customer_id, stripe_subscription_id, current_period_end, event_created_at, billing_interval=interval)
         return
-    repo.update_entitlement_status(conn, workspace_id, status, current_period_end, event_created_at)
+    repo.update_entitlement_status(conn, workspace_id, status, current_period_end, event_created_at, billing_interval=interval)
 
 
 def _apply_webhook_event(conn: Any, event_type: str, obj: Dict[str, Any], event_created_at: Optional[str]) -> None:
@@ -522,6 +533,9 @@ def _apply_webhook_event(conn: Any, event_type: str, obj: Dict[str, Any], event_
         metadata = obj.get("metadata") or {}
         workspace_id = obj.get("client_reference_id")
         plan = metadata.get("plan")
+        interval = metadata.get("interval")
+        if interval not in ("monthly", "annual"):
+            interval = None
         if workspace_id and plan in ("quick", "standard", "pro") and repo.get_entitlement_by_workspace(conn, workspace_id) is None:
             repo.create_entitlement(
                 conn,
@@ -531,6 +545,7 @@ def _apply_webhook_event(conn: Any, event_type: str, obj: Dict[str, Any], event_
                 stripe_customer_id=obj.get("customer"),
                 stripe_subscription_id=obj.get("subscription"),
                 stripe_event_created_at=event_created_at,
+                billing_interval=interval,
             )
     elif event_type in _SUBSCRIPTION_EVENT_TYPES:
         # A canceled subscription's own status is already 'canceled' on
@@ -549,6 +564,7 @@ def _apply_webhook_event(conn: Any, event_type: str, obj: Dict[str, Any], event_
             stripe_subscription_id=obj.get("id"),
             current_period_end=billing_module.subscription_period_end(obj),
             event_created_at=event_created_at,
+            interval=metadata.get("interval"),
         )
     elif event_type == "invoice.paid":
         workspace_id = billing_module.invoice_workspace_id(obj)
@@ -569,6 +585,10 @@ def make_handler(
     storage: Optional["object_storage.ObjectStorage"] = None,
     alert_sender: Optional["alerting.AlertSender"] = None,
     in_flight: Optional[_InFlightTracker] = None,
+    black_friday_enabled: bool = False,
+    black_friday_start: Optional[datetime] = None,
+    black_friday_end: Optional[datetime] = None,
+    black_friday_promotion_code_id: Optional[str] = None,
 ) -> type:
     """Returns a fresh Handler class closed over this specific server
     instance's config - never module-level globals, so multiple servers
@@ -586,7 +606,15 @@ def make_handler(
     which is already a no-op when it is None. in_flight is OPTIONAL,
     normally supplied by run_server() below (never constructed directly
     by a caller of make_handler() itself - see _InFlightTracker's own
-    docstring)."""
+    docstring).
+
+    black_friday_* (Phase 7, D-086) are ALL optional, defaulting to fully
+    disabled (enabled=False, everything else None) - a deployment/test
+    that never configures the campaign gets ordinary Checkout behavior,
+    unchanged. Passed straight through to backend.black_friday.
+    resolve_promotion_code() on every /billing/checkout call - see that
+    module's own docstring on why this is re-evaluated per-request,
+    never cached or trusted from the client."""
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "backend-auth/2026.1"
@@ -1279,6 +1307,18 @@ def make_handler(
                 if entitlement is None or entitlement["status"] not in ("active", "trialing"):
                     self._send_json(402, {"ok": False, "error": "this workspace has no active subscription"})
                     return
+                # P0 plan authorization (D-086): the ONLY place that
+                # decides whether an entitlement's plan may run a given
+                # mode - repo.PLAN_ALLOWED_MODES is the single source of
+                # truth (see that mapping's own docstring). An unknown
+                # plan (should never happen - entitlements.plan has its
+                # own CHECK constraint - defensive only) fails closed via
+                # .get(plan, frozenset()), never an unbounded/implicit
+                # allow. Never trusts the client's own request in any way
+                # beyond the mode value itself, already validated above.
+                if mode not in repo.PLAN_ALLOWED_MODES.get(entitlement["plan"], frozenset()):
+                    self._send_json(403, {"ok": False, "error": "mode not included in the current plan"})
+                    return
                 idempotency_key = client_idempotency_key or repo.new_id()
                 existing = repo.get_job_by_idempotency_key(conn, idempotency_key)
                 if existing is not None:
@@ -1342,8 +1382,12 @@ def make_handler(
                 return
             workspace_id = payload.get("workspace_id") if isinstance(payload, dict) else None
             plan = payload.get("plan") if isinstance(payload, dict) else None
+            interval = payload.get("interval") if isinstance(payload, dict) else None
             if not isinstance(workspace_id, str) or not workspace_id:
                 self._send_json(400, {"ok": False, "error": "workspace_id is required"})
+                return
+            if interval not in ("monthly", "annual"):
+                self._send_json(400, {"ok": False, "error": "interval must be one of monthly/annual"})
                 return
             host = self.headers.get("Host", "")
             if host.split(":")[0] not in host_allowlist:
@@ -1367,16 +1411,28 @@ def make_handler(
                 scheme = "https" if secure_cookies else "http"
                 success_path = auth.validate_redirect_path(payload.get("success_path") if isinstance(payload, dict) else None)
                 cancel_path = auth.validate_redirect_path(payload.get("cancel_path") if isinstance(payload, dict) else None)
+                # Black Friday (D-086): re-evaluated fresh on EVERY
+                # request, from server-side config/clock only - payload
+                # carries no discount/coupon/campaign-flag field of any
+                # kind, and none is ever read here. See backend/
+                # black_friday.py's own docstring on why this is safe
+                # regardless of what the website currently shows/showed.
+                promotion_code_id = black_friday.resolve_promotion_code(
+                    interval, datetime.now(timezone.utc),
+                    black_friday_enabled, black_friday_start, black_friday_end, black_friday_promotion_code_id,
+                )
                 try:
                     session = billing.create_checkout_session(
                         plan=plan,
+                        interval=interval,
                         workspace_id=workspace_id,
                         success_url="%s://%s%s" % (scheme, host, success_path),
                         cancel_url="%s://%s%s" % (scheme, host, cancel_path),
                         customer_id=existing["stripe_customer_id"] if existing is not None else None,
+                        black_friday_promotion_code_id=promotion_code_id,
                     )
                 except billing_module.PriceNotAllowedError:
-                    self._send_json(400, {"ok": False, "error": "unknown plan"})
+                    self._send_json(400, {"ok": False, "error": "unknown plan or billing interval"})
                     return
                 self._send_json(200, {"ok": True, "checkout_url": session.get("url")})
             except Exception:
@@ -1544,9 +1600,16 @@ def run_server(
     billing: Optional["billing_module.StripeBilling"] = None,
     storage: Optional["object_storage.ObjectStorage"] = None,
     alert_sender: Optional["alerting.AlertSender"] = None,
+    black_friday_enabled: bool = False,
+    black_friday_start: Optional[datetime] = None,
+    black_friday_end: Optional[datetime] = None,
+    black_friday_promotion_code_id: Optional[str] = None,
 ) -> ThreadingHTTPServer:
     in_flight = _InFlightTracker()
-    handler_cls = make_handler(connect_fn, email_sender, host_allowlist, secure_cookies, billing, storage, alert_sender, in_flight)
+    handler_cls = make_handler(
+        connect_fn, email_sender, host_allowlist, secure_cookies, billing, storage, alert_sender, in_flight,
+        black_friday_enabled, black_friday_start, black_friday_end, black_friday_promotion_code_id,
+    )
     server = ThreadingHTTPServer((host, port), handler_cls)
     server.in_flight_tracker = in_flight  # see get_in_flight_count() and _InFlightTracker's own docstring.
     return server

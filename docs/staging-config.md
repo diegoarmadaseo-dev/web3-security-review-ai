@@ -23,6 +23,7 @@ for the full detail on each.
 | PostgreSQL | A disposable/cheap managed instance (or the same provider's free/staging tier) - never the production database. | Managed, backed up (see `backend/backup_postgres.py`). |
 | S3-compatible storage | A disposable bucket, ideally with a lifecycle rule auto-expiring objects after a few days (belt-and-suspenders alongside `RETENTION_DAYS`, which this repo never sets by default - see `docs/production-config.md`). | The real production bucket. |
 | Alerts | A real webhook (`ALERT_SENDER_MODE=webhook`) pointed at a staging-only channel, so staging noise never pages whoever watches production alerts. | Production on-call channel. |
+| Black Friday backend gate (D-086) | Leave `BLACK_FRIDAY_ENABLED` unset for ordinary staging work; enable with a TEST PromotionCode id only for a dedicated campaign drill. Website presentation needs no config either way (D-087, runtime-evaluated - see below). | Real dates (2026-11-23 00:00 UTC -> 2026-11-30 23:59:59 UTC), a real, already-configured Stripe PromotionCode id. |
 
 ## Checklist
 
@@ -41,7 +42,8 @@ for the full detail on each.
 
 ### Stripe (TEST mode)
 - `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET` - **DIEGO**: from Stripe's TEST mode dashboard.
-- `STRIPE_PRICE_QUICK` / `STANDARD` / `PRO` - **DIEGO**: TEST mode Price IDs. Real dollar amounts are still Diego's own business decision (`docs/decisiones.md`'s Phase 6 audit entries) - a TEST Price can carry ANY placeholder amount, since no real charge is possible in test mode.
+- `STRIPE_PRICE_QUICK_MONTHLY` / `_ANNUAL`, `STANDARD_MONTHLY` / `_ANNUAL`, `PRO_MONTHLY` / `_ANNUAL` (6 total, D-086) - **DIEGO**: TEST mode Price IDs, 3 Products x 2 Prices each (never 6 Products - see `docs/decisiones.md` D-086). Real amounts are confirmed (D-086: $19/$39/$79 monthly, $190/$390/$790 annual) but a TEST Price can carry any placeholder amount, since no real charge is possible in test mode.
+- `BLACK_FRIDAY_ENABLED` / `_START` / `_END` / `_PROMOTION_CODE_ID` (D-086) - **DIEGO**: leave `BLACK_FRIDAY_ENABLED` unset/false for ordinary staging; set all four (a TEST-mode PromotionCode id for the last one) only when specifically drilling the campaign flow. See `docs/production-config.md`'s own Black Friday section for the exact validation rules.
 
 ### LLM
 - `LLM_API_KEY` - **DIEGO**: a real Anthropic key (staging analysis is real analysis, not mocked, per the task's own "capped real LLM" requirement).
@@ -63,6 +65,7 @@ for the full detail on each.
 ### Website build
 - `VERICEXA_BASE_URL` - **DIEGO**: the staging domain (`https://staging.<real-domain>`).
 - `VERICEXA_APP_URL` (Phase 6C) - **DIEGO**: the staging web container's own public URL. Build with `--env staging` (`python website/build_site.py --env staging --app-url https://staging-app.<real-domain>`) so a missing value fails the build loudly instead of silently shipping without a login CTA - see `website/build_site.py`'s own docstring.
+- Black Friday presentation needs **no build/env configuration at all** (Phase 7, D-087 - supersedes an earlier build-time-env-var design, D-086, that had a real staleness bug: a site built before the campaign start would never show it without a rebuild exactly at that moment). `website/content.py`'s `BLACK_FRIDAY_START_UTC`/`END_UTC` are fixed, source-controlled constants; a small inline script evaluates them against the VISITOR's own browser clock at RUNTIME on every page load - always correct, any day, with zero staging/production difference to configure. Still PRESENTATION ONLY - `backend/black_friday.py` remains the real, independently-configured enforcement point (see above).
 
 ## What "capped real LLM" means operationally
 

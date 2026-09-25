@@ -89,6 +89,9 @@ CREATE TABLE entitlements (
     -- Phase 3 (backend/migrations/0004_entitlement_event_provenance.sql's
     -- mirror): ordering baseline against stale/out-of-order webhooks.
     stripe_event_created_at     TEXT,
+    -- Phase 7 (backend/migrations/0007_billing_interval.sql's mirror):
+    -- 'monthly'/'annual', nullable - see that migration's own comment.
+    billing_interval            TEXT CHECK (billing_interval IN ('monthly', 'annual')),
     created_at                  TEXT NOT NULL,
     updated_at                  TEXT NOT NULL
 );
