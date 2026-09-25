@@ -11,11 +11,13 @@ Run from the repository root: python -m unittest
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WEBSITE_DIR = REPO_ROOT / "website"
@@ -60,8 +62,17 @@ LOCAL_PATH_PATTERN = re.compile(r"[A-Za-z]:\\Users\\|/home/[a-zA-Z0-9_-]+/|/User
 
 
 def _build(tmp_dir: str, **kwargs):
+    """Isolated from the real process environment for BOTH url env vars
+    (VERICEXA_BASE_URL neutralized by always supplying an explicit
+    base_url; VERICEXA_APP_URL - Phase 6C - by explicitly popping it for
+    the duration) so this suite's result never depends on ambient
+    environment state, e.g. a real VERICEXA_APP_URL exported for an actual
+    staging build running on the same machine/CI."""
     kwargs.setdefault("base_url", TEST_BASE_URL)
-    return bs.build_site(tmp_dir, **kwargs)
+    kwargs.setdefault("app_url", None)
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop(content.APP_BASE_URL_ENV, None)
+        return bs.build_site(tmp_dir, **kwargs)
 
 
 class TierComparisonDriftTests(unittest.TestCase):
@@ -587,6 +598,111 @@ class InternalCtaTests(unittest.TestCase):
                 with self.subTest(page=name, href=href):
                     self.assertFalse(href.startswith("http"))
                     self.assertIn(href, written_names)
+
+
+class AppCtaTests(unittest.TestCase):
+    """Phase 6C (docs/decisiones.md D-084): the one conditional, config-gated
+    external CTA to the standalone backend's own /auth/login. Off by
+    default (byte-identical to pre-Phase-6C output); explicit opt-in only."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+
+    def _pages(self, **kwargs):
+        written = _build(self._tmp.name, **kwargs)
+        return {name: Path(path).read_text(encoding="utf-8") for name, path in written.items() if name.endswith(".html")}
+
+    def test_unconfigured_dev_build_renders_no_app_cta_anywhere(self):
+        pages = self._pages()
+        for name, html in pages.items():
+            with self.subTest(page=name):
+                self.assertNotIn(content.APP_LOGIN_PATH, html)
+                self.assertNotIn(content.APP_CTA_LOGIN_LABEL, html)
+                self.assertNotIn(content.APP_CTA_GET_STARTED_LABEL, html)
+
+    def test_configured_app_url_renders_exact_login_href_on_home_and_pricing(self):
+        app_url = "https://app.example-vericexa.invalid"
+        pages = self._pages(app_url=app_url)
+        expected_href = 'href="%s%s"' % (app_url, content.APP_LOGIN_PATH)
+        self.assertIn(expected_href, pages["index.html"])
+        self.assertIn(content.APP_CTA_LOGIN_LABEL, pages["index.html"])
+        self.assertIn(expected_href, pages["pricing.html"])
+        self.assertIn(content.APP_CTA_GET_STARTED_LABEL, pages["pricing.html"])
+
+    def test_app_url_trailing_slash_never_produces_a_double_slash(self):
+        pages = self._pages(app_url="https://app.example-vericexa.invalid/")
+        self.assertIn('href="https://app.example-vericexa.invalid/auth/login"', pages["index.html"])
+        self.assertNotIn("//auth/login", pages["index.html"])
+
+    def test_app_url_env_var_is_honored_when_no_explicit_arg_given(self):
+        written_paths = {}
+        with mock.patch.dict(os.environ, {content.APP_BASE_URL_ENV: "https://env.example-vericexa.invalid"}):
+            written = bs.build_site(self._tmp.name, base_url=TEST_BASE_URL)
+            written_paths = {name: Path(path).read_text(encoding="utf-8") for name, path in written.items() if name.endswith(".html")}
+        self.assertIn('href="https://env.example-vericexa.invalid/auth/login"', written_paths["index.html"])
+
+    def test_staging_env_without_app_url_fails_clearly(self):
+        with self.assertRaises(bs.BuildSiteError):
+            _build(self._tmp.name, env="staging")
+
+    def test_production_env_without_app_url_fails_clearly(self):
+        with self.assertRaises(bs.BuildSiteError):
+            _build(self._tmp.name, env="production")
+
+    def test_staging_env_with_app_url_succeeds(self):
+        pages = self._pages(env="staging", app_url="https://staging.example-vericexa.invalid")
+        self.assertIn("auth/login", pages["index.html"])
+
+    def test_unrecognized_env_value_fails_clearly_never_silently_ignored(self):
+        with self.assertRaises(bs.BuildSiteError):
+            _build(self._tmp.name, env="not-a-real-env")
+
+    def test_no_stray_external_href_beyond_the_one_configured_app_login_link(self):
+        app_url = "https://app.example-vericexa.invalid"
+        pages = self._pages(app_url=app_url)
+        expected = "%s%s" % (app_url, content.APP_LOGIN_PATH)
+        for name, html in pages.items():
+            hrefs = re.findall(r'<a\b[^>]*\bhref="(https?://[^"]+)"', html)
+            with self.subTest(page=name):
+                for href in hrefs:
+                    self.assertEqual(href, expected)
+
+
+class LegalPlaceholderPagesTests(unittest.TestCase):
+    """Phase 6C (D-084): cookies.html/refund.html are new structural
+    placeholders ONLY - clearly marked, no invented policy text - and
+    legal.html/privacy.html's own pre-existing substantive claims are
+    untouched by this phase (see build_site.py's own Phase 6C docstring
+    note on why that revision stays a separate, deliberate decision)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.written = _build(self._tmp.name)
+        self.pages = {name: Path(path).read_text(encoding="utf-8") for name, path in self.written.items() if name.endswith(".html")}
+
+    def test_cookies_and_refund_pages_are_written_and_linked(self):
+        self.assertIn("cookies.html", self.written)
+        self.assertIn("refund.html", self.written)
+        for name, html in self.pages.items():
+            with self.subTest(page=name):
+                self.assertIn('href="cookies.html"', html)
+                self.assertIn('href="refund.html"', html)
+
+    def test_cookies_and_refund_pages_carry_the_placeholder_marker(self):
+        self.assertIn(content.PLACEHOLDER_MARKER, self.pages["cookies.html"])
+        self.assertIn(content.PLACEHOLDER_MARKER, self.pages["refund.html"])
+
+    def test_legal_and_privacy_pages_keep_their_pre_existing_claims_unmodified(self):
+        self.assertIn(
+            "does not process payments, create accounts, or run the analysis engine itself",
+            self.pages["legal.html"],
+        )
+        self.assertIn(
+            "The pages on this site are static: they set no cookies",
+            self.pages["privacy.html"],
+        )
 
 
 class KeywordPlacementTests(unittest.TestCase):

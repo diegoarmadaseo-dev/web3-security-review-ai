@@ -1,0 +1,96 @@
+# Minimal, reproducible web/API role image (Phase 6C, docs/decisiones.md
+# D-084). Runs ONLY `python -m backend.main` with ROLE=web baked in - the
+# public HTTP server (backend/http_app.py). This is a DIFFERENT container
+# from backend/docker/Dockerfile.worker: that one builds the image the
+# ROLE=worker SUPERVISOR spawns ONE PER JOB for isolated analysis (never
+# public-facing, no HTTP, egress-proxy-only network - see that file's own
+# docstring). This image is the opposite shape: it never touches Docker,
+# never executes submitted contract source, and is the thing a load
+# balancer points untrusted public traffic at - see backend/main.py's own
+# module docstring on why splitting these two capabilities into separate
+# processes/images is a deliberate SECURITY boundary, not a convenience.
+#
+# BUILD (from the REPO ROOT - needs both backend/ and the one config file
+# below as build context):
+#   docker build -f backend/docker/Dockerfile.web -t vericexa-web:local .
+#
+# RUN (ROLE is already baked in; every other variable in
+# docs/production-config.md's "HTTP server"/"Database"/"Object storage"/
+# "Stripe billing"/"Alerting"/"Email" sections is supplied at RUN time,
+# never baked into this image):
+#   docker run -p 8080:8080 \
+#     -e DATABASE_URL=... -e HOST_ALLOWLIST=... \
+#     -e S3_BUCKET=... -e S3_REGION=... \
+#     -e STRIPE_SECRET_KEY=... -e STRIPE_WEBHOOK_SECRET=... \
+#     -e STRIPE_PRICE_QUICK=... -e STRIPE_PRICE_STANDARD=... -e STRIPE_PRICE_PRO=... \
+#     vericexa-web:local
+#
+# BASE IMAGE: python:3.11-slim-bookworm - same pinned tag family as
+# Dockerfile.worker, for the same reproducibility reasoning documented
+# there (Debian release + Python minor version pinned; exact digest is a
+# deployer/CI concern, not hardcoded here without querying it).
+#
+# NO WORKER PRIVILEGES, BY CONSTRUCTION, NOT BY POLICY ALONE: this
+# Dockerfile never installs the Docker CLI/SDK, never declares a volume for
+# /var/run/docker.sock, and never copies .claude/skills/web3-auditor/scripts/
+# (the analyzer code that actually executes/inspects submitted contract
+# source - see backend/worker_entrypoint.py). A process started from this
+# image has no code path that could even ATTEMPT to launch a container or
+# execute submitted source, regardless of how it is run - the one thing a
+# deployer must still do correctly is never bind-mount the Docker socket
+# into a container from this image (see docs/deployment.md's own explicit
+# warning on this exact point).
+#
+# SAME PRODUCTION DEPENDENCIES AS backend/requirements.txt, reused rather
+# than hand-copied (psycopg for backend/db.py's Postgres adapter, stripe
+# for backend/billing.py, boto3 for backend/object_storage.py's S3Storage) -
+# no `anthropic` SDK here (that is worker-image-only, see Dockerfile.worker;
+# ROLE=web never calls an LLM provider).
+#
+# config/modes.json (NOT the rest of .claude/skills/web3-auditor/) is
+# copied in because backend/http_app.py's own _load_modes_config() reads it
+# directly as JSON, best-effort, for entitlement/limit reporting on
+# GET /workspaces/<id> - see that function's own docstring. No Python
+# script from the Skill is ever imported by ROLE=web.
+#
+# NON-ROOT RUNTIME: a dedicated, unprivileged `appuser` owns /app and is
+# the container's own USER - ROLE=web accepts untrusted public HTTP input,
+# so running as root inside the container would be a real, avoidable
+# privilege-escalation surface even though this image never gets Docker
+# access at the host level either way (defense in depth, not redundant).
+#
+# HEALTHCHECK uses backend/http_app.py's own GET /health (see that route's
+# docstring: always 200, touches nothing) via stdlib urllib - no curl/wget
+# dependency added just for this. Matches HTTP_PORT's own documented
+# default (docs/production-config.md); override HEALTHCHECK in compose/
+# orchestrator config if HTTP_PORT is set to something else.
+#
+# NO CREDENTIALS BAKED IN: nothing below ever COPYs a credential or sets an
+# ENV/ARG with a real secret value - every secret in docs/production-
+# config.md arrives only at container RUNTIME, via `docker run -e` (or an
+# orchestrator's own secret-injection mechanism), never a file in this
+# image.
+
+FROM python:3.11-slim-bookworm
+
+WORKDIR /app
+
+RUN groupadd --system appuser && useradd --system --gid appuser --home /app appuser
+
+COPY backend/requirements.txt /app/backend/requirements.txt
+RUN pip install --no-cache-dir -r /app/backend/requirements.txt
+
+COPY backend/ /app/backend/
+COPY .claude/skills/web3-auditor/config/modes.json /app/.claude/skills/web3-auditor/config/modes.json
+RUN touch /app/backend/__init__.py \
+    && chown -R appuser:appuser /app
+
+USER appuser
+
+ENV ROLE=web
+ENV PYTHONUNBUFFERED=1
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).status == 200 else 1)"]
+
+ENTRYPOINT ["python", "-m", "backend.main"]

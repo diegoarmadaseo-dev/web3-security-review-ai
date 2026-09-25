@@ -8,24 +8,33 @@ itself: this file still renders no accounts, no payment UI, no storage, no
 hosted-analyzer-execution UI of its own - it remains a thin, PUBLIC, static
 layer. Per the SEO-fixes pass, the public site names or links no external
 distribution mechanism anywhere: every CTA is an internal Vericexa page
-(content.CTA_ANALYZE/CTA_DEMO/CTA_HOW_IT_WORKS), and the only remaining
-dynamic surface it links to is the stateless W-03 endpoint (server.py).
+(content.CTA_ANALYZE/CTA_DEMO/CTA_HOW_IT_WORKS) except the one conditional
+app-login CTA described in the Phase 6C note below (never a third-party
+marketplace), and the only remaining dynamic surface it links to is the
+stateless W-03 endpoint (server.py).
 
 Phase 5 note (docs/decisiones.md D-077 follow-up): a THIRD-PARTY marketplace
 (docs/capafy-notas.md, capafy/pricing.md) is no longer the only mechanism
 that can own auth/billing/tiers/execution - an independent standalone-SaaS
 backend now exists (backend/http_app.py, backend/billing.py, backend/
-worker_supervisor.py, Phases 1-4). This generator is not wired to either one
-yet (still zero accounts/payment/execution UI here) - which mechanism is
-actually live, and whether/how a CTA here should eventually point at the
-standalone backend's own GET /auth/login entry point, is a business/legal
-decision Diego has not made yet (see legal.html/privacy.html's own current,
-unmodified claims that this site "does not process payments, create
-accounts, or run the analysis engine itself" - a live signup CTA on this
-site would need those claims revisited FIRST, not silently). Not decided by
-this pass. Whichever mechanism is confirmed, it is still disclosed BY FACT in
-legal.html/privacy.html, generically worded per content.py's LEGAL_SECTIONS/
-PRIVACY_SECTIONS - never removed, never named as a brand on the public site.
+worker_supervisor.py, Phases 1-4).
+
+Phase 6C note (docs/decisiones.md D-084): this generator now HAS a
+config-gated capability to link the standalone backend's own GET
+/auth/login entry point (content.APP_BASE_URL_ENV / --app-url below), but
+it remains OFF by default - build_site() with no app URL configured
+renders byte-identical output to before this phase, no dead/placeholder
+link anywhere. Whether/when to actually set that env var for a real
+deploy is still the business/legal decision Diego has not made yet (see
+legal.html/privacy.html's own current, unmodified claims that this site
+"does not process payments, create accounts, or run the analysis engine
+itself" - a LIVE signup CTA would need those claims revisited FIRST, not
+silently as a side effect of setting an env var). --env staging/production
+fails the build loudly if the app URL is missing, precisely so that
+choice can never happen by accident either way. Whichever mechanism is
+confirmed, it is still disclosed BY FACT in legal.html/privacy.html,
+generically worded per content.py's LEGAL_SECTIONS/PRIVACY_SECTIONS -
+never removed, never named as a brand on the public site.
 
 All brand/copy/feature-status/pricing facts live in website/content.py (one
 place to edit, never restated here - same single-source-of-truth discipline
@@ -165,7 +174,7 @@ def render_footer_html() -> str:
 
     product = [p for p in c.ALL_PAGES if p[0] in ("features.html", "demo.html", "methodology.html", "pricing.html")]
     developer = [p for p in c.ALL_PAGES if p[0] in ("developers.html", "faq.html")]
-    legal = [p for p in c.ALL_PAGES if p[0] in ("legal.html", "privacy.html", "disclaimer.html")]
+    legal = [p for p in c.ALL_PAGES if p[0] in ("legal.html", "privacy.html", "disclaimer.html", "cookies.html", "refund.html")]
     return (
         '<footer class="site-footer">\n<div class="wrap">\n'
         '<div class="footer-grid">\n'
@@ -388,14 +397,27 @@ def _cta_link(cta: "tuple[str, str]", css_class: str = "button secondary") -> st
     return '<a class="%s" href="%s">%s</a>' % (css_class, escape(href), escape(label))
 
 
-def render_home_html() -> str:
+def render_app_cta(app_base_url: Optional[str], label: str, css_class: str = "button") -> str:
+    """The ONE conditional external link this site ever renders - see
+    module docstring's Phase 6C note and content.py's own comment above
+    APP_BASE_URL_ENV. Returns "" (nothing at all - never a dead/placeholder
+    href) when app_base_url is falsy, so an unconfigured build's output is
+    byte-identical to before this function existed."""
+    if not app_base_url:
+        return ""
+    href = app_base_url.rstrip("/") + c.APP_LOGIN_PATH
+    return '<a class="%s" href="%s">%s</a>' % (css_class, escape(href), escape(label))
+
+
+def render_home_html(app_base_url: Optional[str] = None) -> str:
     diffs = "\n".join("<li>%s</li>" % escape(d) for d in c.DIFFERENTIATORS)
+    app_cta = render_app_cta(app_base_url, c.APP_CTA_LOGIN_LABEL, "button")
     return (
         '<section class="hero wrap">\n'
         "<h1>%s</h1>\n"
         '<p class="tagline">%s</p>\n'
         '<div class="notice">%s</div>\n'
-        '<div class="cta">%s %s</div>\n'
+        '<div class="cta">%s %s %s</div>\n'
         "%s"
         "</section>\n"
 
@@ -421,7 +443,7 @@ def render_home_html() -> str:
         "</section>\n"
     ) % (
         escape(c.HOME_HEADLINE), escape(c.POSITIONING_TAGLINE), escape(c.NOT_AN_AUDIT_NOTE),
-        _cta_link(c.CTA_ANALYZE, "button"), _cta_link(c.CTA_DEMO), illo_hero_flow(),
+        _cta_link(c.CTA_ANALYZE, "button"), _cta_link(c.CTA_DEMO), app_cta, illo_hero_flow(),
         escape(c.BRAND_NAME), escape(c.WHO_ITS_FOR), diffs,
         escape(c.LLM_PROCESSING_NOTE), escape(c.RETENTION_NOTE),
     )
@@ -562,7 +584,7 @@ def render_developers_html(cli_entries: List[Dict[str, str]]) -> str:
     )
 
 
-def render_pricing_html(tiers: List[Dict[str, Any]]) -> str:
+def render_pricing_html(tiers: List[Dict[str, Any]], app_base_url: Optional[str] = None) -> str:
     rows = []
     for key, label in _FEATURE_LABELS:
         cells = []
@@ -585,6 +607,7 @@ def render_pricing_html(tiers: List[Dict[str, Any]]) -> str:
             price = cfg["price"] if cfg else None
             price_cells.append("<td>%s</td>" % escape(price if price else "Contact"))
         price_row = '<tr><th scope="row">Price</th>%s</tr>\n' % "".join(price_cells)
+    app_cta = render_app_cta(app_base_url, c.APP_CTA_GET_STARTED_LABEL, "button")
     return (
         '<section class="section wrap">\n<h1>Pricing</h1>\n'
         '<p class="section-intro">Tier names match the product\'s own analysis modes one-to-one.</p>\n'
@@ -595,9 +618,9 @@ def render_pricing_html(tiers: List[Dict[str, Any]]) -> str:
         '<thead><tr><th scope="col">Feature</th>%s</tr></thead>\n'
         "<tbody>\n%s%s\n</tbody>\n"
         "</table></div>\n"
-        '<p class="cta">%s</p>\n'
+        '<p class="cta">%s %s</p>\n'
         "</section>\n"
-    ) % (escape(c.PRICING_UNCONFIRMED_NOTE), header_cells, price_row, "\n".join(rows), _cta_link(c.CTA_ANALYZE, "button"))
+    ) % (escape(c.PRICING_UNCONFIRMED_NOTE), header_cells, price_row, "\n".join(rows), _cta_link(c.CTA_ANALYZE, "button"), app_cta)
 
 
 def render_faq_html() -> str:
@@ -627,19 +650,50 @@ def render_disclaimer_html() -> str:
     return _sections_page("Disclaimer", c.DISCLAIMER_SECTIONS)
 
 
+def render_cookies_html() -> str:
+    return _sections_page("Cookies", c.COOKIES_SECTIONS)
+
+
+def render_refund_html() -> str:
+    return _sections_page("Refund & Cancellation", c.REFUND_SECTIONS)
+
+
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def build_site(out_dir: str, base_url: Optional[str] = None) -> Dict[str, str]:
+_BUILD_ENVS = ("dev", "staging", "production")
+
+
+def build_site(out_dir: str, base_url: Optional[str] = None, app_url: Optional[str] = None, env: str = "dev") -> Dict[str, str]:
     """Generates the static site into out_dir. Returns {relative_path: absolute_path}
     for every file written (pages + sitemap.xml + robots.txt + static assets).
     Pure function of content.py + config/modes.json + each script's own
     --help output (plus SITE_LAST_UPDATED, a manually-bumped constant, never
     datetime.now()) - no network, no account/session state. No external
-    checkout/marketplace URL is accepted or rendered anywhere - every CTA is
-    one of content.py's internal-only CTA_* constants."""
+    checkout/marketplace URL is accepted or rendered anywhere except the one
+    conditional app-login CTA (content.APP_BASE_URL_ENV / app_url below,
+    Phase 6C) - every other CTA is one of content.py's internal-only CTA_*
+    constants.
+
+    app_url (or the VERICEXA_APP_URL env var) is OPTIONAL for env="dev" (the
+    default): omitting it simply renders no app CTA anywhere, byte-identical
+    to this function's pre-Phase-6C output - never a dead/placeholder link.
+    For env="staging"/"production" it is REQUIRED and this function raises
+    BuildSiteError immediately if missing - a staging/production build must
+    never silently ship without knowing where its own login CTA points, and
+    must never silently fall back to a guessed/hardcoded domain either (see
+    content.py's own comment above APP_BASE_URL_ENV)."""
+    if env not in _BUILD_ENVS:
+        raise BuildSiteError("env must be one of %r, got %r" % (_BUILD_ENVS, env))
     site_base_url = (base_url or os.environ.get(c.BASE_URL_ENV) or c.DEFAULT_BASE_URL).rstrip("/")
+    app_base_url = (app_url or os.environ.get(c.APP_BASE_URL_ENV) or "").rstrip("/") or None
+    if env != "dev" and not app_base_url:
+        raise BuildSiteError(
+            "env=%r requires an app base URL (--app-url or the %s env var) - "
+            "refusing to build a staging/production site with no configured "
+            "app login destination." % (env, c.APP_BASE_URL_ENV)
+        )
     try:
         modes_config = load_modes_config()
     except ModesConfigError as exc:
@@ -649,16 +703,18 @@ def build_site(out_dir: str, base_url: Optional[str] = None) -> Dict[str, str]:
     cli_entries = collect_cli_reference()
 
     bodies = {
-        "index.html": render_home_html(),
+        "index.html": render_home_html(app_base_url),
         "features.html": render_features_html(),
         "demo.html": render_demo_html(),
         "methodology.html": render_methodology_html(),
         "developers.html": render_developers_html(cli_entries),
-        "pricing.html": render_pricing_html(tiers),
+        "pricing.html": render_pricing_html(tiers, app_base_url),
         "faq.html": render_faq_html(),
         "legal.html": render_legal_html(),
         "privacy.html": render_privacy_html(),
         "disclaimer.html": render_disclaimer_html(),
+        "cookies.html": render_cookies_html(),
+        "refund.html": render_refund_html(),
     }
     extra_jsonld = {"faq.html": seo.faq_jsonld(c.FAQ_ITEMS)}
     pages = {
@@ -715,6 +771,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--out", default=os.path.join(SCRIPT_DIR, "dist"), help="Output directory (default: website/dist).")
     parser.add_argument("--base-url", default=None, help="Canonical site base URL for SEO tags/sitemap (default: %s env var, then %s)." % (c.BASE_URL_ENV, c.DEFAULT_BASE_URL))
+    parser.add_argument("--app-url", default=None, help="Standalone backend's public base URL for the app login CTA (default: %s env var; no other default - see build_site()'s own docstring)." % c.APP_BASE_URL_ENV)
+    parser.add_argument("--env", default="dev", choices=_BUILD_ENVS, help="Build environment (default: dev). staging/production require --app-url or %s to be set, and fail the build otherwise." % c.APP_BASE_URL_ENV)
     return parser
 
 
@@ -723,7 +781,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     try:
-        written = build_site(args.out, base_url=args.base_url)
+        written = build_site(args.out, base_url=args.base_url, app_url=args.app_url, env=args.env)
     except BuildSiteError as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False), file=sys.stdout)
         return EXIT_FAILED

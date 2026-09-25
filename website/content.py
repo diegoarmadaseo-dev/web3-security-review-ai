@@ -42,6 +42,16 @@ DOMAIN = "vericexa.com"
 DEFAULT_BASE_URL = "https://vericexa.com"
 BASE_URL_ENV = "VERICEXA_BASE_URL"
 
+# The standalone backend's own public base URL (Phase 6C, docs/decisiones.md
+# D-084) - e.g. "https://app.vericexa.com". Deliberately has NO default
+# (unlike DEFAULT_BASE_URL above): this is a real deployment's own address,
+# never guessed. Unset by default, so build_site.py's build_site() renders
+# no app CTA at all (never a dead/placeholder link) unless a caller
+# explicitly supplies one - see that function's own docstring on the
+# staging/production fail-fast gate.
+APP_BASE_URL_ENV = "VERICEXA_APP_URL"
+APP_LOGIN_PATH = "/auth/login"  # backend/http_app.py's real GET /auth/login entry point (Phase 5).
+
 # Global positioning line (meta description fallback, footer, Organization/
 # WebApplication JSON-LD). Distinct from HOME_HEADLINE, which is the shorter
 # on-page H1 - both strings were specified verbatim and are kept verbatim.
@@ -84,16 +94,30 @@ FALSE_NEGATIVE_NOTE = "The absence of a reported finding does NOT mean that no v
 SCORE_UNAVAILABLE_NOTE = "Automated deterministic scoring was unavailable in this runtime."
 
 # ---------------------------------------------------------------------------
-# Calls to action - internal Vericexa pages only. No external checkout or
-# marketplace link is rendered anywhere on the public site; the real
-# distribution/billing/LLM-processing mechanism (docs/capafy-notas.md) is
-# disclosed as a fact, not a brand name or link, in legal.html/privacy.html
-# only (see LEGAL_SECTIONS / PRIVACY_SECTIONS).
+# Calls to action - internal Vericexa pages only, plus (Phase 6C) ONE
+# conditional link to the standalone backend's own /auth/login entry point,
+# rendered ONLY when APP_BASE_URL_ENV is actually configured (see
+# build_site.render_app_cta()). Never a third-party marketplace link - the
+# real distribution/billing/LLM-processing mechanism (docs/capafy-notas.md)
+# is disclosed as a fact, not a brand name or link, in legal.html/
+# privacy.html only (see LEGAL_SECTIONS / PRIVACY_SECTIONS).
+#
+# IMPORTANT, CARRIED FORWARD FROM Phase 5 (build_site.py's own prior
+# docstring): legal.html currently states this website "does not process
+# payments, create accounts, or run the analysis engine itself". Actually
+# CONFIGURING APP_BASE_URL_ENV for a real deploy makes that claim false the
+# moment the CTA below goes live - that revision is a business/legal
+# decision for Diego to make deliberately, not a side effect of setting an
+# env var. This phase only builds the config-gated CAPABILITY (off unless
+# explicitly configured); it does not decide to use it and does not touch
+# legal.html/privacy.html's own text.
 # ---------------------------------------------------------------------------
 
 CTA_ANALYZE: Tuple[str, str] = ("Analyze a Contract", "developers.html")
 CTA_DEMO: Tuple[str, str] = ("View Demo", "demo.html")
 CTA_HOW_IT_WORKS: Tuple[str, str] = ("See How It Works", "methodology.html")
+APP_CTA_LOGIN_LABEL = "Sign In"
+APP_CTA_GET_STARTED_LABEL = "Get Started"
 
 # ---------------------------------------------------------------------------
 # Navigation / pages
@@ -114,8 +138,10 @@ ALL_PAGES: List[Tuple[str, str]] = [
     ("legal.html", "Legal"),
     ("privacy.html", "Privacy"),
     ("disclaimer.html", "Disclaimer"),
+    ("cookies.html", "Cookies"),
+    ("refund.html", "Refund & Cancellation"),
 ]
-PRIMARY_NAV_COUNT = 7  # Home..FAQ in the header; Legal/Privacy/Disclaimer live in the footer only.
+PRIMARY_NAV_COUNT = 7  # Home..FAQ in the header; Legal/Privacy/Disclaimer/Cookies/Refund live in the footer only.
 
 PAGE_TITLES: Dict[str, str] = {
     "index.html": "Vericexa - Automated Smart Contract Security Review Platform",
@@ -128,6 +154,8 @@ PAGE_TITLES: Dict[str, str] = {
     "legal.html": "Legal - Vericexa",
     "privacy.html": "Privacy - Vericexa",
     "disclaimer.html": "Disclaimer - Vericexa",
+    "cookies.html": "Cookie Policy - Vericexa",
+    "refund.html": "Refund & Cancellation Policy - Vericexa",
 }
 PAGE_DESCRIPTIONS: Dict[str, str] = {
     "index.html": "Vericexa is an automated, AI-assisted blockchain security platform for Web3 developers, reviewing smart contracts with findings, an Automated Risk Indicator and suggested remediation for Solidity and Vyper.",
@@ -140,6 +168,8 @@ PAGE_DESCRIPTIONS: Dict[str, str] = {
     "legal.html": "Terms governing use of the Vericexa website: content ownership, informational scope, and how the underlying security review product is distributed and governed.",
     "privacy.html": "What data the Vericexa website and its stateless API endpoint do - and do not - process or store.",
     "disclaimer.html": "The full security review disclaimer: scope, limitations, and what an automated, AI-assisted review is not.",
+    "cookies.html": "Cookie policy for the Vericexa website - what this static site does and does not set today, and where the finalized policy will be published.",
+    "refund.html": "Refund and cancellation policy for Vericexa subscriptions - where the finalized policy will be published once confirmed.",
 }
 
 # ---------------------------------------------------------------------------
@@ -403,6 +433,43 @@ DISCLAIMER_SECTIONS: List[Tuple[str, str]] = [
         "No statement on this website or in any report creates a warranty, certification, guarantee, or "
         "an audit performed by a professional.",
     ),
+]
+
+# ---------------------------------------------------------------------------
+# Cookies / Refund - Phase 6C structural placeholders ONLY (docs/decisiones.md
+# D-084). Neither page existed before this phase; legal.html/privacy.html
+# already cover Terms/Privacy in full, so no separate terms.html was added.
+# Every sentence below restates an ALREADY-PUBLISHED fact from PRIVACY_SECTIONS
+# above (this site sets no cookies) or is an explicit, visible placeholder
+# marker - never a new legal/business claim, never an invented policy. Diego
+# must replace PLACEHOLDER_* below with real, reviewed text before either
+# page is considered final - see docs/decisiones.md D-084 and
+# docs/legal-risk-register.md.
+# ---------------------------------------------------------------------------
+
+PLACEHOLDER_MARKER = (
+    "PLACEHOLDER - this section is not yet final. It will be replaced with "
+    "reviewed policy text once confirmed; nothing below should be treated as "
+    "a final legal statement."
+)
+
+COOKIES_SECTIONS: List[Tuple[str, str]] = [
+    (
+        "Current state",
+        "This static website sets no cookies and requires no account or sign-in to read - the same fact "
+        "already stated in Privacy. If a future login/checkout flow on the standalone application "
+        "(separate from this marketing site) sets any cookie, that will be disclosed here before it ships.",
+    ),
+    ("Policy text", PLACEHOLDER_MARKER),
+]
+
+REFUND_SECTIONS: List[Tuple[str, str]] = [
+    (
+        "Status",
+        "No subscription is sold through this website today (see Pricing) - there is nothing to refund or "
+        "cancel yet. A real refund/cancellation policy will be published here before any paid plan goes live.",
+    ),
+    ("Policy text", PLACEHOLDER_MARKER),
 ]
 
 # ---------------------------------------------------------------------------

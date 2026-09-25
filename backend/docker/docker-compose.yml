@@ -1,0 +1,62 @@
+# Minimal, vendor-neutral deployment manifest for the ROLE=web container
+# ONLY (Phase 6C, docs/decisiones.md D-084) - see docs/deployment.md for
+# why ROLE=worker is deliberately NOT a service in this file, and for the
+# full picture (persistent external services, the internal worker/egress
+# Docker network, restart/shutdown/health behavior).
+#
+# Run from the REPO ROOT (the build context both Dockerfiles need):
+#   docker compose -f backend/docker/docker-compose.yml --env-file <your .env> up -d --build
+#
+# Every value below is a REFERENCE to an environment variable - nothing
+# here has a real value baked in (see docs/production-config.md for the
+# full table, docs/staging-config.md for a filled-in-except-secrets
+# staging example). No cloud-vendor-specific field appears anywhere in
+# this file: DATABASE_URL/S3_*/etc. are plain connection strings that work
+# against any provider that speaks Postgres/S3.
+
+services:
+  web:
+    build:
+      context: ../..
+      dockerfile: backend/docker/Dockerfile.web
+    image: vericexa-web:${IMAGE_TAG:-local}
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-8080}:8080"
+    environment:
+      # Required, no default anywhere in the code - see
+      # docs/production-config.md. Left as ${VAR} references on purpose:
+      # this file never carries a real secret.
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      HOST_ALLOWLIST: ${HOST_ALLOWLIST:?HOST_ALLOWLIST is required}
+      S3_BUCKET: ${S3_BUCKET:?S3_BUCKET is required}
+      S3_REGION: ${S3_REGION:?S3_REGION is required}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:?STRIPE_SECRET_KEY is required}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:?STRIPE_WEBHOOK_SECRET is required}
+      STRIPE_PRICE_QUICK: ${STRIPE_PRICE_QUICK:?STRIPE_PRICE_QUICK is required}
+      STRIPE_PRICE_STANDARD: ${STRIPE_PRICE_STANDARD:?STRIPE_PRICE_STANDARD is required}
+      STRIPE_PRICE_PRO: ${STRIPE_PRICE_PRO:?STRIPE_PRICE_PRO is required}
+      # Optional - real defaults documented in docs/production-config.md;
+      # left unset here unless the caller's .env supplies them.
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      SECURE_COOKIES: ${SECURE_COOKIES:-true}
+      HTTP_PORT: ${HTTP_PORT:-8080}
+      SHUTDOWN_GRACE_SECONDS: ${SHUTDOWN_GRACE_SECONDS:-30}
+      ALERT_SENDER_MODE: ${ALERT_SENDER_MODE:-logging}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+      EMAIL_SENDER_MODE: ${EMAIL_SENDER_MODE:-logging}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
+      EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:-}
+    # SHUTDOWN_GRACE_SECONDS above should stay <= this, so Docker's own
+    # SIGKILL never arrives before backend/main.py's own graceful-shutdown
+    # window (_serve_until_shutdown(), Phase 6A) finishes on its own.
+    stop_grace_period: 40s
+    # Uses the image's own HEALTHCHECK (backend/docker/Dockerfile.web) -
+    # nothing to add here; a compose-level healthcheck: override is only
+    # needed to point at a different port/path than that HEALTHCHECK's own
+    # default (8080 /health).
