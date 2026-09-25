@@ -24,17 +24,20 @@ config-gated capability to link the standalone backend's own GET
 /auth/login entry point (content.APP_BASE_URL_ENV / --app-url below), but
 it remains OFF by default - build_site() with no app URL configured
 renders byte-identical output to before this phase, no dead/placeholder
-link anywhere. Whether/when to actually set that env var for a real
-deploy is still the business/legal decision Diego has not made yet (see
-legal.html/privacy.html's own current, unmodified claims that this site
-"does not process payments, create accounts, or run the analysis engine
-itself" - a LIVE signup CTA would need those claims revisited FIRST, not
-silently as a side effect of setting an env var). --env staging/production
-fails the build loudly if the app URL is missing, precisely so that
-choice can never happen by accident either way. Whichever mechanism is
-confirmed, it is still disclosed BY FACT in legal.html/privacy.html,
-generically worded per content.py's LEGAL_SECTIONS/PRIVACY_SECTIONS -
-never removed, never named as a brand on the public site.
+link anywhere. --env staging/production fails the build loudly if the
+app URL is missing, so that choice can never happen by accident either way.
+
+Phase 7 note (docs/decisiones.md D-085): legal.html/privacy.html's own
+claims were the one precondition Phase 6C left unmet before a live CTA -
+that text is now updated (content.py's LEGAL_SECTIONS) to describe the
+separate application by fact, without inventing company identity, a
+retention period, or any other legal claim. Actually setting
+APP_BASE_URL_ENV/VERICEXA_APP_URL for a real deploy is still a separate
+decision Diego has not made - this phase removes the CONTRADICTION, it
+does not enable the CTA. Whichever mechanism is confirmed, it is still
+disclosed BY FACT in legal.html/privacy.html, generically worded per
+content.py's LEGAL_SECTIONS/PRIVACY_SECTIONS - never removed, never named
+as a brand on the public site.
 
 All brand/copy/feature-status/pricing facts live in website/content.py (one
 place to edit, never restated here - same single-source-of-truth discipline

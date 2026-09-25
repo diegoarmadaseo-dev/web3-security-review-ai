@@ -102,15 +102,16 @@ SCORE_UNAVAILABLE_NOTE = "Automated deterministic scoring was unavailable in thi
 # is disclosed as a fact, not a brand name or link, in legal.html/
 # privacy.html only (see LEGAL_SECTIONS / PRIVACY_SECTIONS).
 #
-# IMPORTANT, CARRIED FORWARD FROM Phase 5 (build_site.py's own prior
-# docstring): legal.html currently states this website "does not process
-# payments, create accounts, or run the analysis engine itself". Actually
-# CONFIGURING APP_BASE_URL_ENV for a real deploy makes that claim false the
-# moment the CTA below goes live - that revision is a business/legal
-# decision for Diego to make deliberately, not a side effect of setting an
-# env var. This phase only builds the config-gated CAPABILITY (off unless
-# explicitly configured); it does not decide to use it and does not touch
-# legal.html/privacy.html's own text.
+# Phase 7 (docs/decisiones.md D-085): the "does not... create accounts"
+# contradiction Phase 5/6C flagged here is now resolved - legal.html's
+# "About this website" section (LEGAL_SECTIONS below) was rewritten to
+# describe the separate application by fact, without inventing company
+# identity, VAT/NIF, a retention period, a refund policy, or any DPA/legal
+# claim (still explicitly "pending final legal review"). This is a text
+# fix only - the CTA capability below stays OFF unless APP_BASE_URL_ENV is
+# actually configured, exactly as Phase 6C left it; resolving the legal
+# contradiction is a precondition for a live CTA, not the same decision as
+# actually enabling one.
 # ---------------------------------------------------------------------------
 
 CTA_ANALYZE: Tuple[str, str] = ("Analyze a Contract", "developers.html")
@@ -380,8 +381,11 @@ FAQ_ITEMS: List[Tuple[str, str]] = [
 LEGAL_SECTIONS: List[Tuple[str, str]] = [
     (
         "About this website",
-        "This website (%s) is an informational and marketing site for Vericexa. It does not process payments, "
-        "create accounts, or run the analysis engine itself." % DOMAIN,
+        "This website (%s) is an informational and marketing site for Vericexa. It does not process payments "
+        "or run the analysis engine itself. A separate application, linked from this site, is where a user "
+        "creates or signs in to an account; that application stores workspace and account data. Detailed terms "
+        "governing that application are still pending final legal review and will be published here once "
+        "complete." % DOMAIN,
     ),
     (
         "The product itself",

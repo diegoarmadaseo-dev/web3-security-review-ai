@@ -671,10 +671,12 @@ class AppCtaTests(unittest.TestCase):
 
 class LegalPlaceholderPagesTests(unittest.TestCase):
     """Phase 6C (D-084): cookies.html/refund.html are new structural
-    placeholders ONLY - clearly marked, no invented policy text - and
-    legal.html/privacy.html's own pre-existing substantive claims are
-    untouched by this phase (see build_site.py's own Phase 6C docstring
-    note on why that revision stays a separate, deliberate decision)."""
+    placeholders ONLY - clearly marked, no invented policy text.
+    privacy.html's own pre-existing substantive claims are untouched.
+    legal.html's own account-related claim was DELIBERATELY corrected in
+    Phase 7 (D-085, see build_site.py's own docstring note) - the tests
+    below assert the NEW accurate text and that the old contradictory
+    phrase is gone, never that legal.html itself is unmodified."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -694,15 +696,52 @@ class LegalPlaceholderPagesTests(unittest.TestCase):
         self.assertIn(content.PLACEHOLDER_MARKER, self.pages["cookies.html"])
         self.assertIn(content.PLACEHOLDER_MARKER, self.pages["refund.html"])
 
-    def test_legal_and_privacy_pages_keep_their_pre_existing_claims_unmodified(self):
-        self.assertIn(
-            "does not process payments, create accounts, or run the analysis engine itself",
-            self.pages["legal.html"],
-        )
+    def test_privacy_page_keeps_its_pre_existing_claims_unmodified(self):
         self.assertIn(
             "The pages on this site are static: they set no cookies",
             self.pages["privacy.html"],
         )
+
+
+class LegalAccountClaimCorrectionTests(unittest.TestCase):
+    """Phase 7 (D-085): the "does not... create accounts" contradiction
+    Phase 5/6C flagged (build_site.py's own docstring) is fixed. Asserts
+    the OLD phrase is gone AND the new text is accurate/neutral - not
+    just that something changed."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.written = _build(self._tmp.name)
+        self.legal_html = Path(self.written["legal.html"]).read_text(encoding="utf-8")
+
+    def test_old_contradictory_account_claim_is_gone(self):
+        self.assertNotIn("does not process payments, create accounts", self.legal_html)
+        self.assertNotIn("create accounts, or run the analysis engine itself", self.legal_html)
+
+    def test_new_text_describes_the_separate_application_by_fact(self):
+        self.assertIn("A separate application, linked from this site", self.legal_html)
+        self.assertIn("creates or signs in to an account", self.legal_html)
+        self.assertIn("stores workspace and account data", self.legal_html)
+        self.assertIn("pending final legal review", self.legal_html)
+
+    def test_payments_and_analysis_engine_claims_about_this_site_are_kept(self):
+        # Only the accounts clause was in scope for this phase - the site
+        # itself still does not process payments or run the analyzer.
+        self.assertIn("It does not process payments", self.legal_html)
+        self.assertIn("run the analysis engine itself", self.legal_html)
+
+    def test_no_invented_company_identity_vat_or_legal_claim(self):
+        lowered = self.legal_html.lower()
+        for forbidden in ("nif", "cif", "vat", "gdpr", "dpa", "s.l.", "s.a.", "inc.", "llc"):
+            with self.subTest(term=forbidden):
+                self.assertNotIn(forbidden, lowered)
+
+    def test_no_retention_period_or_refund_policy_invented(self):
+        lowered = self.legal_html.lower()
+        for forbidden in ("30 days", "90 days", "days of retention", "refund within", "money-back"):
+            with self.subTest(term=forbidden):
+                self.assertNotIn(forbidden, lowered)
 
 
 class KeywordPlacementTests(unittest.TestCase):
