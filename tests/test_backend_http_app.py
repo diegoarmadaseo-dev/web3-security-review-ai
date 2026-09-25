@@ -1288,6 +1288,121 @@ class RateLimitAlertTests(_HttpAppTestCase):
         self.assertTrue(any(e[0] == alerting.EVENT_AUTH_RATE_LIMIT for e in alert_sender.events))
 
 
+class _FailingEmailSender:
+    """Same shape as _CapturingEmailSender (records what a real provider
+    adapter would have tried to send, including a working last_token())
+    but THEN raises - simulating a real SMTPEmailSender whose message was
+    fully built before the network call itself failed (docs/decisiones.md
+    D-083)."""
+
+    def __init__(self, exc):
+        self._exc = exc
+        self.sent = []
+
+    def send(self, to_email, subject, body):
+        self.sent.append((to_email, subject, body))
+        raise self._exc
+
+    def last_token(self):
+        _, _, body = self.sent[-1]
+        match = re.search(r"token=([A-Za-z0-9_-]+)", body)
+        return match.group(1) if match else None
+
+
+class EmailDeliveryFailureTests(_HttpAppTestCase):
+    """D-083: a delivery failure from email_sender.send() (e.g. a real
+    SMTPEmailSender) must never crash the request, leak provider detail,
+    or change the token/anti-enumeration guarantees request-link already
+    provides - see backend/http_app.py's _handle_request_link()."""
+
+    def _swap_server(self, email_sender, alert_sender=None):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.httpd = http_app.run_server(
+            connect_fn=lambda: repo.connect(self.db_path), email_sender=email_sender,
+            host_allowlist=[HOST], host=HOST, port=0, secure_cookies=False, alert_sender=alert_sender,
+        )
+        self.port = self.httpd.server_address[1]
+        self.host_header = "%s:%d" % (HOST, self.port)
+        self.same_origin = "http://%s" % self.host_header
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        time.sleep(0.05)
+
+    def test_smtp_style_failure_still_returns_a_clean_200(self):
+        failing = _FailingEmailSender(OSError("connection refused"))
+        self._swap_server(failing)
+        status, _, body = self.post_json("/auth/request-link", {"email": "u@example.com"})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"ok": True, "message": "If that email is registered, a sign-in link has been sent."})
+        self.assertEqual(len(failing.sent), 1)  # delivery WAS attempted, not skipped.
+
+    def test_delivery_failure_response_is_identical_to_a_successful_send(self):
+        success_status, _, success_body = self.post_json("/auth/request-link", {"email": "success@example.com"})
+        failing = _FailingEmailSender(RuntimeError("boom"))
+        self._swap_server(failing)
+        fail_status, _, fail_body = self.post_json("/auth/request-link", {"email": "fails@example.com"})
+        self.assertEqual((success_status, success_body), (fail_status, fail_body))
+
+    def test_anti_enumeration_unchanged_for_known_and_unknown_email_on_failure(self):
+        seed_conn = repo.connect(self.db_path)
+        repo.create_user(seed_conn, "known-fail@example.com")
+        seed_conn.close()
+        failing = _FailingEmailSender(RuntimeError("boom"))
+        self._swap_server(failing)
+        s1, _, b1 = self.post_json("/auth/request-link", {"email": "unknown-fail@example.com"})
+        s2, _, b2 = self.post_json("/auth/request-link", {"email": "known-fail@example.com"})
+        self.assertEqual((s1, b1), (s2, b2))
+
+    def test_provider_exception_message_never_reaches_the_client(self):
+        secret_looking = "535 5.7.8 Authentication failed for user s3cr3t-password"
+        failing = _FailingEmailSender(RuntimeError(secret_looking))
+        self._swap_server(failing)
+        _, _, body = self.post_json("/auth/request-link", {"email": "u@example.com"})
+        self.assertNotIn(b"s3cr3t-password", body)
+        self.assertNotIn(b"Authentication failed", body)
+        self.assertNotIn(b"Traceback", body)
+        self.assertNotIn(b"RuntimeError", body)
+
+    def test_provider_exception_message_never_reaches_the_alert_payload(self):
+        secret_looking = "535 5.7.8 Authentication failed: bad-password-abc"
+        failing = _FailingEmailSender(RuntimeError(secret_looking))
+        alert_sender = _CollectingAlertSender()
+        self._swap_server(failing, alert_sender=alert_sender)
+        self.post_json("/auth/request-link", {"email": "u@example.com"})
+        self.assertEqual(len(alert_sender.events), 1)
+        event_type, severity, detail = alert_sender.events[0]
+        self.assertEqual(event_type, alerting.EVENT_EMAIL_DELIVERY_FAILURE)
+        self.assertEqual(severity, "error")
+        self.assertEqual(detail["error_type"], "RuntimeError")
+        self.assertNotIn("bad-password-abc", repr(detail))
+
+    def test_successful_delivery_emits_no_alert(self):
+        alert_sender = _CollectingAlertSender()
+        self._swap_server(_CapturingEmailSender(), alert_sender=alert_sender)
+        self.post_json("/auth/request-link", {"email": "u@example.com"})
+        self.assertEqual(alert_sender.events, [])
+
+    def test_token_survives_a_failed_delivery_and_still_logs_in_exactly_once(self):
+        # The blocker this fix closes: without a try/except around
+        # email_sender.send(), do_POST's uncaught exception used to abort
+        # the request with no HTTP response at all - never a token-state
+        # problem (request_magic_link() already committed before delivery
+        # is ever attempted), but this proves the token really is
+        # completely unaffected either way: still valid, still single-use.
+        failing = _FailingEmailSender(RuntimeError("boom"))
+        self._swap_server(failing)
+        self.post_json("/auth/request-link", {"email": "u@example.com"})
+        token = failing.last_token()
+        self.assertIsNotNone(token)
+        first_status, first_headers, _ = self.post_form("/auth/verify", {"token": token, "redirect": "/dashboard"})
+        self.assertEqual(first_status, 303)
+        self.assertIn("Set-Cookie", first_headers)
+        second_status, _, second_body = self.post_form("/auth/verify", {"token": token, "redirect": "/dashboard"})
+        self.assertEqual(second_status, 200)
+        self.assertIn(b"invalid or has expired", second_body)
+
+
 class InFlightTrackerTests(unittest.TestCase):
     """Direct tests of backend.http_app._InFlightTracker/get_in_flight_count
     - the primitive backend/main.py's graceful-shutdown drain loop polls.

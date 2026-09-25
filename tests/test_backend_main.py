@@ -29,6 +29,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+import backend.alerting as alerting
 import backend.http_app as http_app
 import backend.main as main
 import backend.repository as repo
@@ -302,6 +303,207 @@ class WorkerShutdownWiringTests(unittest.TestCase):
         self.assertFalse(event.is_set())
         handler(signal.SIGINT, None)
         self.assertTrue(event.is_set())
+
+
+# ---------------------------------------------------------------------------
+# Phase 6B (docs/decisiones.md D-077 follow-up): worker resource config,
+# retention scheduler config, alert/email provider-mode config.
+# ---------------------------------------------------------------------------
+
+class WorkerResourceConfigTests(unittest.TestCase):
+    """default/override/invalid for every value backend/main.py._load_
+    worker_config() now validates - see that function's own docstring on
+    why each default is imported from worker_supervisor.py rather than
+    hand-typed a second time."""
+
+    def test_defaults_match_worker_supervisor_own_hardcoded_constants(self):
+        with patch.dict(os.environ, _FAKE_WORKER_ENV, clear=True):
+            cfg = main._load_worker_config()
+        import backend.worker_supervisor as worker_supervisor
+        self.assertEqual(cfg["memory_limit"], worker_supervisor.DEFAULT_MEMORY_LIMIT)
+        self.assertEqual(cfg["cpu_limit"], worker_supervisor.DEFAULT_CPU_LIMIT)
+        self.assertEqual(cfg["pids_limit"], worker_supervisor.DEFAULT_PIDS_LIMIT)
+        self.assertEqual(cfg["tmpfs_size"], worker_supervisor.DEFAULT_TMPFS_SIZE)
+        self.assertEqual(cfg["wall_clock_timeout_seconds"], worker_supervisor.DEFAULT_WALL_CLOCK_TIMEOUT_SECONDS)
+        self.assertEqual(cfg["output_size_limit_bytes"], worker_supervisor.DEFAULT_OUTPUT_SIZE_LIMIT_BYTES)
+        self.assertEqual(cfg["llm_max_output_tokens"], 8000)
+        self.assertEqual(cfg["llm_per_attempt_timeout_seconds"], 120)
+        self.assertIsNone(cfg["retention_days"])  # unset -> disabled, never a guessed default - see module docstring.
+
+    def test_valid_overrides_are_honored(self):
+        env = dict(_FAKE_WORKER_ENV)
+        env.update({
+            "WORKER_MEMORY_LIMIT": "1g", "WORKER_CPU_LIMIT": "2.5", "WORKER_PIDS_LIMIT": "256",
+            "WORKER_TMPFS_SIZE": "128m", "WORKER_WALL_CLOCK_TIMEOUT_SECONDS": "600",
+            "WORKER_OUTPUT_SIZE_LIMIT_BYTES": "4194304", "LLM_MAX_OUTPUT_TOKENS": "4000",
+            "LLM_PER_ATTEMPT_TIMEOUT_SECONDS": "60",
+        })
+        with patch.dict(os.environ, env, clear=True):
+            cfg = main._load_worker_config()
+        self.assertEqual(cfg["memory_limit"], "1g")
+        self.assertEqual(cfg["cpu_limit"], "2.5")
+        self.assertEqual(cfg["pids_limit"], "256")
+        self.assertEqual(cfg["tmpfs_size"], "128m")
+        self.assertEqual(cfg["wall_clock_timeout_seconds"], 600)
+        self.assertEqual(cfg["output_size_limit_bytes"], 4194304)
+        self.assertEqual(cfg["llm_max_output_tokens"], 4000)
+        self.assertEqual(cfg["llm_per_attempt_timeout_seconds"], 60)
+
+    def test_invalid_byte_size_values_fail_fast(self):
+        for bad in ("", "abc", "-512m", "512x", "0m", "512 m"):
+            env = dict(_FAKE_WORKER_ENV)
+            env["WORKER_MEMORY_LIMIT"] = bad
+            with patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(main.ConfigError, msg="bad=%r" % bad):
+                    main._load_worker_config()
+
+    def test_invalid_cpu_value_fails_fast(self):
+        for bad in ("", "abc", "-1", "0"):
+            env = dict(_FAKE_WORKER_ENV)
+            env["WORKER_CPU_LIMIT"] = bad
+            with patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(main.ConfigError, msg="bad=%r" % bad):
+                    main._load_worker_config()
+
+    def test_invalid_pids_limit_fails_fast(self):
+        for bad in ("", "abc", "-1", "0", "128m"):
+            env = dict(_FAKE_WORKER_ENV)
+            env["WORKER_PIDS_LIMIT"] = bad
+            with patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(main.ConfigError, msg="bad=%r" % bad):
+                    main._load_worker_config()
+
+    def test_non_positive_timeout_and_output_limit_fail_fast(self):
+        for var in ("WORKER_WALL_CLOCK_TIMEOUT_SECONDS", "WORKER_OUTPUT_SIZE_LIMIT_BYTES", "LLM_MAX_OUTPUT_TOKENS", "LLM_PER_ATTEMPT_TIMEOUT_SECONDS"):
+            for bad in ("0", "-5", "not-a-number"):
+                env = dict(_FAKE_WORKER_ENV)
+                env[var] = bad
+                with patch.dict(os.environ, env, clear=True):
+                    with self.assertRaises(main.ConfigError, msg="var=%s bad=%r" % (var, bad)):
+                        main._load_worker_config()
+
+    def test_no_secret_appears_in_any_config_error_message(self):
+        # Confirms these validation errors only ever name the variable
+        # and the (non-secret) value rejected - never anything from
+        # elsewhere in the same environment (e.g. LLM_API_KEY).
+        env = dict(_FAKE_WORKER_ENV)
+        env["WORKER_MEMORY_LIMIT"] = "garbage"
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(main.ConfigError) as ctx:
+                main._load_worker_config()
+        self.assertNotIn(_FAKE_WORKER_ENV["LLM_API_KEY"], str(ctx.exception))
+
+
+class RetentionConfigTests(unittest.TestCase):
+    def test_unset_retention_days_disables_retention(self):
+        with patch.dict(os.environ, _FAKE_WORKER_ENV, clear=True):
+            cfg = main._load_worker_config()
+        self.assertIsNone(cfg["retention_days"])
+
+    def test_valid_retention_days_is_honored(self):
+        env = dict(_FAKE_WORKER_ENV)
+        env["RETENTION_DAYS"] = "90"
+        with patch.dict(os.environ, env, clear=True):
+            cfg = main._load_worker_config()
+        self.assertEqual(cfg["retention_days"], 90)
+        self.assertFalse(cfg["retention_dry_run"])
+
+    def test_invalid_retention_days_fails_fast(self):
+        for bad in ("0", "-1", "abc"):
+            env = dict(_FAKE_WORKER_ENV)
+            env["RETENTION_DAYS"] = bad
+            with patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(main.ConfigError, msg="bad=%r" % bad):
+                    main._load_worker_config()
+
+    def test_retention_dry_run_flag_is_honored(self):
+        env = dict(_FAKE_WORKER_ENV)
+        env["RETENTION_DAYS"] = "30"
+        env["RETENTION_DRY_RUN"] = "true"
+        with patch.dict(os.environ, env, clear=True):
+            cfg = main._load_worker_config()
+        self.assertTrue(cfg["retention_dry_run"])
+
+
+class AlertModeConfigTests(unittest.TestCase):
+    def test_default_mode_is_logging_no_url_required(self):
+        with patch.dict(os.environ, _FAKE_WEB_ENV, clear=True):
+            cfg = main._load_web_config()
+        self.assertEqual(cfg["alert_sender_mode"], "logging")
+        sender = main._build_alert_sender(cfg["alert_sender_mode"], cfg["alert_webhook_url"])
+        self.assertIsInstance(sender, alerting.LoggingAlertSender)
+
+    def test_webhook_mode_without_url_fails_fast(self):
+        env = dict(_FAKE_WEB_ENV)
+        env["ALERT_SENDER_MODE"] = "webhook"
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(main.ConfigError):
+                main._load_web_config()
+
+    def test_webhook_mode_with_url_builds_a_webhook_sender(self):
+        env = dict(_FAKE_WEB_ENV)
+        env["ALERT_SENDER_MODE"] = "webhook"
+        env["ALERT_WEBHOOK_URL"] = "https://example.com/hook"
+        with patch.dict(os.environ, env, clear=True):
+            cfg = main._load_web_config()
+        sender = main._build_alert_sender(cfg["alert_sender_mode"], cfg["alert_webhook_url"])
+        self.assertIsInstance(sender, alerting.WebhookAlertSender)
+
+    def test_unrecognized_mode_fails_fast(self):
+        env = dict(_FAKE_WEB_ENV)
+        env["ALERT_SENDER_MODE"] = "carrier-pigeon"
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(main.ConfigError):
+                main._load_web_config()
+
+    def test_worker_role_shares_the_same_alert_config(self):
+        env = dict(_FAKE_WORKER_ENV)
+        env["ALERT_SENDER_MODE"] = "webhook"
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(main.ConfigError):
+                main._load_worker_config()
+
+
+class EmailModeConfigTests(unittest.TestCase):
+    def test_default_mode_is_logging(self):
+        with patch.dict(os.environ, _FAKE_WEB_ENV, clear=True):
+            cfg = main._load_web_config()
+        self.assertEqual(cfg["email_sender_mode"], "logging")
+        sender = main._build_email_sender(cfg["email_sender_mode"], cfg["smtp_config"])
+        self.assertIsInstance(sender, main.email_sender_module.LoggingEmailSender)
+
+    def test_smtp_mode_missing_any_field_fails_fast(self):
+        base = dict(_FAKE_WEB_ENV)
+        base["EMAIL_SENDER_MODE"] = "smtp"
+        base.update({
+            "SMTP_HOST": "smtp.example.com", "SMTP_USERNAME": "user", "SMTP_PASSWORD": "pw",
+            "EMAIL_FROM_ADDRESS": "noreply@example.com",
+        })
+        for missing in ("SMTP_HOST", "SMTP_USERNAME", "SMTP_PASSWORD", "EMAIL_FROM_ADDRESS"):
+            env = dict(base)
+            del env[missing]
+            with patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(main.ConfigError, msg="missing=%s" % missing):
+                    main._load_web_config()
+
+    def test_smtp_mode_with_complete_config_builds_an_smtp_sender(self):
+        env = dict(_FAKE_WEB_ENV)
+        env["EMAIL_SENDER_MODE"] = "smtp"
+        env.update({
+            "SMTP_HOST": "smtp.example.com", "SMTP_USERNAME": "user", "SMTP_PASSWORD": "pw",
+            "EMAIL_FROM_ADDRESS": "noreply@example.com",
+        })
+        with patch.dict(os.environ, env, clear=True):
+            cfg = main._load_web_config()
+        sender = main._build_email_sender(cfg["email_sender_mode"], cfg["smtp_config"])
+        self.assertIsInstance(sender, main.email_sender_module.SMTPEmailSender)
+
+    def test_unrecognized_mode_fails_fast(self):
+        env = dict(_FAKE_WEB_ENV)
+        env["EMAIL_SENDER_MODE"] = "carrier-pigeon"
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(main.ConfigError):
+                main._load_web_config()
 
 
 if __name__ == "__main__":

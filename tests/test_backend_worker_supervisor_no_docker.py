@@ -13,6 +13,7 @@ Run from the repository root: python -m unittest
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 import threading
 import unittest
@@ -215,6 +216,93 @@ class ShutdownEventTests(unittest.TestCase):
         self.assertTrue(any(e[0] == alerting.EVENT_WORKER_REPEATED_RETRY for e in alert_sender.events), "events=%r" % (alert_sender.events,))
         job = repo.get_job(self.conn, seeded["job_id"])
         self.assertIn(job["status"], ("queued", "failed"))
+
+
+class RetentionSchedulerTests(unittest.TestCase):
+    """Phase 6B (docs/decisiones.md D-077 follow-up): proves run_worker_
+    supervisor_loop() actually invokes backend.retention's purge
+    functions - not just that retention.py works in isolation (already
+    covered by tests/test_backend_retention.py)."""
+
+    def setUp(self):
+        fd, self.db_path = tempfile.mkstemp(suffix=".sqlite3")
+        os.close(fd)
+        os.remove(self.db_path)
+        self.conn = repo.connect(self.db_path)
+        repo.init_schema(self.conn)
+        self.addCleanup(lambda: os.remove(self.db_path) if os.path.exists(self.db_path) else None)
+        self.addCleanup(self.conn.close)
+
+        self.storage_dir = tempfile.mkdtemp(prefix="retention-scheduler-tests-")
+        self.addCleanup(shutil.rmtree, self.storage_dir, True)
+        self.storage = object_storage.LocalFilesystemStorage(self.storage_dir, sign_secret="retention-scheduler-secret")
+
+    def _connect_fn(self):
+        return repo.connect(self.db_path)
+
+    def _seed_old_contract(self):
+        from datetime import datetime, timedelta, timezone
+        import backend.db as db
+
+        user_id = repo.create_user(self.conn, "retention-scheduler@example.com")
+        workspace_id = repo.create_workspace(self.conn, "WS", user_id)
+        storage_ref = object_storage.workspace_key(workspace_id, "sources", repo.new_id())
+        self.storage.put_object(storage_ref, b"contract Old {}", content_type="text/plain")
+        contract_id = repo.create_contract(self.conn, workspace_id, storage_ref, "hash", "A.sol")
+        old_iso = (datetime.now(timezone.utc) - timedelta(days=400)).isoformat()
+        db.execute(self.conn, "UPDATE contracts SET created_at = ? WHERE id = ?", (old_iso, contract_id))
+        self.conn.commit()
+        return {"contract_id": contract_id, "storage_ref": storage_ref}
+
+    def test_retention_days_none_never_purges_anything(self):
+        seeded = self._seed_old_contract()
+        ws.run_worker_supervisor_loop(
+            connect_fn=self._connect_fn, worker_id="w-retention-off", config=_FAKE_CONFIG, storage=self.storage,
+            poll_interval_seconds=0, max_iterations=1, retention_days=None,
+        )
+        self.assertTrue(self.storage.object_exists(seeded["storage_ref"]))  # still there - retention disabled.
+
+    def test_retention_days_set_purges_expired_content_on_the_first_iteration(self):
+        seeded = self._seed_old_contract()
+        alert_sender = _CollectingAlertSender()
+        ws.run_worker_supervisor_loop(
+            connect_fn=self._connect_fn, worker_id="w-retention-on", config=_FAKE_CONFIG, storage=self.storage,
+            poll_interval_seconds=0, max_iterations=1, retention_days=30,
+            retention_check_interval_seconds=3600, alert_sender=alert_sender,
+        )
+        self.assertFalse(self.storage.object_exists(seeded["storage_ref"]))
+        contract = repo.get_contract(self.conn, seeded["contract_id"])
+        self.assertIsNotNone(contract["deleted_at"])
+        self.assertTrue(any(e[0] == alerting.EVENT_RETENTION_PURGE for e in alert_sender.events), "events=%r" % (alert_sender.events,))
+
+    def test_retention_dry_run_never_deletes_but_still_checks(self):
+        seeded = self._seed_old_contract()
+        ws.run_worker_supervisor_loop(
+            connect_fn=self._connect_fn, worker_id="w-retention-dry", config=_FAKE_CONFIG, storage=self.storage,
+            poll_interval_seconds=0, max_iterations=1, retention_days=30, retention_dry_run=True,
+        )
+        self.assertTrue(self.storage.object_exists(seeded["storage_ref"]))  # dry_run - never actually deleted.
+        contract = repo.get_contract(self.conn, seeded["contract_id"])
+        self.assertIsNone(contract["deleted_at"])
+
+    def test_retention_check_interval_prevents_a_redundant_second_scan(self):
+        seeded = self._seed_old_contract()
+        # First iteration purges it AND resets the next-check deadline far
+        # into the future (retention_check_interval_seconds=3600) - a
+        # SECOND iteration right after must not scan again at all. Proven
+        # indirectly: purging an already-purged contract is itself
+        # idempotent (tests/test_backend_retention.py), so this asserts
+        # the more specific, scheduler-level property - no additional
+        # EVENT_RETENTION_PURGE alert fires on the second iteration,
+        # since nothing new should even be looked at.
+        alert_sender = _CollectingAlertSender()
+        ws.run_worker_supervisor_loop(
+            connect_fn=self._connect_fn, worker_id="w-retention-interval", config=_FAKE_CONFIG, storage=self.storage,
+            poll_interval_seconds=0, max_iterations=2, retention_days=30,
+            retention_check_interval_seconds=3600, alert_sender=alert_sender,
+        )
+        purge_events = [e for e in alert_sender.events if e[0] == alerting.EVENT_RETENTION_PURGE]
+        self.assertEqual(len(purge_events), 1, "events=%r" % (alert_sender.events,))
 
 
 if __name__ == "__main__":

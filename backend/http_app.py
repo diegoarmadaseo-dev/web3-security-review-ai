@@ -914,13 +914,37 @@ def make_handler(
                 return
             finally:
                 conn.close()
+            # The token row above is already committed regardless of what
+            # happens next (identical work for a real or fake address -
+            # see request_magic_link()'s own anti-enumeration docstring),
+            # so delivery is attempted unconditionally and a failure below
+            # must never change the response shape - that would both crash
+            # the request (do_POST has no wrapping handler, so an uncaught
+            # SMTPEmailSender exception used to propagate as a raw
+            # traceback with no HTTP response at all) and turn delivery
+            # success/failure into a new enumeration signal. The token
+            # itself needs no special handling on failure: it simply sits
+            # unconsumed until its normal TOKEN_TTL_SECONDS expiry, exactly
+            # like any link a user never clicked - see docs/decisiones.md
+            # D-083.
             scheme = "https" if secure_cookies else "http"
             verify_url = "%s://%s/auth/verify?token=%s" % (scheme, host, quote(token))
-            email_sender.send(
-                auth.normalize_email(email),
-                "Your sign-in link",
-                "Click to sign in (expires in 15 minutes): %s" % verify_url,
-            )
+            try:
+                email_sender.send(
+                    auth.normalize_email(email),
+                    "Your sign-in link",
+                    "Click to sign in (expires in 15 minutes): %s" % verify_url,
+                )
+            except Exception as exc:
+                # TYPE NAME only, never str(exc)/the message body - same
+                # discipline backend/email_sender.SMTPEmailSender and
+                # backend/alerting.WebhookAlertSender already apply, for
+                # the same reason (a provider's own error text can echo
+                # back credentials or the message content).
+                alerting.emit_safe(
+                    alert_sender, alerting.EVENT_EMAIL_DELIVERY_FAILURE, "error",
+                    {"ip": self._client_ip(), "error_type": type(exc).__name__},
+                )
             if is_form:
                 self._send_html(200, _render_request_link_sent_page("If that email is registered, a sign-in link has been sent."))
             else:

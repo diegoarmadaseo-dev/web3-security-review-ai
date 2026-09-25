@@ -83,6 +83,7 @@ from typing import Any, Dict, List, Optional
 import backend.alerting as alerting
 import backend.object_storage as object_storage
 import backend.repository as repo
+import backend.retention as retention
 
 DEFAULT_DOCKER_BINARY = "docker"
 DEFAULT_MEMORY_LIMIT = "512m"
@@ -364,6 +365,9 @@ def run_worker_supervisor_loop(
     max_iterations: Optional[int] = None,
     alert_sender: Optional[alerting.AlertSender] = None,
     shutdown_event: Optional[threading.Event] = None,
+    retention_days: Optional[int] = None,
+    retention_check_interval_seconds: float = 3600.0,
+    retention_dry_run: bool = False,
 ) -> None:
     """Thin polling wrapper - reaps expired leases, then claims/runs at
     most one job, repeating forever (max_iterations=None) or a bounded
@@ -385,13 +389,41 @@ def run_worker_supervisor_loop(
     requeues or fails it exactly as it already does for any other
     process death - lease/reaper semantics remain the ONE recovery
     mechanism for a job in flight when its worker disappears, unchanged
-    by this shutdown path."""
+    by this shutdown path.
+
+    RETENTION SCHEDULER (Phase 6B, docs/decisiones.md D-077 follow-up):
+    retention_days is None by default - retention stays completely
+    disabled (never runs, never even queries) unless a caller (backend/
+    main.py, from the explicit RETENTION_DAYS environment variable)
+    supplies a real value. This is deliberate: this codebase never
+    invents a legal retention period on its own (see backend/
+    retention.py's own module docstring) - "unset" must fail/disable
+    safely, never fall back to some guessed number of days. When set,
+    this loop calls backend.retention.purge_expired_contracts()/
+    purge_expired_reports() at most once every
+    retention_check_interval_seconds (a real Postgres table scan on
+    every 2-second poll iteration would be wasteful) - checked via a
+    plain monotonic deadline local to this loop, reset after each run
+    regardless of whether it found anything to purge. retention_dry_run
+    (also from an explicit environment variable, never invented) lets an
+    operator prove the mechanism runs without deleting anything even
+    once RETENTION_DAYS is set - see backend/retention.py's own purge
+    functions for what dry_run actually does. Uses the SAME per-
+    iteration connection reap/claim already use, never a second one."""
     iterations = 0
+    next_retention_check = 0.0  # 0.0 - due immediately on the very first iteration this process ever runs, if retention_days is configured at all.
     while max_iterations is None or iterations < max_iterations:
         if shutdown_event is not None and shutdown_event.is_set():
             break
         conn = connect_fn()
         try:
+            if retention_days is not None and time.monotonic() >= next_retention_check:
+                contracts_result = retention.purge_expired_contracts(conn, storage, retention_days, dry_run=retention_dry_run)
+                reports_result = retention.purge_expired_reports(conn, storage, retention_days, dry_run=retention_dry_run)
+                next_retention_check = time.monotonic() + retention_check_interval_seconds
+                purged_total = contracts_result.get("purged", 0) + reports_result.get("purged", 0)
+                if purged_total:
+                    alerting.emit_safe(alert_sender, alerting.EVENT_RETENTION_PURGE, "info", {"purged_contracts": contracts_result.get("purged", 0), "purged_reports": reports_result.get("purged", 0)})
             reap_result = repo.reap_expired_jobs(conn)
             if reap_result.get("requeued"):
                 alerting.emit_safe(alert_sender, alerting.EVENT_WORKER_REPEATED_RETRY, "warning", {"requeued": reap_result["requeued"]})

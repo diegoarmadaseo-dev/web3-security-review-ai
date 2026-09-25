@@ -1,0 +1,147 @@
+# Production configuration reference
+
+Every environment variable `backend/main.py` reads, and only what it reads -
+`backend/main.py` is the ONE place in this backend allowed to read
+`os.environ` (see that module's own docstring); every other module takes
+its configuration as explicit constructor arguments. This file documents
+what exists in the code today - it does not invent, recommend, or assume
+any real value (a real Stripe key, a real domain, a real price). See
+`docs/decisiones.md` (D-077 line of work, D-081 Phase 6A, current Phase 6B
+entry) for the design decisions behind each subsystem.
+
+Update this file whenever `backend/main.py`'s own `_load_web_config()`/
+`_load_worker_config()` gain or lose a variable - it must never drift from
+what the code actually reads.
+
+## ROLE dispatch
+
+| Variable | Purpose | Role | Required? | Secret? |
+|---|---|---|---|---|
+| `ROLE` | Selects `web` or `worker` - the two roles never run combined in one process (see `backend/main.py`'s own module docstring on why). | both | Yes, no default | No |
+
+## Database
+
+| Variable | Purpose | Role | Required? | Secret? |
+|---|---|---|---|---|
+| `DATABASE_URL` | PostgreSQL DSN (`backend/db.py`'s `connect_postgres()`). Never falls back to SQLite. | both | Yes | **Yes** |
+
+## HTTP server (ROLE=web)
+
+| Variable | Purpose | Required? | Secret? | Default |
+|---|---|---|---|---|
+| `HOST_ALLOWLIST` | Comma-separated hostnames trusted for the Host header / CSRF Origin check. | Yes | No | - |
+| `SECURE_COOKIES` | `Secure` cookie flag. Set `false` only for plain-HTTP local/staging. | No | No | `true` |
+| `HTTP_HOST` / `HTTP_PORT` | Bind address for the HTTP server. | No | No | `0.0.0.0` / `8080` |
+| `SHUTDOWN_GRACE_SECONDS` | Seconds `_serve_until_shutdown()` waits for in-flight requests to finish after SIGTERM/SIGINT before closing anyway. | No | No | `30` |
+
+## Object storage (both roles)
+
+| Variable | Purpose | Required? | Secret? | Default |
+|---|---|---|---|---|
+| `S3_BUCKET` / `S3_REGION` | `backend/object_storage.S3Storage` target. | Yes | No | - |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | Explicit S3 credentials. If unset, boto3's own default credential chain (IAM role, etc.) applies. | No | **Yes** | - |
+
+## Stripe billing (ROLE=web)
+
+| Variable | Purpose | Required? | Secret? |
+|---|---|---|---|
+| `STRIPE_SECRET_KEY` | Stripe API secret key. | Yes | **Yes** |
+| `STRIPE_WEBHOOK_SECRET` | Verifies `Stripe-Signature` on `/billing/webhook`. | Yes | **Yes** |
+| `STRIPE_PRICE_QUICK` / `STRIPE_PRICE_STANDARD` / `STRIPE_PRICE_PRO` | The only plan-name -> Stripe Price ID mapping (`backend/billing.py`'s `resolve_price_id()`). IDs, not amounts - no price/currency is set anywhere in code. | Yes (all 3) | No |
+
+Business decisions NOT in code (see `docs/decisiones.md`'s Phase 6 audit
+entries): final prices, currency, billing interval, trial period,
+cancellation/refund policy, VAT handling.
+
+## LLM provider (ROLE=worker)
+
+| Variable | Purpose | Required? | Secret? | Default |
+|---|---|---|---|---|
+| `LLM_API_KEY` | Anthropic API key, held only in the worker process's memory and the one job container's stdin - never a host file, never `docker create -e`. | Yes | **Yes** | - |
+| `LLM_MODEL` | Anthropic model id. | Yes | No | - |
+| `LLM_MAX_OUTPUT_TOKENS` | Per-attempt output token cap - read here on the HOST, then passed into the container as the SAME-named env var (`backend/worker_entrypoint.py` reads it back out). | No | No | `8000` |
+| `LLM_PER_ATTEMPT_TIMEOUT_SECONDS` | Per-attempt wall-clock cap for one LLM call. Same host->container name reuse as above. | No | No | `120` |
+| `LLM_API_ALLOWLIST_HOST` / `LLM_API_ALLOWLIST_PORT` | The exact `(host, port)` the egress proxy allows a job container to reach - never a substring/wildcard match. | No | No | `api.anthropic.com` / `443` |
+
+**Not configurable anywhere, by deliberate design**: `MAX_STEP6_ATTEMPTS`
+(`backend/llm_client.py`, hardcoded `3`) - its own comment states it must
+never drift independently from `analyze_pipeline.py`'s own
+SKILL.md-documented "3 attempts total" cap. Per-job spend ceiling
+(`repository.DEFAULT_BUDGET_LIMIT_UNITS = 100`, a units ledger, not a
+dollar figure) is likewise hardcoded today - no environment variable
+exists for it.
+
+## Worker resource limits (ROLE=worker, Phase 6B)
+
+Every default below is imported directly from `backend/worker_supervisor.py`'s
+own `DEFAULT_*` constants - setting none of these reproduces the exact
+pre-Phase-6B behavior.
+
+| Variable | Purpose | Default | Validated as |
+|---|---|---|---|
+| `WORKER_MEMORY_LIMIT` | `docker create --memory` | `512m` | Docker byte-size (`\d+[bkmg]?`) |
+| `WORKER_CPU_LIMIT` | `docker create --cpus` | `1` | positive decimal |
+| `WORKER_PIDS_LIMIT` | `docker create --pids-limit` | `128` | positive integer |
+| `WORKER_TMPFS_SIZE` | `/scratch` tmpfs `size=` | `64m` | Docker byte-size |
+| `WORKER_WALL_CLOCK_TIMEOUT_SECONDS` | Max seconds one job's container may run | `300` | positive integer |
+| `WORKER_OUTPUT_SIZE_LIMIT_BYTES` | Max bytes of container stdout accepted | `2097152` (2 MiB) | positive integer |
+
+All six fail fast (`ConfigError`) on an invalid value - never silently
+clamped or passed through to `docker create` unchecked.
+
+## Egress proxy (ROLE=worker)
+
+| Variable | Purpose | Required? | Default |
+|---|---|---|---|
+| `EGRESS_PROXY_HOST` | The address a job CONTAINER dials to reach the allowlist proxy over the Docker network it joins. No safe default is guessed - Docker network topology is deployment-specific. | Yes | - |
+| `EGRESS_PROXY_PORT` | Port this process itself binds the proxy to (also told to the container as the same value). | No | `0` (OS-assigned) |
+| `WORKER_DOCKER_IMAGE` / `WORKER_NETWORK_NAME` | The built worker image tag and the dedicated, non-default Docker network job containers join. | Yes | - |
+| `WORKER_ID` | This worker instance's own identifier (`analysis_jobs.claimed_by`). | No | `worker-<pid>` |
+
+## Retention (ROLE=worker, Phase 6B)
+
+| Variable | Purpose | Required? | Default |
+|---|---|---|---|
+| `RETENTION_DAYS` | Age (days) past which `backend/retention.py`'s purge functions delete source/report OBJECT CONTENT (never the metadata row). **Unset = retention completely disabled** - this codebase never invents a legal retention period; see `backend/retention.py`'s own module docstring. | No | *(disabled)* |
+| `RETENTION_CHECK_INTERVAL_SECONDS` | How often the worker loop checks whether a purge is due. | No | `3600` |
+| `RETENTION_DRY_RUN` | `true` runs the check without deleting anything - proves the mechanism without risk. | No | `false` |
+
+## Alerting (both roles, Phase 6A/6B)
+
+| Variable | Purpose | Required? | Allowed values |
+|---|---|---|---|
+| `ALERT_SENDER_MODE` | Explicitly selects the alert channel - never inferred from whether a URL happens to be set. | No | `logging` (default), `webhook` |
+| `ALERT_WEBHOOK_URL` | Required only when `ALERT_SENDER_MODE=webhook`. A provider-neutral JSON POST target (Slack/Discord/PagerDuty/custom - any webhook receiver), never a vendor SDK. May itself be secret-bearing (some providers embed a token in the path) - never logged on delivery failure, only the exception type name. | Conditional | - |
+
+## Email (ROLE=web, Phase 6B)
+
+| Variable | Purpose | Required? | Secret? |
+|---|---|---|---|
+| `EMAIL_SENDER_MODE` | Explicitly selects `logging` (dev/test, default - still a legitimate choice for an early deployment) or `smtp` (real delivery). | No | No |
+| `SMTP_HOST` / `SMTP_PORT` | SMTP relay address - works with any provider that exposes one (SES, Postmark, SendGrid, Mailgun, ...). Required only when `EMAIL_SENDER_MODE=smtp`. | Conditional | No |
+| `SMTP_USERNAME` / `SMTP_PASSWORD` | SMTP auth. Required only when `EMAIL_SENDER_MODE=smtp`. Never logged - `backend/email_sender.SMTPEmailSender` logs only the exception type name on failure. | Conditional | **Yes** |
+| `EMAIL_FROM_ADDRESS` | The `From:` address on every sent magic-link email. Required only when `EMAIL_SENDER_MODE=smtp`. | Conditional | No |
+| `SMTP_USE_TLS` | Whether to call `STARTTLS` before authenticating. | No | No (default `true`) |
+
+## Templates
+
+No email template configuration exists - `backend/http_app.py`'s
+`_handle_request_link()` builds the magic-link email's subject/body as a
+plain hardcoded string today (see that function). A real template system
+was not part of this phase's scope.
+
+## Resolved gap (D-083, email hardening)
+
+`backend/http_app.py`'s `_handle_request_link()` previously called
+`email_sender.send()` outside any exception handling - an `SMTPEmailSender`
+delivery failure (vs. the old `LoggingEmailSender`, which could never
+fail) propagated as an unhandled exception with no HTTP response at all
+(`do_POST` has no wrapping handler either). Fixed: `send()` is now called
+inside a try/except that emits `alerting.EVENT_EMAIL_DELIVERY_FAILURE`
+(exception TYPE NAME only, never the message) and always falls through to
+the SAME generic 200 the success path already returns - both closing the
+leak and keeping delivery outcome indistinguishable from account
+existence (anti-enumeration). The `auth_tokens` row itself needs no
+special handling either way: it was already committed before delivery is
+attempted, and simply expires unconsumed like any link a user never
+clicked. See `docs/decisiones.md` D-083.

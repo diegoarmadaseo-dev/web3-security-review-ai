@@ -65,20 +65,27 @@ already in place for any other worker-process death remains the ONLY
 thing that recovers a job whose worker is killed before it finishes -
 see worker_supervisor.run_worker_supervisor_loop()'s own docstring.
 
-ALERTING (Phase 6A) is wired for both roles via backend/alerting.py -
-LoggingAlertSender is the only implementation this phase ships (same
-"known, explicit gap" shape as email delivery below); a real provider
-is a later, explicit deployment decision.
+ALERTING (Phase 6A/6B): ALERT_SENDER_MODE explicitly selects
+LoggingAlertSender (default, dev/test) or backend/alerting.
+WebhookAlertSender (a provider-neutral JSON-POST channel, no vendor SDK)
+- see _load_alert_config(). Shared by both roles.
 
-EMAIL DELIVERY IS A KNOWN, EXPLICIT GAP, not an oversight: backend/
-email_sender.py ships exactly one implementation, LoggingEmailSender,
-whose own docstring says "Never use in production." This file wires it
-anyway (there is nothing else to wire - see that module's docstring on
-why a real provider was deliberately never added without being asked for
-explicitly) and is honest about it in run_web()'s own comment; every
-other piece of the ROLE=web process (auth rate-limiting, session
-issuance, entitlement gating, CSRF/host-header safety) works correctly
-regardless - only actual magic-link email delivery is a stand-in.
+EMAIL (Phase 6B): EMAIL_SENDER_MODE explicitly selects LoggingEmailSender
+(default - still a legitimate choice, e.g. early staging, not merely a
+gap) or backend/email_sender.SMTPEmailSender (works with any provider
+that exposes an SMTP relay - SES/Postmark/SendGrid/etc. - without this
+codebase picking or importing a vendor SDK) - see _load_email_config().
+ROLE=web only.
+
+WORKER RESOURCE LIMITS AND RETENTION (Phase 6B) are both now
+configurable - see _load_worker_config()'s own docstring for exactly
+which variables and why MAX_STEP6_ATTEMPTS (llm_client.py) deliberately
+stays out of that list.
+
+See docs/production-config.md for the full, current table of every
+variable this file reads, purpose/role/required/secret - kept in sync
+with this file by hand; if the two ever disagree, this file (the actual
+code) is authoritative.
 
 Standard library only at this file's own top level, plus whichever of
 psycopg/stripe/boto3 the selected role's config actually constructs
@@ -89,11 +96,12 @@ never silently skipped).
 from __future__ import annotations
 
 import os
+import re
 import signal
 import sys
 import threading
 import time
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Optional
 
 import backend.alerting as alerting
 import backend.billing as billing_module
@@ -135,6 +143,141 @@ def _int_env(name: str, default: int) -> int:
         raise ConfigError("environment variable %s must be an integer, got %r" % (name, value))
 
 
+def _positive_int_env(name: str, default: int) -> int:
+    """Phase 6B: same as _int_env(), plus a > 0 check - every worker
+    resource/timeout limit and retention interval this file validates is
+    nonsensical at zero or negative (a 0-second timeout, a 0-byte output
+    cap), so this is the ONE helper all of them share rather than each
+    repeating its own bounds check."""
+    value = _int_env(name, default)
+    if value <= 0:
+        raise ConfigError("environment variable %s must be a positive integer, got %r" % (name, value))
+    return value
+
+
+def _optional_positive_int_env(name: str) -> Optional[int]:
+    """Returns None if name is unset - the caller (backend/retention.py's
+    RETENTION_DAYS) must treat None as "disabled", never invent a
+    fallback number of days - see _load_worker_config()'s own docstring.
+    Set-but-invalid still fails fast, exactly like every other variable
+    this file validates."""
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise ConfigError("environment variable %s must be an integer, got %r" % (name, value))
+    if parsed <= 0:
+        raise ConfigError("environment variable %s must be a positive integer, got %r" % (name, parsed))
+    return parsed
+
+
+_DOCKER_BYTE_SIZE_RE = re.compile(r"^[1-9]\d*[bkmgBKMG]?$")
+
+
+def _docker_byte_size_env(name: str, default: str) -> str:
+    """Validates the same byte-size syntax `docker create --memory`/
+    `--tmpfs size=` itself accepts (a positive integer with an optional
+    single b/k/m/g suffix) - rejecting a malformed value HERE, before
+    ever handing it to WorkerConfig/`docker create`, is what "invalid
+    values fail fast" means for a string-typed Docker flag: an actual
+    invalid value would otherwise only be caught when `docker create`
+    itself rejects it deep inside a running worker process."""
+    value = os.environ.get(name, default)
+    if not _DOCKER_BYTE_SIZE_RE.match(value):
+        raise ConfigError("environment variable %s must be a positive Docker byte-size value (e.g. '512m'), got %r" % (name, value))
+    return value
+
+
+def _docker_positive_int_string_env(name: str, default: str) -> str:
+    """Same fail-fast validation as _positive_int_env(), but returns the
+    original STRING (WorkerConfig.pids_limit is passed verbatim as a
+    `docker create --pids-limit` argument, never parsed as a Python int
+    itself)."""
+    value = os.environ.get(name, default)
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise ConfigError("environment variable %s must be a positive integer, got %r" % (name, value))
+    if parsed <= 0:
+        raise ConfigError("environment variable %s must be a positive integer, got %r" % (name, value))
+    return value
+
+
+def _docker_cpu_env(name: str, default: str) -> str:
+    """Same shape as _docker_positive_int_string_env(), for
+    WorkerConfig.cpu_limit (`docker create --cpus`, which accepts a
+    decimal like "1.5", not only a whole number)."""
+    value = os.environ.get(name, default)
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise ConfigError("environment variable %s must be a positive number, got %r" % (name, value))
+    if parsed <= 0:
+        raise ConfigError("environment variable %s must be a positive number, got %r" % (name, value))
+    return value
+
+
+_ALERT_SENDER_MODES = ("logging", "webhook")
+_EMAIL_SENDER_MODES = ("logging", "smtp")
+
+
+def _load_alert_config() -> Dict[str, Any]:
+    """Shared by both roles (both construct an alert_sender) - see
+    backend/alerting.py's own module docstring. "logging" (the default)
+    keeps LoggingAlertSender; "webhook" requires ALERT_WEBHOOK_URL and
+    fails fast without it - this is the "production configuration must
+    explicitly distinguish logging vs external sender" requirement:
+    nothing here infers "webhook" just because a URL happens to be set,
+    and nothing silently downgrades an explicit "webhook" choice back to
+    logging when the URL is missing."""
+    mode = os.environ.get("ALERT_SENDER_MODE", "logging")
+    if mode not in _ALERT_SENDER_MODES:
+        raise ConfigError("ALERT_SENDER_MODE must be one of %r, got %r" % (_ALERT_SENDER_MODES, mode))
+    webhook_url = _require_env("ALERT_WEBHOOK_URL") if mode == "webhook" else None
+    return {"alert_sender_mode": mode, "alert_webhook_url": webhook_url}
+
+
+def _build_alert_sender(mode: str, webhook_url: Optional[str]) -> "alerting.AlertSender":
+    if mode == "webhook":
+        return alerting.WebhookAlertSender(webhook_url)
+    return alerting.LoggingAlertSender()
+
+
+def _load_email_config() -> Dict[str, Any]:
+    """ROLE=web only (backend/http_app.py's _handle_request_link() is the
+    one caller of email_sender.send()). Same explicit-mode discipline as
+    _load_alert_config() above: "smtp" requires every SMTP_*/
+    EMAIL_FROM_ADDRESS variable and fails fast if any is missing -
+    "production mode must fail fast if real email delivery is required
+    but not configured". Leaving EMAIL_SENDER_MODE at its "logging"
+    default is still a valid, explicit choice (e.g. an early staging
+    deployment) - see backend/email_sender.py's own module docstring on
+    why LoggingEmailSender remains a legitimate, known gap rather than
+    something this file forces every deployment out of."""
+    mode = os.environ.get("EMAIL_SENDER_MODE", "logging")
+    if mode not in _EMAIL_SENDER_MODES:
+        raise ConfigError("EMAIL_SENDER_MODE must be one of %r, got %r" % (_EMAIL_SENDER_MODES, mode))
+    smtp_config = None
+    if mode == "smtp":
+        smtp_config = {
+            "host": _require_env("SMTP_HOST"),
+            "port": _positive_int_env("SMTP_PORT", 587),
+            "username": _require_env("SMTP_USERNAME"),
+            "password": _require_env("SMTP_PASSWORD"),
+            "from_address": _require_env("EMAIL_FROM_ADDRESS"),
+            "use_tls": _bool_env("SMTP_USE_TLS", True),
+        }
+    return {"email_sender_mode": mode, "smtp_config": smtp_config}
+
+
+def _build_email_sender(mode: str, smtp_config: Optional[Dict[str, Any]]) -> "email_sender_module.EmailSender":
+    if mode == "smtp":
+        return email_sender_module.SMTPEmailSender(**smtp_config)
+    return email_sender_module.LoggingEmailSender()
+
+
 def _connect_fn(database_url: str) -> Callable[[], Any]:
     # A fresh connection per unit of work, never one shared across
     # threads/requests - matches backend/http_app.py's own module
@@ -157,7 +300,7 @@ def _load_web_config() -> Dict[str, Any]:
     host_allowlist = [h.strip() for h in _require_env("HOST_ALLOWLIST").split(",") if h.strip()]
     if not host_allowlist:
         raise ConfigError("HOST_ALLOWLIST must contain at least one hostname")
-    return {
+    cfg = {
         "database_url": _require_env("DATABASE_URL"),
         "host_allowlist": host_allowlist,
         "secure_cookies": _bool_env("SECURE_COOKIES", True),
@@ -176,6 +319,9 @@ def _load_web_config() -> Dict[str, Any]:
         # - "shutdown timeout is configurable" per that phase's own spec.
         "shutdown_grace_seconds": _int_env("SHUTDOWN_GRACE_SECONDS", 30),
     }
+    cfg.update(_load_alert_config())
+    cfg.update(_load_email_config())
+    return cfg
 
 
 def _load_worker_config() -> Dict[str, Any]:
@@ -186,8 +332,29 @@ def _load_worker_config() -> Dict[str, Any]:
     those would fail after a socket was already opened, which the
     original version of this function then had to remember to close on
     every failure path. Validating first means the failure path never
-    has anything to clean up."""
-    return {
+    has anything to clean up.
+
+    WORKER RESOURCE CONFIG (Phase 6B, docs/decisiones.md D-077
+    follow-up): every value below defaults to the EXACT same constant
+    backend/worker_supervisor.py itself already hardcoded (imported from
+    there, never a second hand-typed copy that could drift) - an
+    operator who sets none of these gets byte-identical behavior to
+    before this phase. LLM_MAX_OUTPUT_TOKENS/LLM_PER_ATTEMPT_TIMEOUT_
+    SECONDS deliberately reuse the SAME variable names backend/
+    worker_entrypoint.py already reads INSIDE the container (see that
+    module and build_docker_create_args()) - this is the value crossing
+    from this HOST process's own environment into the container's
+    environment via `docker create -e`, not two unrelated settings that
+    happen to share a name. MAX_STEP6_ATTEMPTS (llm_client.py) is
+    deliberately NOT made configurable here - that module's own comment
+    already states why: it must never drift independently from
+    analyze_pipeline.py's own SKILL.md-documented "3 attempts total" cap,
+    and this phase was explicitly told not to touch analyzer/V3 logic.
+
+    RETENTION (Phase 6B): RETENTION_DAYS is None unless explicitly set -
+    see _optional_positive_int_env()'s own docstring on why "unset" must
+    disable retention rather than invent a legal default."""
+    cfg = {
         "database_url": _require_env("DATABASE_URL"),
         "s3_bucket": _require_env("S3_BUCKET"),
         "s3_region": _require_env("S3_REGION"),
@@ -203,7 +370,20 @@ def _load_worker_config() -> Dict[str, Any]:
         "llm_allowlist_port": _int_env("LLM_API_ALLOWLIST_PORT", 443),
         "llm_api_key": _require_env("LLM_API_KEY"),
         "llm_model": _require_env("LLM_MODEL"),
+        "memory_limit": _docker_byte_size_env("WORKER_MEMORY_LIMIT", worker_supervisor.DEFAULT_MEMORY_LIMIT),
+        "cpu_limit": _docker_cpu_env("WORKER_CPU_LIMIT", worker_supervisor.DEFAULT_CPU_LIMIT),
+        "pids_limit": _docker_positive_int_string_env("WORKER_PIDS_LIMIT", worker_supervisor.DEFAULT_PIDS_LIMIT),
+        "tmpfs_size": _docker_byte_size_env("WORKER_TMPFS_SIZE", worker_supervisor.DEFAULT_TMPFS_SIZE),
+        "wall_clock_timeout_seconds": _positive_int_env("WORKER_WALL_CLOCK_TIMEOUT_SECONDS", worker_supervisor.DEFAULT_WALL_CLOCK_TIMEOUT_SECONDS),
+        "output_size_limit_bytes": _positive_int_env("WORKER_OUTPUT_SIZE_LIMIT_BYTES", worker_supervisor.DEFAULT_OUTPUT_SIZE_LIMIT_BYTES),
+        "llm_max_output_tokens": _positive_int_env("LLM_MAX_OUTPUT_TOKENS", 8000),
+        "llm_per_attempt_timeout_seconds": _positive_int_env("LLM_PER_ATTEMPT_TIMEOUT_SECONDS", 120),
+        "retention_days": _optional_positive_int_env("RETENTION_DAYS"),
+        "retention_check_interval_seconds": _positive_int_env("RETENTION_CHECK_INTERVAL_SECONDS", 3600),
+        "retention_dry_run": _bool_env("RETENTION_DRY_RUN", False),
     }
+    cfg.update(_load_alert_config())
+    return cfg
 
 
 def _build_storage(bucket: str, region: str) -> object_storage.ObjectStorage:
@@ -281,10 +461,8 @@ def run_web() -> None:
     cfg = _load_web_config()
     storage = _build_storage(cfg["s3_bucket"], cfg["s3_region"])
     billing = _build_billing(cfg["stripe_secret_key"], cfg["stripe_webhook_secret"], cfg["stripe_price_allowlist"])
-    # See module docstring on email delivery - this is the only
-    # implementation that exists anywhere in this codebase today.
-    sender = email_sender_module.LoggingEmailSender()
-    alert_sender = alerting.LoggingAlertSender()
+    sender = _build_email_sender(cfg["email_sender_mode"], cfg["smtp_config"])
+    alert_sender = _build_alert_sender(cfg["alert_sender_mode"], cfg["alert_webhook_url"])
 
     httpd = http_app.run_server(
         connect_fn=_connect_fn(cfg["database_url"]),
@@ -310,7 +488,7 @@ def run_web() -> None:
 def run_worker() -> None:
     cfg = _load_worker_config()
     storage = _build_storage(cfg["s3_bucket"], cfg["s3_region"])
-    alert_sender = alerting.LoggingAlertSender()
+    alert_sender = _build_alert_sender(cfg["alert_sender_mode"], cfg["alert_webhook_url"])
 
     proxy = egress_proxy.run_egress_proxy(
         {(cfg["llm_allowlist_host"], cfg["llm_allowlist_port"])}, host="0.0.0.0", port=cfg["proxy_bind_port"]
@@ -334,8 +512,18 @@ def run_worker() -> None:
         proxy_port=actual_proxy_port,
         llm_api_key=cfg["llm_api_key"],
         llm_model=cfg["llm_model"],
+        memory_limit=cfg["memory_limit"],
+        cpu_limit=cfg["cpu_limit"],
+        pids_limit=cfg["pids_limit"],
+        tmpfs_size=cfg["tmpfs_size"],
+        wall_clock_timeout_seconds=cfg["wall_clock_timeout_seconds"],
+        output_size_limit_bytes=cfg["output_size_limit_bytes"],
+        max_output_tokens=cfg["llm_max_output_tokens"],
+        per_attempt_timeout_seconds=cfg["llm_per_attempt_timeout_seconds"],
     )
     sys.stderr.write("backend worker process %r starting (image=%s)\n" % (cfg["worker_id"], config.docker_image))
+    if cfg["retention_days"] is not None:
+        sys.stderr.write("retention enabled: %d day(s), dry_run=%s\n" % (cfg["retention_days"], cfg["retention_dry_run"]))
     shutdown_event = threading.Event()
     _install_shutdown_signal_handlers(shutdown_event)
     try:
@@ -346,6 +534,9 @@ def run_worker() -> None:
             storage=storage,
             alert_sender=alert_sender,
             shutdown_event=shutdown_event,
+            retention_days=cfg["retention_days"],
+            retention_check_interval_seconds=cfg["retention_check_interval_seconds"],
+            retention_dry_run=cfg["retention_dry_run"],
         )
     except KeyboardInterrupt:
         pass
