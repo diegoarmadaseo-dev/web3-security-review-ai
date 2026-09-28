@@ -49,7 +49,21 @@ LLM_API_KEY_FILE, JOB_INPUT_PATH, JOB_OUTPUT_PATH and
 LLM_MOCK_RESPONSES_PATH from the pre-D-079 design are GONE - that data now
 arrives via the stdin envelope instead, never an env var or a file path:
   SOURCE_PATH, SKILL_SCRIPTS_DIR, REPO_ROOT,
-  LLM_MODEL, LLM_MAX_OUTPUT_TOKENS, LLM_PER_ATTEMPT_TIMEOUT_SECONDS.
+  LLM_MODEL, LLM_PROVIDER, LLM_MAX_OUTPUT_TOKENS, LLM_PER_ATTEMPT_TIMEOUT_SECONDS.
+
+PROVIDER SELECTION (docs/decisiones.md, the phase that wired the already-
+validated DeepSeekLLMProvider into this real worker path): LLM_PROVIDER
+selects which concrete backend.llm_client provider class this script
+constructs - "anthropic" (the default, byte-identical to every prior
+deployment that never set this variable) or "deepseek". Any other value
+fails closed with a clear configuration error before any real work
+begins, same "never start a partially prepared job" discipline as
+_read_stdin_envelope()'s own errors - never silently falls back to a
+default a deployer did not ask for. reasoning_effort is NOT a variable
+here: DeepSeekLLMProvider's own constructor default ("low", the value a
+real empirical benchmark validated - see backend/llm_client.py's own
+docstring) is used as-is, since nothing in this codebase yet needs it to
+vary per-deployment.
 """
 from __future__ import annotations
 
@@ -74,6 +88,28 @@ def _write_result(status: str, **fields: Any) -> None:
     payload.update(fields)
     sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
     sys.stdout.flush()
+
+
+def _select_provider(llm_client_module: Any, provider_name: str, api_key: str, model: str) -> Any:
+    """Constructs the real LLMProvider named by provider_name - see module
+    docstring's PROVIDER SELECTION section. A separate, directly-testable
+    function (see tests/test_backend_worker_entrypoint.py) rather than
+    inline in main(), so provider selection can be asserted on in
+    isolation without needing to drive main()'s own stdin/stdout/sys.path
+    setup. llm_client_module is passed in explicitly (never a module-level
+    import here) because main() itself only imports backend.llm_client
+    after inserting REPO_ROOT onto sys.path - see main()'s own comment.
+    Raises llm_client_module.LLMError for an unrecognized name (fail
+    closed, never a silent default) or whichever of that error the
+    underlying provider's own constructor raises (missing package,
+    missing credential)."""
+    if provider_name == "anthropic":
+        return llm_client_module.AnthropicLLMProvider(api_key=api_key, model=model)
+    if provider_name == "deepseek":
+        return llm_client_module.DeepSeekLLMProvider(api_key=api_key, model=model)
+    raise llm_client_module.LLMError(
+        "unknown LLM_PROVIDER %r - must be 'anthropic' or 'deepseek'" % provider_name
+    )
 
 
 class _EnvelopeError(Exception):
@@ -140,8 +176,9 @@ def main() -> int:
     else:
         api_key = envelope.get("llm_api_key")
         model = os.environ.get("LLM_MODEL", "")
+        provider_name = os.environ.get("LLM_PROVIDER", "anthropic")
         try:
-            provider = llm_client.AnthropicLLMProvider(api_key=api_key, model=model)
+            provider = _select_provider(llm_client, provider_name, api_key, model)
         except llm_client.LLMError as exc:
             _write_result("failed", error=str(exc))
             return 1

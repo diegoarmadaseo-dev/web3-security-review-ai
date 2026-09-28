@@ -71,11 +71,12 @@ docstring.
 
 | Variable | Purpose | Required? | Secret? | Default |
 |---|---|---|---|---|
-| `LLM_API_KEY` | Anthropic API key, held only in the worker process's memory and the one job container's stdin - never a host file, never `docker create -e`. | Yes | **Yes** | - |
-| `LLM_MODEL` | Anthropic model id. | Yes | No | - |
+| `LLM_API_KEY` | API key for whichever provider `LLM_PROVIDER` selects, held only in the worker process's memory and the one job container's stdin - never a host file, never `docker create -e`. | Yes | **Yes** | - |
+| `LLM_MODEL` | Model id for whichever provider `LLM_PROVIDER` selects (e.g. an Anthropic Claude model id, or `deepseek-flash` for DeepSeek). | Yes | No | - |
+| `LLM_PROVIDER` | Which concrete `backend.llm_client` provider class `worker_entrypoint.py` constructs - `anthropic` or `deepseek`; any other value fails the job closed with a clear config error before any real work begins. Passed host->container the same way as `LLM_MODEL`. | No | No | `anthropic` |
 | `LLM_MAX_OUTPUT_TOKENS` | Per-attempt output token cap - read here on the HOST, then passed into the container as the SAME-named env var (`backend/worker_entrypoint.py` reads it back out). | No | No | `8000` |
 | `LLM_PER_ATTEMPT_TIMEOUT_SECONDS` | Per-attempt wall-clock cap for one LLM call. Same host->container name reuse as above. | No | No | `120` |
-| `LLM_API_ALLOWLIST_HOST` / `LLM_API_ALLOWLIST_PORT` | The exact `(host, port)` the egress proxy allows a job container to reach - never a substring/wildcard match. | No | No | `api.anthropic.com` / `443` |
+| `LLM_API_ALLOWLIST_HOST` / `LLM_API_ALLOWLIST_PORT` | The exact `(host, port)` the egress proxy allows a job container to reach - never a substring/wildcard match. Must match whichever host `LLM_PROVIDER`'s API actually lives at (e.g. `api.anthropic.com` or `api.deepseek.com`) - this is a separate, host-side-only setting never passed into the container itself (the container only receives `HTTPS_PROXY`, never the allowlist host directly). | No | No | `api.anthropic.com` / `443` |
 
 **Not configurable anywhere, by deliberate design**: `MAX_STEP6_ATTEMPTS`
 (`backend/llm_client.py`, hardcoded `3`) - its own comment states it must

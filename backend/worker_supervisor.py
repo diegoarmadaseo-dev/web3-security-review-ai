@@ -118,6 +118,7 @@ class WorkerConfig:
         proxy_port: int,
         llm_api_key: str,
         llm_model: str,
+        llm_provider: str = "anthropic",
         docker_binary: str = DEFAULT_DOCKER_BINARY,
         memory_limit: str = DEFAULT_MEMORY_LIMIT,
         cpu_limit: str = DEFAULT_CPU_LIMIT,
@@ -136,6 +137,7 @@ class WorkerConfig:
         self.proxy_port = proxy_port
         self.llm_api_key = llm_api_key
         self.llm_model = llm_model
+        self.llm_provider = llm_provider
         self.docker_binary = docker_binary
         self.memory_limit = memory_limit
         self.cpu_limit = cpu_limit
@@ -174,6 +176,7 @@ def build_docker_create_args(config: WorkerConfig, container_name: str) -> List[
         "-e", "HTTPS_PROXY=http://%s:%d" % (config.proxy_host, config.proxy_port),
         "-e", "SOURCE_PATH=%s" % _SOURCE_PATH,
         "-e", "LLM_MODEL=%s" % config.llm_model,
+        "-e", "LLM_PROVIDER=%s" % config.llm_provider,
         "-e", "LLM_MAX_OUTPUT_TOKENS=%d" % config.max_output_tokens,
         "-e", "LLM_PER_ATTEMPT_TIMEOUT_SECONDS=%d" % config.per_attempt_timeout_seconds,
         config.docker_image,

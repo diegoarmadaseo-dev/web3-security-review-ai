@@ -3,9 +3,9 @@
   "mode": "quick",
   "language": "en",
   "targetCategory": "SC02",
-  "allowedCategories": ["SC02"],
+  "allowedCategories": ["SC02", "SC08"],
   "expectedCompleteness": "complete",
   "expectedCompletenessReasonCodes": [],
   "injectionExpected": false,
-  "notes": "release() recomputes vestedAmount() from scratch and pays it out in full every call instead of paying only the delta since the last release, so calling it repeatedly drains far more than the beneficiary is entitled to. No mechanical signal maps to this directly (per checklist.md, SC02 has no reliable mechanical signal) - this case specifically tests business-logic judgment, not signal promotion. block.timestamp is used only in comparison-shaped statements (deadline/elapsed-time checks), the documented non-issue pattern for the timestamp-dependence family."
+  "notes": "release() recomputes vestedAmount() from scratch and pays it out in full every call instead of paying only the delta since the last release, so calling it repeatedly drains far more than the beneficiary is entitled to. No mechanical signal maps to this directly (per checklist.md, SC02 has no reliable mechanical signal) - this case specifically tests business-logic judgment, not signal promotion. block.timestamp is used only in comparison-shaped statements (deadline/elapsed-time checks), the documented non-issue pattern for the timestamp-dependence family. SC08 may legitimately also be reported: release() has zero state tracking of an already-released amount anywhere in the contract, and its external .call happens before any such accounting could exist, so a beneficiary that is itself a contract with reentrant receive/fallback logic can call back into release() and extract the same vestedAmount() again - the identical 'calling it repeatedly drains more than entitled' mechanism this case's own notes already describe, independently reachable via reentrancy, not a separate invented defect."
 }

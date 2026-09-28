@@ -3,9 +3,9 @@
   "mode": "quick",
   "language": "en",
   "targetCategory": "SC03",
-  "allowedCategories": ["SC03", "SC02"],
+  "allowedCategories": ["SC03", "SC02", "SC04"],
   "expectedCompleteness": "complete",
   "expectedCompletenessReasonCodes": [],
   "injectionExpected": false,
-  "notes": "_currentPrice() reads a single pair's instantaneous getReserves() with no TWAP or staleness check, and that price feeds directly into isLiquidatable()/liquidate(). The oracle-usage signal has high fpRisk in general, but here it feeds a critical financial decision directly with no mitigating context, which is exactly the strong corroborating evidence checklist.md asks for before promoting SC03/SC04 above low confidence."
+  "notes": "_currentPrice() reads a single pair's instantaneous getReserves() with no TWAP or staleness check, and that price feeds directly into isLiquidatable()/liquidate(). The oracle-usage signal has high fpRisk in general, but here it feeds a critical financial decision directly with no mitigating context, which is exactly the strong corroborating evidence checklist.md asks for before promoting SC03/SC04 above low confidence. SC04 may legitimately also be reported: checklist.md maps oracle-usage to SC03 and SC04 jointly (same as the sc04_flashloan_priced_mint case's own notes), since an attacker without enough native capital to move collateralPair's reserves can flash-borrow it from an unrelated external provider, skew the reserves within one atomic transaction, and repay - this contract needs no flash-loan code of its own for that to apply."
 }

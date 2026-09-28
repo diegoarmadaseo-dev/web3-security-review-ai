@@ -223,8 +223,14 @@ def _grade_full_report_case(expected: Dict[str, Any]) -> Dict[str, Any]:
 
     if report.get("mode") != expected["mode"]:
         errors.append("mode %r != expected %r" % (report.get("mode"), expected["mode"]))
-    if expected.get("language") and report.get("language") != expected["language"]:
-        errors.append("language %r != expected %r" % (report.get("language"), expected["language"]))
+    # Missing/None language means effective "en" at render time (render_report.py:
+    # `report.get("language") or "en"`, both markdown and HTML output) - compare
+    # that SAME effective value here, never the raw field, or an omitted
+    # (implicitly-English) language incorrectly fails this check against an
+    # "en" expectation even though the product would have rendered it correctly.
+    effective_language = report.get("language") or "en"
+    if expected.get("language") and effective_language != expected["language"]:
+        errors.append("language %r (effective) != expected %r" % (effective_language, expected["language"]))
 
     completeness = (report.get("scope") or {}).get("completeness")
     if completeness != expected["expectedCompleteness"]:

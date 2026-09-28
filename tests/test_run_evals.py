@@ -31,6 +31,44 @@ import run_evals  # noqa: E402
 import score  # noqa: E402
 
 SC_CATEGORIES = ["SC%02d" % n for n in range(1, 11)]
+_UNSET = object()  # sentinel distinct from None, used by LanguageEffectiveComparisonTests._run()
+
+
+class Sc03AllowedCategoriesFixtureTests(unittest.TestCase):
+    """Deliberately checks the REAL evals/expected/sc03_spot_price_liquidation.json
+    content directly (unlike this file's usual synthetic-fixture convention -
+    see module docstring) - a real DeepSeek benchmark run reliably (2/2)
+    produced a well-reasoned SC04 finding alongside SC03 for this case, and
+    checklist.md's own signal table (oracle-usage -> SC03, SC04) confirms
+    that is a legitimate secondary finding, not a hallucination; the sibling
+    sc04_flashloan_priced_mint.json fixture already symmetrically allows
+    SC03. This guards against the asymmetry silently returning."""
+
+    def test_sc03_allowed_categories_includes_sc04(self):
+        path = EVALS_DIR / "expected" / "sc03_spot_price_liquidation.json"
+        with open(path, "r", encoding="utf-8") as f:
+            expected = json.load(f)
+        self.assertIn("SC04", expected["allowedCategories"])
+
+
+class Sc02AllowedCategoriesFixtureTests(unittest.TestCase):
+    """Deliberately checks the REAL evals/expected/sc02_vesting_double_release.json
+    content directly (unlike this file's usual synthetic-fixture convention -
+    see module docstring) - a real DeepSeek benchmark run (Run 4, the real
+    DeepSeekLLMProvider production path) produced a technically accurate SC08
+    finding for this case: release() has zero state tracking of an already-
+    released amount anywhere in the contract, so a reentrant beneficiary can
+    extract the same vestedAmount() repeatedly - the identical "calling it
+    repeatedly drains more than entitled" mechanism this case's own notes
+    already describe for the intended SC02 finding, independently reachable
+    via reentrancy. Guards against the asymmetry silently returning, same
+    convention as Sc03AllowedCategoriesFixtureTests above."""
+
+    def test_sc02_allowed_categories_includes_sc08(self):
+        path = EVALS_DIR / "expected" / "sc02_vesting_double_release.json"
+        with open(path, "r", encoding="utf-8") as f:
+            expected = json.load(f)
+        self.assertIn("SC08", expected["allowedCategories"])
 
 
 def _coverage(detected=None, not_assessed=None):
@@ -264,6 +302,64 @@ class SchemaValidityTests(_TempEvalDirsMixin, unittest.TestCase):
         results = run_evals.run_all()
         self.assertFalse(results[0]["ok"])
         self.assertIn("missing evals/results/actual", results[0]["errors"][0])
+
+
+class LanguageEffectiveComparisonTests(_TempEvalDirsMixin, unittest.TestCase):
+    """Regression tests for the language-comparison fix: this harness must
+    compare the EFFECTIVE language (report.get("language") or "en", the
+    same expression render_report.py itself uses for both markdown and
+    HTML output) against expected, never the raw field. An omitted
+    "language" is not a defect - it is the correct, intentional way to
+    produce an English report (backend/llm_client.py's own prompt tells
+    the model to omit "language" entirely for English source)."""
+
+    def _run(self, name, expected_language, report_language=_UNSET):
+        expected = dict(BASE_EXPECTED, _name=name, language=expected_language)
+        self.write_expected(name, expected)
+        report = make_report(findings=[_finding(category="SC01")], coverage=_coverage(detected=["SC01"]))
+        if report_language is _UNSET:
+            del report["language"]
+        else:
+            report["language"] = report_language
+        self.write_actual(name, report)
+        return run_evals.run_all()[0]
+
+    def test_omitted_language_is_treated_as_effective_en(self):
+        result = self._run("omitted_case", expected_language="en")
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertEqual(result["errors"], [])
+
+    def test_explicit_en_remains_en(self):
+        result = self._run("explicit_en_case", expected_language="en", report_language="en")
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertEqual(result["errors"], [])
+
+    def test_explicit_non_english_language_mismatch_is_still_caught(self):
+        # The fix normalizes only the MISSING case - a report that actually
+        # says "es" when "en" was expected must still fail, never masked.
+        result = self._run("es_mismatch_case", expected_language="en", report_language="es")
+        self.assertFalse(result["ok"])
+        self.assertIn("language 'es' (effective) != expected 'en'", result["errors"][0])
+
+    def test_explicit_matching_non_english_language_passes_unchanged(self):
+        result = self._run("es_match_case", expected_language="es", report_language="es")
+        self.assertTrue(result["ok"], result["errors"])
+        self.assertEqual(result["errors"], [])
+
+    def test_unrelated_detection_mismatch_is_unaffected_by_the_language_fix(self):
+        # Same omitted-language report, but with a real detection mismatch
+        # elsewhere (case expects SC02, report only detects SC01) - proves
+        # the language normalization neither masks nor interacts with any
+        # other check.
+        expected = dict(BASE_EXPECTED, _name="unrelated_case", language="en", targetCategory="SC02")
+        self.write_expected("unrelated_case", expected)
+        report = make_report(findings=[_finding(category="SC01")], coverage=_coverage(detected=["SC01"]))
+        del report["language"]
+        self.write_actual("unrelated_case", report)
+        result = run_evals.run_all()[0]
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["detectionHit"])
+        self.assertNotIn("language", " ".join(result["errors"]))
 
 
 class InjectionCaseTests(_TempEvalDirsMixin, unittest.TestCase):

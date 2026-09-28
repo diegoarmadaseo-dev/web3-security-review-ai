@@ -441,6 +441,37 @@ class WorkerResourceConfigTests(unittest.TestCase):
         self.assertEqual(cfg["llm_per_attempt_timeout_seconds"], 120)
         self.assertIsNone(cfg["retention_days"])  # unset -> disabled, never a guessed default - see module docstring.
 
+    def test_llm_provider_defaults_to_anthropic(self):
+        # Byte-identical to every deployment that predates LLM_PROVIDER -
+        # see backend/worker_entrypoint.py's own PROVIDER SELECTION note.
+        with patch.dict(os.environ, _FAKE_WORKER_ENV, clear=True):
+            cfg = main._load_worker_config()
+        self.assertEqual(cfg["llm_provider"], "anthropic")
+
+    def test_llm_provider_deepseek_override_is_honored(self):
+        env = dict(_FAKE_WORKER_ENV)
+        env["LLM_PROVIDER"] = "deepseek"
+        with patch.dict(os.environ, env, clear=True):
+            cfg = main._load_worker_config()
+        self.assertEqual(cfg["llm_provider"], "deepseek")
+
+    def test_llm_allowlist_host_defaults_to_anthropic(self):
+        with patch.dict(os.environ, _FAKE_WORKER_ENV, clear=True):
+            cfg = main._load_worker_config()
+        self.assertEqual(cfg["llm_allowlist_host"], "api.anthropic.com")
+        self.assertEqual(cfg["llm_allowlist_port"], 443)
+
+    def test_llm_allowlist_host_can_be_set_to_deepseek(self):
+        # The SAME existing generic mechanism _load_worker_config() already
+        # had before this phase - no code change was needed for this,
+        # only this test was missing (see docs/production-config.md's own
+        # updated LLM_API_ALLOWLIST_HOST row).
+        env = dict(_FAKE_WORKER_ENV)
+        env["LLM_API_ALLOWLIST_HOST"] = "api.deepseek.com"
+        with patch.dict(os.environ, env, clear=True):
+            cfg = main._load_worker_config()
+        self.assertEqual(cfg["llm_allowlist_host"], "api.deepseek.com")
+
     def test_valid_overrides_are_honored(self):
         env = dict(_FAKE_WORKER_ENV)
         env.update({

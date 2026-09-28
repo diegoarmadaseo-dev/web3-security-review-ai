@@ -31,13 +31,20 @@
 # submitted source as DATA only. A Solidity toolchain has no reason to exist
 # in this image and is deliberately never installed.
 #
-# MINIMAL RUNTIME DEPENDENCIES: only the `anthropic` SDK is pip-installed
-# (needed for AnthropicLLMProvider's real, non-mock path - see
-# backend/llm_client.py). Neither `psycopg` (Postgres) nor `stripe` (billing)
-# is installed here - both are HOST-side-only dependencies (backend/db.py,
-# backend/billing.py) this container has no use for and never imports; the
-# worker's own imports are exactly backend/worker_entrypoint.py + backend/
-# llm_client.py + the analyzer's own scripts/ tree, confirmed by inspection.
+# MINIMAL RUNTIME DEPENDENCIES: only the `anthropic` and `openai` SDKs are
+# pip-installed (needed for AnthropicLLMProvider's and DeepSeekLLMProvider's
+# real, non-mock paths respectively - DeepSeek's API is OpenAI-compatible,
+# so `openai` is the real, live transport backend/llm_client.py's
+# DeepSeekLLMProvider lazily imports - see that module's own docstring).
+# LLM_PROVIDER selects which one main() actually constructs at runtime (see
+# backend/worker_entrypoint.py's own PROVIDER SELECTION docstring section) -
+# both SDKs are installed unconditionally here since the image is built once
+# and must support either selection without a rebuild. Neither `psycopg`
+# (Postgres) nor `stripe` (billing) is installed here - both are HOST-side-only
+# dependencies (backend/db.py, backend/billing.py) this container has no use
+# for and never imports; the worker's own imports are exactly backend/
+# worker_entrypoint.py + backend/llm_client.py + the analyzer's own scripts/
+# tree, confirmed by inspection.
 #
 # EXISTING ANALYZER CODE: the full .claude/skills/web3-auditor/ tree (scripts/
 # + config/ + references/) is copied in - not just scripts/. preprocess.py's
@@ -61,10 +68,10 @@ FROM python:3.11-slim-bookworm
 
 WORKDIR /app
 
-# anthropic only - see "MINIMAL RUNTIME DEPENDENCIES" above. --no-cache-dir
-# keeps the image smaller; no compiler toolchain is invoked (anthropic's own
+# anthropic + openai - see "MINIMAL RUNTIME DEPENDENCIES" above. --no-cache-dir
+# keeps the image smaller; no compiler toolchain is invoked (both SDKs' own
 # dependencies are pure-Python/pre-built wheels for this platform).
-RUN pip install --no-cache-dir "anthropic>=0.40,<1"
+RUN pip install --no-cache-dir "anthropic>=0.40,<1" "openai>=1.0,<2"
 
 COPY .claude/skills/web3-auditor/ /app/.claude/skills/web3-auditor/
 COPY backend/worker_entrypoint.py /app/backend/worker_entrypoint.py
