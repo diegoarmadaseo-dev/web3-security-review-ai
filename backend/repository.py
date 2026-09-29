@@ -809,7 +809,17 @@ def release_workspace_budget(conn: Any, workspace_id: str, units: int) -> None:
 
 _VALID_TRANSITIONS = {
     "queued": {"claimed", "canceled"},
-    "claimed": {"running", "queued", "canceled"},  # "queued" covers a reaper requeueing a dead worker's claim.
+    # "queued" covers a reaper requeueing a dead worker's claim. "failed"
+    # covers claim_and_run_one_job()'s own budget-exhausted path (reserve_
+    # workspace_budget() returning False before the job ever reaches
+    # 'running') - PRE-EXISTING GAP found and fixed while building
+    # finalize_job_attempt() below: that call site has passed ("claimed",
+    # "failed") since it was written, which this dict rejected, so it has
+    # always raised RepositoryError uncaught (never reached fencing logic
+    # at all) - confirmed by no test ever exercising it. Unrelated to
+    # fencing itself; fixed as a necessary prerequisite for that call site
+    # to work at all.
+    "claimed": {"running", "queued", "canceled", "failed"},
     "running": {"succeeded", "failed"},
 }
 
@@ -848,6 +858,128 @@ def transition_job_status(
         )
     conn.commit()
     return cur.rowcount > 0
+
+
+def finalize_job_attempt(
+    conn: Any,
+    job_id: str,
+    workspace_id: str,
+    expected_attempt_count: int,
+    expected_claimed_by: str,
+    from_status: str,
+    to_status: str,
+    error: Optional[str] = None,
+    budget_units: Optional[int] = None,
+    budget_action: Optional[str] = None,
+    report_storage_ref: Optional[str] = None,
+    report_score_status: Optional[str] = None,
+    report_score: Optional[int] = None,
+    report_risk_band: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Fenced counterpart to transition_job_status(), for the ONE caller
+    (claim_and_run_one_job()) that must finalize a job it claimed a
+    possibly-long time ago - after the wall-clock-bounded container run,
+    reap_expired_jobs() may already have reclaimed this exact job (lease
+    expired while the container was still legitimately running) and even
+    handed it to a NEW worker for a NEW attempt by the time this call
+    happens. Confirmed real gap (found by a dedicated concurrency audit
+    after the reap atomicity fix above): job_id + status='running' alone
+    is NOT sufficient fencing, because a reaped-and-re-claimed job is
+    ALSO 'running' again by the time the stale caller gets here - it just
+    belongs to a different attempt. attempt_count is bumped by
+    reap_expired_jobs() exactly once per reap (both its requeue and its
+    fail branch) and is otherwise untouched between a claim and that
+    claim's own finalization (claim_next_job() and this function's own
+    'running' transition never touch it), so it strictly increases across
+    any two distinct claims of the same job_id and stays constant across
+    all of ONE claim's own lifetime - a claim's own (attempt_count,
+    claimed_by) pair, captured once right after claim_next_job() returns
+    and threaded through unchanged by the caller, is a valid fencing
+    token for exactly that one attempt. claimed_by is included too (the
+    caller's own preference) as cheap defense in depth, though
+    attempt_count alone is already sufficient by the argument above.
+
+    Returns {"applied": bool, "report_id": Optional[str]}. "applied" is
+    False exactly when the fencing check lost the race (rowcount 0 on the
+    conditional UPDATE below) - an EXPECTED, not exceptional, outcome:
+    the caller must treat this as "stand down silently", writing no
+    report and touching no budget, never as an error to raise or an
+    alert to fire (reap_expired_jobs() already alerts on the requeue that
+    caused this, when it happens via EVENT_WORKER_REPEATED_RETRY - see
+    worker_supervisor.py). Genuinely never raises for THIS reason; an
+    exception from the report INSERT or the budget UPDATE below (only
+    ever reached after the fencing check already passed - a real
+    CHECK-constraint violation or similar) is a different, real
+    infrastructure/data problem that must NOT be swallowed - rolled back
+    and re-raised unchanged, same discipline as reap_expired_jobs()'s own
+    exception handling.
+
+    TRANSACTIONAL ATOMICITY: identical reasoning to reap_expired_jobs()'s
+    own docstring - neither backend auto-commits between two db.execute()
+    calls on the same connection, so the fencing UPDATE, the optional
+    report INSERT, and the optional budget UPDATE below are issued back
+    to back with NO commit() between them, closed by exactly ONE
+    commit(). record_report()/consume_reserved_workspace_budget()/
+    release_workspace_budget() are deliberately never called here (each
+    does its own commit(), which would defeat this) - the same SQL each
+    one runs is inlined instead, exactly like reap_expired_jobs() already
+    inlines release_workspace_budget()'s own statement. Those three
+    functions and transition_job_status() itself are all unchanged."""
+    if to_status not in _VALID_TRANSITIONS.get(from_status, set()):
+        raise RepositoryError("invalid job transition %r -> %r" % (from_status, to_status))
+    if budget_action not in (None, "consume", "release"):
+        raise RepositoryError("budget_action must be one of consume/release/None, got %r" % (budget_action,))
+    if report_storage_ref is not None and report_score_status not in ("computed", "not_computed"):
+        raise RepositoryError("score_status must be computed/not_computed, got %r" % (report_score_status,))
+
+    now = utcnow_iso()
+    timestamp_column = {"running": "started_at", "succeeded": "completed_at", "failed": "completed_at"}.get(to_status)
+    if timestamp_column:
+        cur = db.execute(
+            conn,
+            "UPDATE analysis_jobs SET status = ?, %s = ?, last_error = COALESCE(?, last_error), "
+            "attempt_count = attempt_count + CASE WHEN ? = 'failed' THEN 1 ELSE 0 END "
+            "WHERE id = ? AND status = ? AND attempt_count = ? AND claimed_by = ?" % timestamp_column,
+            (to_status, now, error, to_status, job_id, from_status, expected_attempt_count, expected_claimed_by),
+        )
+    else:
+        cur = db.execute(
+            conn,
+            "UPDATE analysis_jobs SET status = ?, last_error = COALESCE(?, last_error) "
+            "WHERE id = ? AND status = ? AND attempt_count = ? AND claimed_by = ?",
+            (to_status, error, job_id, from_status, expected_attempt_count, expected_claimed_by),
+        )
+    if cur.rowcount == 0:
+        conn.rollback()  # fencing lost - a concurrent reap already reclaimed this attempt (possibly for a new one).
+        return {"applied": False, "report_id": None}
+
+    report_id = None
+    try:
+        if report_storage_ref is not None:
+            report_id = new_id()
+            db.execute(
+                conn,
+                "INSERT INTO reports (id, job_id, workspace_id, storage_ref, score_status, score, risk_band, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (report_id, job_id, workspace_id, report_storage_ref, report_score_status, report_score, report_risk_band, now),
+            )
+        if budget_action == "consume":
+            db.execute(
+                conn,
+                "UPDATE workspace_budgets SET reserved_units = reserved_units - ?, consumed_units = consumed_units + ?, updated_at = ? WHERE workspace_id = ?",
+                (budget_units, budget_units, now, workspace_id),
+            )
+        elif budget_action == "release":
+            db.execute(
+                conn,
+                "UPDATE workspace_budgets SET reserved_units = reserved_units - ?, updated_at = ? WHERE workspace_id = ?",
+                (budget_units, now, workspace_id),
+            )
+        conn.commit()  # the ONE commit for this attempt - transition, report and budget land together, or none do.
+    except Exception:
+        conn.rollback()
+        raise
+    return {"applied": True, "report_id": report_id}
 
 
 # ---------------------------------------------------------------------------

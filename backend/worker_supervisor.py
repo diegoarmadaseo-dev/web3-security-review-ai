@@ -307,7 +307,26 @@ def claim_and_run_one_job(
     one job. Both paths now release the reserved budget, transition the
     job to a clean 'failed' terminal state, and emit a
     alerting.EVENT_STORAGE_FAILURE alert (alert_sender is optional and
-    never required - see backend/alerting.py's own module docstring)."""
+    never required - see backend/alerting.py's own module docstring).
+
+    FENCING (concurrency audit, post-reap-atomicity-fix): every write
+    this function makes to the job/report/budget AFTER the claim below
+    now goes through repo.finalize_job_attempt() instead of calling
+    transition_job_status()/record_report()/consume_reserved_workspace_
+    budget()/release_workspace_budget() directly - a confirmed gap let a
+    worker whose lease had already expired (container still legitimately
+    running past LEASE_DURATION_SECONDS, e.g. under a misconfigured
+    WORKER_WALL_CLOCK_TIMEOUT_SECONDS - see _load_worker_config()'s own
+    validation) finish AFTER reap_expired_jobs() had already reclaimed
+    (and possibly re-run) the same job: a plain job_id+status='running'
+    check is not enough fencing, because a reaped-and-re-claimed job is
+    'running' again too, just for a different attempt - see
+    finalize_job_attempt()'s own docstring for the full reasoning and why
+    (attempt_count, claimed_by), captured once right below immediately
+    after claim_next_job() returns, is what actually distinguishes them.
+    Every finalize_job_attempt() call below threads that SAME pair
+    through unchanged - never re-read from the job row later, which
+    could already reflect a newer attempt."""
     job = repo.claim_next_job(conn, worker_id)
     if job is None:
         return None
@@ -315,19 +334,44 @@ def claim_and_run_one_job(
     workspace_id = job["workspace_id"]
     mode = job["mode"]
     units = repo.JOB_MODE_BUDGET_COST.get(mode, 1)
+    attempt_count = job["attempt_count"]
+    claimed_by = job["claimed_by"]
 
     if not repo.reserve_workspace_budget(conn, workspace_id, units):
-        repo.transition_job_status(conn, job_id, "claimed", "failed", error="workspace budget exhausted")
+        repo.finalize_job_attempt(
+            conn, job_id, workspace_id, attempt_count, claimed_by,
+            from_status="claimed", to_status="failed", error="workspace budget exhausted",
+        )
         return job_id
 
-    repo.transition_job_status(conn, job_id, "claimed", "running")
+    if not repo.finalize_job_attempt(
+        conn, job_id, workspace_id, attempt_count, claimed_by,
+        from_status="claimed", to_status="running",
+    )["applied"]:
+        # Lost fencing before the container ever started - a concurrent
+        # reap already reclaimed this job while it was still 'claimed'.
+        # reap_expired_jobs() deliberately never releases budget for a
+        # job it finds 'claimed' (the reservation there is ambiguous from
+        # its side - see that function's own docstring), so the units
+        # reserved just above are this worker's own, unambiguously, and
+        # ONLY this worker will ever release them - a plain call here
+        # (not fenced - nothing else could legitimately touch this exact
+        # reservation) is correct regardless of ordering against whatever
+        # the job's NEXT attempt goes on to reserve for itself.
+        repo.release_workspace_budget(conn, workspace_id, units)
+        return job_id
+
     contract = repo.get_contract(conn, job["contract_id"])
     try:
         source = storage.get_object(contract["storage_ref"]).decode("utf-8", "replace")
     except Exception as exc:
         alerting.emit_safe(alert_sender, alerting.EVENT_STORAGE_FAILURE, "error", {"job_id": job_id, "phase": "fetch_source", "error_type": type(exc).__name__})
-        repo.release_workspace_budget(conn, workspace_id, units)
-        repo.transition_job_status(conn, job_id, "running", "failed", error="object storage error fetching source: %s" % type(exc).__name__)
+        repo.finalize_job_attempt(
+            conn, job_id, workspace_id, attempt_count, claimed_by,
+            from_status="running", to_status="failed",
+            error="object storage error fetching source: %s" % type(exc).__name__,
+            budget_units=units, budget_action="release",
+        )
         return job_id
 
     try:
@@ -341,21 +385,30 @@ def claim_and_run_one_job(
             storage.put_object(report_key, result.get("rendered", "").encode("utf-8"), content_type="text/markdown")
         except Exception as exc:
             alerting.emit_safe(alert_sender, alerting.EVENT_STORAGE_FAILURE, "error", {"job_id": job_id, "phase": "store_report", "error_type": type(exc).__name__})
-            repo.release_workspace_budget(conn, workspace_id, units)
-            repo.transition_job_status(conn, job_id, "running", "failed", error="object storage error storing report: %s" % type(exc).__name__)
+            repo.finalize_job_attempt(
+                conn, job_id, workspace_id, attempt_count, claimed_by,
+                from_status="running", to_status="failed",
+                error="object storage error storing report: %s" % type(exc).__name__,
+                budget_units=units, budget_action="release",
+            )
             return job_id
         risk_indicator = result.get("risk_indicator") or {}
-        repo.record_report(
-            conn, job_id, workspace_id, report_key,
-            score_status="computed" if risk_indicator.get("score") is not None else "not_computed",
-            score=risk_indicator.get("score"), risk_band=risk_indicator.get("band"),
+        repo.finalize_job_attempt(
+            conn, job_id, workspace_id, attempt_count, claimed_by,
+            from_status="running", to_status="succeeded",
+            budget_units=units, budget_action="consume",
+            report_storage_ref=report_key,
+            report_score_status="computed" if risk_indicator.get("score") is not None else "not_computed",
+            report_score=risk_indicator.get("score"), report_risk_band=risk_indicator.get("band"),
         )
-        repo.consume_reserved_workspace_budget(conn, workspace_id, units)
-        repo.transition_job_status(conn, job_id, "running", "succeeded")
     else:
         alerting.emit_safe(alert_sender, alerting.EVENT_WORKER_JOB_FAILED, "warning", {"job_id": job_id, "workspace_id": workspace_id, "error": str(result.get("error", ""))[:200]})
-        repo.release_workspace_budget(conn, workspace_id, units)
-        repo.transition_job_status(conn, job_id, "running", "failed", error=str(result.get("error", "unknown worker failure"))[:500])
+        repo.finalize_job_attempt(
+            conn, job_id, workspace_id, attempt_count, claimed_by,
+            from_status="running", to_status="failed",
+            error=str(result.get("error", "unknown worker failure"))[:500],
+            budget_units=units, budget_action="release",
+        )
     return job_id
 
 

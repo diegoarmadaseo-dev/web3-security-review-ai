@@ -111,6 +111,7 @@ import backend.egress_proxy as egress_proxy
 import backend.email_sender as email_sender_module
 import backend.http_app as http_app
 import backend.object_storage as object_storage
+import backend.repository as repo
 import backend.worker_supervisor as worker_supervisor
 
 
@@ -437,7 +438,34 @@ def _load_worker_config() -> Dict[str, Any]:
         "retention_dry_run": _bool_env("RETENTION_DRY_RUN", False),
     }
     cfg.update(_load_alert_config())
+    _validate_wall_clock_timeout_under_lease(cfg["wall_clock_timeout_seconds"])
     return cfg
+
+
+def _validate_wall_clock_timeout_under_lease(wall_clock_timeout_seconds: int) -> None:
+    """Concurrency audit follow-up (post-reap-atomicity-fix fencing work):
+    a worker whose container legitimately runs longer than repo.
+    LEASE_DURATION_SECONDS (900s, hardcoded - never changed by this
+    validation) can have its job's lease expire, and therefore reclaimed
+    by a concurrent reap, WHILE the container is still genuinely running
+    - claim_and_run_one_job()'s own fencing (repo.finalize_job_attempt())
+    already makes that race land safely rather than corrupt state or
+    crash the process, but a deployment where it happens routinely (not
+    just in a rare worst-case race) is still a real availability problem
+    (jobs bounce through extra reap/retry cycles instead of completing).
+    This is cheap, blunt defense in depth against that: refuse to start
+    at all when the configured ceiling leaves no room. Deliberately does
+    NOT check host-load/S3-latency/DB-round-trip overhead between claim
+    and the container actually starting - only the two configured
+    numbers themselves - so it cannot catch every real-world way this
+    margin could still be exhausted, only the most direct misconfiguration."""
+    if wall_clock_timeout_seconds >= repo.LEASE_DURATION_SECONDS:
+        raise ConfigError(
+            "WORKER_WALL_CLOCK_TIMEOUT_SECONDS (%d) must be less than the job lease duration (%d seconds) - "
+            "otherwise a worker still legitimately running a job can outlive its own lease, letting a "
+            "concurrent reap reclaim the job while this worker is still processing it"
+            % (wall_clock_timeout_seconds, repo.LEASE_DURATION_SECONDS)
+        )
 
 
 def _build_storage(bucket: str, region: str) -> object_storage.ObjectStorage:

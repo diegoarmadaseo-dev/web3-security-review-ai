@@ -535,6 +535,42 @@ class WorkerResourceConfigTests(unittest.TestCase):
                 main._load_worker_config()
         self.assertNotIn(_FAKE_WORKER_ENV["LLM_API_KEY"], str(ctx.exception))
 
+    def test_wall_clock_timeout_equal_to_lease_duration_fails_fast(self):
+        # Concurrency audit follow-up: a worker must never be allowed to
+        # start configured such that its own container can legitimately
+        # run for as long as (or longer than) a job's lease - see
+        # backend/main.py's own _validate_wall_clock_timeout_under_lease()
+        # docstring. Equal is already unsafe (no margin at all), not just
+        # "greater than".
+        env = dict(_FAKE_WORKER_ENV)
+        env["WORKER_WALL_CLOCK_TIMEOUT_SECONDS"] = str(repo.LEASE_DURATION_SECONDS)
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(main.ConfigError) as ctx:
+                main._load_worker_config()
+        self.assertIn("WORKER_WALL_CLOCK_TIMEOUT_SECONDS", str(ctx.exception))
+
+    def test_wall_clock_timeout_greater_than_lease_duration_fails_fast(self):
+        env = dict(_FAKE_WORKER_ENV)
+        env["WORKER_WALL_CLOCK_TIMEOUT_SECONDS"] = str(repo.LEASE_DURATION_SECONDS + 1)
+        with patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(main.ConfigError):
+                main._load_worker_config()
+
+    def test_wall_clock_timeout_comfortably_under_lease_duration_starts_cleanly(self):
+        env = dict(_FAKE_WORKER_ENV)
+        env["WORKER_WALL_CLOCK_TIMEOUT_SECONDS"] = str(repo.LEASE_DURATION_SECONDS - 1)
+        with patch.dict(os.environ, env, clear=True):
+            cfg = main._load_worker_config()  # must not raise.
+        self.assertEqual(cfg["wall_clock_timeout_seconds"], repo.LEASE_DURATION_SECONDS - 1)
+
+    def test_default_wall_clock_timeout_is_already_safely_under_the_lease(self):
+        # The documented production default (300s, docs/production-
+        # config.md) against the real, unmodified LEASE_DURATION_SECONDS
+        # (900s) - a deployment that changes neither must always start.
+        with patch.dict(os.environ, dict(_FAKE_WORKER_ENV), clear=True):
+            cfg = main._load_worker_config()  # must not raise.
+        self.assertLess(cfg["wall_clock_timeout_seconds"], repo.LEASE_DURATION_SECONDS)
+
 
 class RetentionConfigTests(unittest.TestCase):
     def test_unset_retention_days_disables_retention(self):

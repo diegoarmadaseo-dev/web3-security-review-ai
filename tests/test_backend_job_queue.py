@@ -396,5 +396,173 @@ class ReapExpiredJobsTests(unittest.TestCase):
         self.assertEqual(repo.get_workspace_budget(self.conn, workspace_id)["reserved_units"], 0)
 
 
+class FinalizeJobAttemptTests(unittest.TestCase):
+    """Regression coverage for a confirmed fencing gap found by a
+    dedicated concurrency audit AFTER ReapExpiredJobsTests above already
+    landed: claim_and_run_one_job()'s own finalization (report write +
+    budget consume/release + terminal transition) had no protection
+    against a concurrent reap_expired_jobs() call that already reclaimed
+    (and possibly re-ran) the exact same job by the time a slow worker
+    gets around to finishing it. job_id + status='running' is NOT
+    sufficient fencing - a reaped-and-re-claimed job is 'running' again
+    too, just for a different attempt - see finalize_job_attempt()'s own
+    docstring (repository.py) for why (attempt_count, claimed_by) is.
+    These tests exercise that function directly, the same layer
+    ReapExpiredJobsTests above already tests reap_expired_jobs() at."""
+
+    def setUp(self):
+        self.conn = repo.connect(":memory:")
+        repo.init_schema(self.conn)
+        self.addCleanup(self.conn.close)
+
+    def _reports_for_job(self, job_id):
+        return self.conn.execute("SELECT * FROM reports WHERE job_id = ?", (job_id,)).fetchall()
+
+    def test_stale_attempt_after_reap_and_reclaim_cannot_finalize(self):
+        # The hardest, most realistic version of the race - not just
+        # "reaped, still queued" but "reaped AND already re-claimed by a
+        # different worker, running its own NEW attempt" - proving why
+        # job_id + status='running' alone would be unsafe: the row IS
+        # 'running' again by the time worker-A gets here, just for
+        # attempt N+1, not worker-A's own attempt N.
+        job_id = _seed_job(self.conn)
+        workspace_id = repo.get_job(self.conn, job_id)["workspace_id"]
+        claimed = repo.claim_next_job(self.conn, "worker-A")
+        self.assertEqual(claimed["id"], job_id)
+        stale_attempt_count = claimed["attempt_count"]
+        stale_claimed_by = claimed["claimed_by"]
+        self.assertTrue(repo.reserve_workspace_budget(self.conn, workspace_id, repo.JOB_MODE_BUDGET_COST["quick"]))
+        self.assertTrue(repo.finalize_job_attempt(
+            self.conn, job_id, workspace_id, stale_attempt_count, stale_claimed_by,
+            from_status="claimed", to_status="running",
+        )["applied"])
+
+        # worker-A's lease expires while it is still (legitimately, as
+        # far as it itself knows) running the job - a real reaper reaps
+        # it for real, using the already-atomicity-fixed function above.
+        self.conn.execute("UPDATE analysis_jobs SET lease_expires_at = '2000-01-01T00:00:00+00:00' WHERE id = ?", (job_id,))
+        self.conn.commit()
+        self.assertEqual(repo.reap_expired_jobs(self.conn), {"requeued": 1, "failed": 0})
+
+        # A DIFFERENT worker claims the SAME job_id for attempt N+1 and
+        # drives it to 'running' again - status is 'running' again, but
+        # attempt_count/claimed_by are no longer worker-A's own values.
+        reclaimed = repo.claim_next_job(self.conn, "worker-C")
+        self.assertEqual(reclaimed["id"], job_id)
+        new_attempt_count = reclaimed["attempt_count"]
+        self.assertNotEqual(new_attempt_count, stale_attempt_count)
+        self.assertTrue(repo.reserve_workspace_budget(self.conn, workspace_id, repo.JOB_MODE_BUDGET_COST["quick"]))
+        self.assertTrue(repo.finalize_job_attempt(
+            self.conn, job_id, workspace_id, new_attempt_count, "worker-C",
+            from_status="claimed", to_status="running",
+        )["applied"])
+        budget_before_stale_finalize = repo.get_workspace_budget(self.conn, workspace_id)
+
+        # worker-A (stale, still using ITS OWN captured attempt_count/
+        # claimed_by from attempt N) now tries to finish - the exact call
+        # claim_and_run_one_job() makes on its success path.
+        result = repo.finalize_job_attempt(
+            self.conn, job_id, workspace_id, stale_attempt_count, stale_claimed_by,
+            from_status="running", to_status="succeeded",
+            budget_units=repo.JOB_MODE_BUDGET_COST["quick"], budget_action="consume",
+            report_storage_ref="s3://stale-report", report_score_status="computed",
+            report_score=42, report_risk_band="HIGH",
+        )
+
+        self.assertEqual(result, {"applied": False, "report_id": None})
+        job_after = repo.get_job(self.conn, job_id)
+        self.assertEqual(job_after["status"], "running")  # attempt N+1's own state - untouched by worker-A.
+        self.assertEqual(job_after["attempt_count"], new_attempt_count)
+        self.assertEqual(job_after["claimed_by"], "worker-C")
+        self.assertEqual(self._reports_for_job(job_id), [])  # no report from the stale attempt.
+        budget_after = repo.get_workspace_budget(self.conn, workspace_id)
+        self.assertEqual(budget_after["reserved_units"], budget_before_stale_finalize["reserved_units"])
+        self.assertEqual(budget_after["consumed_units"], budget_before_stale_finalize["consumed_units"])
+
+    def test_worker_wins_the_race_reaper_then_finds_nothing(self):
+        job_id = _seed_job(self.conn)
+        workspace_id = repo.get_job(self.conn, job_id)["workspace_id"]
+        claimed = repo.claim_next_job(self.conn, "worker-A")
+        attempt_count = claimed["attempt_count"]
+        claimed_by = claimed["claimed_by"]
+        self.assertTrue(repo.reserve_workspace_budget(self.conn, workspace_id, repo.JOB_MODE_BUDGET_COST["quick"]))
+        self.assertTrue(repo.finalize_job_attempt(
+            self.conn, job_id, workspace_id, attempt_count, claimed_by,
+            from_status="claimed", to_status="running",
+        )["applied"])
+
+        result = repo.finalize_job_attempt(
+            self.conn, job_id, workspace_id, attempt_count, claimed_by,
+            from_status="running", to_status="succeeded",
+            budget_units=repo.JOB_MODE_BUDGET_COST["quick"], budget_action="consume",
+            report_storage_ref="s3://real-report", report_score_status="computed",
+            report_score=10, report_risk_band="LOW",
+        )
+
+        self.assertTrue(result["applied"])
+        self.assertIsNotNone(result["report_id"])
+        self.assertEqual(repo.get_job(self.conn, job_id)["status"], "succeeded")
+        budget = repo.get_workspace_budget(self.conn, workspace_id)
+        self.assertEqual(budget["reserved_units"], 0)
+        self.assertEqual(budget["consumed_units"], 1)
+        self.assertEqual(len(self._reports_for_job(job_id)), 1)
+
+        # The reaper, even goaded with an artificially-expired lease,
+        # must find nothing left - status is no longer claimed/running.
+        self.conn.execute("UPDATE analysis_jobs SET lease_expires_at = '2000-01-01T00:00:00+00:00' WHERE id = ?", (job_id,))
+        self.conn.commit()
+        self.assertEqual(repo.reap_expired_jobs(self.conn), {"requeued": 0, "failed": 0})
+        budget_after_reap = repo.get_workspace_budget(self.conn, workspace_id)
+        self.assertEqual(budget_after_reap["reserved_units"], 0)  # not double-released.
+        self.assertEqual(budget_after_reap["consumed_units"], 1)
+
+    def test_reaper_wins_stale_worker_fails_fencing_without_exception_or_budget_change(self):
+        job_id = _seed_job(self.conn)
+        workspace_id = repo.get_job(self.conn, job_id)["workspace_id"]
+        claimed = repo.claim_next_job(self.conn, "worker-A")
+        attempt_count = claimed["attempt_count"]
+        claimed_by = claimed["claimed_by"]
+        self.assertTrue(repo.reserve_workspace_budget(self.conn, workspace_id, repo.JOB_MODE_BUDGET_COST["quick"]))
+        self.assertTrue(repo.finalize_job_attempt(
+            self.conn, job_id, workspace_id, attempt_count, claimed_by,
+            from_status="claimed", to_status="running",
+        )["applied"])
+
+        self.conn.execute("UPDATE analysis_jobs SET lease_expires_at = '2000-01-01T00:00:00+00:00' WHERE id = ?", (job_id,))
+        self.conn.commit()
+        self.assertEqual(repo.reap_expired_jobs(self.conn), {"requeued": 1, "failed": 0})
+        self.assertEqual(repo.get_workspace_budget(self.conn, workspace_id)["reserved_units"], 0)  # already released by the reap.
+
+        # worker-A tries to finish anyway - must not raise (no CHECK
+        # violation, no exception of any kind - this IS the expected-race
+        # path, not an infrastructure error), must not touch the budget
+        # again, must not create a report.
+        try:
+            result = repo.finalize_job_attempt(
+                self.conn, job_id, workspace_id, attempt_count, claimed_by,
+                from_status="running", to_status="succeeded",
+                budget_units=repo.JOB_MODE_BUDGET_COST["quick"], budget_action="consume",
+                report_storage_ref="s3://stale-report-2", report_score_status="computed",
+                report_score=99, report_risk_band="CRITICAL",
+            )
+        except Exception as exc:  # pragma: no cover - the whole point of this test is that this never happens.
+            self.fail("finalize_job_attempt() raised on a losing-fencing race instead of returning applied=False: %r" % (exc,))
+
+        self.assertEqual(result, {"applied": False, "report_id": None})
+        self.assertEqual(repo.get_workspace_budget(self.conn, workspace_id)["reserved_units"], 0)
+        self.assertEqual(self._reports_for_job(job_id), [])
+        self.assertEqual(repo.get_job(self.conn, job_id)["status"], "queued")  # exactly what the reap left it as.
+
+    def test_invalid_transition_still_rejected_before_touching_fencing_or_database(self):
+        job_id = _seed_job(self.conn)
+        workspace_id = repo.get_job(self.conn, job_id)["workspace_id"]
+        with self.assertRaises(repo.RepositoryError):
+            repo.finalize_job_attempt(
+                self.conn, job_id, workspace_id, 0, "worker-x",
+                from_status="queued", to_status="running",
+            )
+        self.assertEqual(repo.get_job(self.conn, job_id)["status"], "queued")
+
+
 if __name__ == "__main__":
     unittest.main()

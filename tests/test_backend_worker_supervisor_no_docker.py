@@ -17,6 +17,7 @@ import shutil
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 import backend.alerting as alerting
 import backend.object_storage as object_storage
@@ -123,6 +124,141 @@ class StorageFailureHandlingTests(unittest.TestCase):
         storage = _RaisingStorage(fail_get=True, fail_put=True)
         result = ws.claim_and_run_one_job(self.conn, "worker-a", _FAKE_CONFIG, storage)
         self.assertIsNone(result)
+
+
+class FencingThroughClaimAndRunOneJobTests(unittest.TestCase):
+    """claim_and_run_one_job()'s fencing (repo.finalize_job_attempt(),
+    keyed on the (attempt_count, claimed_by) pair captured right after
+    its own claim_next_job() call) exercised through the REAL function,
+    not just at the repository layer (tests/test_backend_job_queue.py's
+    own FinalizeJobAttemptTests already covers that layer directly).
+    Neither Docker nor a real container is needed - run_job_in_container()
+    is mocked, its side effect standing in for "a concurrent reaper
+    reclaimed this exact job while the container was still legitimately
+    running" (the real-world trigger: a container that runs past
+    LEASE_DURATION_SECONDS - see backend/main.py's own wall-clock/lease
+    validation, added alongside this fencing work, for why that should
+    be rare in a correctly configured deployment, but never structurally
+    impossible)."""
+
+    def setUp(self):
+        self.conn = repo.connect(":memory:")
+        repo.init_schema(self.conn)
+        self.addCleanup(self.conn.close)
+
+    def _steal_lease_via_real_reap(self, job_id):
+        self.conn.execute("UPDATE analysis_jobs SET lease_expires_at = '2000-01-01T00:00:00+00:00' WHERE id = ?", (job_id,))
+        self.conn.commit()
+        self.assertEqual(repo.reap_expired_jobs(self.conn), {"requeued": 1, "failed": 0})
+
+    def test_lease_stolen_before_running_transition_releases_budget_and_never_runs_container(self):
+        seeded = _seed_queued_job(self.conn)
+        real_reserve = repo.reserve_workspace_budget
+        container_calls = []
+
+        def _reserve_then_steal_lease(conn, workspace_id, units, **kwargs):
+            result = real_reserve(conn, workspace_id, units, **kwargs)
+            self._steal_lease_via_real_reap(seeded["job_id"])
+            return result
+
+        def _should_never_run(*args, **kwargs):
+            container_calls.append((args, kwargs))
+            return {"status": "succeeded", "rendered": "unused"}
+
+        with mock.patch.object(repo, "reserve_workspace_budget", side_effect=_reserve_then_steal_lease), \
+                mock.patch.object(ws, "run_job_in_container", side_effect=_should_never_run):
+            job_id = ws.claim_and_run_one_job(self.conn, "worker-stale", _FAKE_CONFIG, _RaisingStorage())
+
+        self.assertEqual(job_id, seeded["job_id"])
+        self.assertEqual(container_calls, [])  # never reached - fencing failed before the container could start.
+        job = repo.get_job(self.conn, seeded["job_id"])
+        self.assertEqual(job["status"], "queued")  # left exactly as the reap set it.
+        self.assertEqual(job["attempt_count"], 1)
+        budget = repo.get_workspace_budget(self.conn, seeded["workspace_id"])
+        self.assertEqual(budget["reserved_units"], 0)  # worker-stale released its own now-orphaned reservation.
+
+    def test_lease_stolen_during_container_run_success_path_writes_nothing(self):
+        seeded = _seed_queued_job(self.conn)
+        storage = _RaisingStorage()  # get_object/put_object both succeed - the job "legitimately" gets all the way to a real result.
+
+        def _run_then_steal_lease(config, job_id, mode, source):
+            self._steal_lease_via_real_reap(job_id)
+            return {"status": "succeeded", "rendered": "# report", "risk_indicator": {"score": 10, "band": "LOW"}}
+
+        with mock.patch.object(ws, "run_job_in_container", side_effect=_run_then_steal_lease):
+            job_id = ws.claim_and_run_one_job(self.conn, "worker-stale", _FAKE_CONFIG, storage)
+
+        self.assertEqual(job_id, seeded["job_id"])
+        job = repo.get_job(self.conn, seeded["job_id"])
+        self.assertEqual(job["status"], "queued")  # left exactly as the reap set it - never overwritten to 'succeeded'.
+        reports = self.conn.execute("SELECT * FROM reports WHERE job_id = ?", (seeded["job_id"],)).fetchall()
+        self.assertEqual(reports, [])  # no duplicate/orphaned report row from the stale attempt.
+        budget = repo.get_workspace_budget(self.conn, seeded["workspace_id"])
+        self.assertEqual(budget["reserved_units"], 0)
+        self.assertEqual(budget["consumed_units"], 0)  # the stale worker's own consume never landed.
+
+    def test_normal_success_path_writes_exactly_one_report_and_consumes_budget_once(self):
+        # Regression coverage: before this fencing work, NO no-docker test
+        # exercised the success path at all (only Docker-gated tests in
+        # tests/test_backend_worker_supervisor.py did) - claim_and_run_
+        # one_job()'s success branch was rewritten to route through
+        # finalize_job_attempt() here, so this proves the normal,
+        # uncontested path still behaves identically to before.
+        seeded = _seed_queued_job(self.conn)
+        storage = _RaisingStorage()
+
+        with mock.patch.object(ws, "run_job_in_container", return_value={"status": "succeeded", "rendered": "# report", "risk_indicator": {"score": 5, "band": "LOW"}}):
+            job_id = ws.claim_and_run_one_job(self.conn, "worker-a", _FAKE_CONFIG, storage)
+
+        self.assertEqual(job_id, seeded["job_id"])
+        job = repo.get_job(self.conn, seeded["job_id"])
+        self.assertEqual(job["status"], "succeeded")
+        self.assertIsNotNone(job["completed_at"])
+        reports = self.conn.execute("SELECT * FROM reports WHERE job_id = ?", (seeded["job_id"],)).fetchall()
+        self.assertEqual(len(reports), 1)
+        budget = repo.get_workspace_budget(self.conn, seeded["workspace_id"])
+        self.assertEqual(budget["reserved_units"], 0)
+        self.assertEqual(budget["consumed_units"], 1)
+
+    def test_normal_failure_path_still_releases_budget_and_fails_the_job(self):
+        # Same regression intent as above, for the (uncontested) failure
+        # branch - now routed through finalize_job_attempt() with
+        # budget_action="release" instead of a direct release_workspace_
+        # budget() + transition_job_status() pair.
+        seeded = _seed_queued_job(self.conn)
+        storage = _RaisingStorage()
+
+        with mock.patch.object(ws, "run_job_in_container", return_value={"status": "failed", "error": "LLM provider error"}):
+            job_id = ws.claim_and_run_one_job(self.conn, "worker-a", _FAKE_CONFIG, storage)
+
+        self.assertEqual(job_id, seeded["job_id"])
+        job = repo.get_job(self.conn, seeded["job_id"])
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["attempt_count"], 1)
+        self.assertIn("LLM provider error", job["last_error"])
+        budget = repo.get_workspace_budget(self.conn, seeded["workspace_id"])
+        self.assertEqual(budget["reserved_units"], 0)
+
+    def test_budget_exhausted_path_fails_cleanly_never_crashes(self):
+        # PRE-EXISTING gap found and fixed while building the fencing
+        # mechanism: _VALID_TRANSITIONS["claimed"] never included "failed"
+        # until now, so this exact call site (reserve_workspace_budget()
+        # returning False) has raised RepositoryError, uncaught, since it
+        # was written - confirmed by no test anywhere ever exercising it.
+        # Unrelated to fencing itself; fixed as a necessary prerequisite
+        # for this call site to work at all, and now covered.
+        seeded = _seed_queued_job(self.conn)
+        self.assertTrue(repo.reserve_workspace_budget(self.conn, seeded["workspace_id"], repo.DEFAULT_BUDGET_LIMIT_UNITS))  # exhaust the ceiling.
+
+        job_id = ws.claim_and_run_one_job(self.conn, "worker-a", _FAKE_CONFIG, _RaisingStorage())
+
+        self.assertEqual(job_id, seeded["job_id"])
+        job = repo.get_job(self.conn, seeded["job_id"])
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["last_error"], "workspace budget exhausted")
+        budget = repo.get_workspace_budget(self.conn, seeded["workspace_id"])
+        self.assertEqual(budget["reserved_units"], repo.DEFAULT_BUDGET_LIMIT_UNITS)  # the pre-existing reservation is untouched - never released (nothing was reserved for THIS job).
+        self.assertEqual(budget["consumed_units"], 0)
 
 
 class ShutdownEventTests(unittest.TestCase):

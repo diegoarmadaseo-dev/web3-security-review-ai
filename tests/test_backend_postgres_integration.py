@@ -294,6 +294,116 @@ class JobQueueIntegrationTests(unittest.TestCase):
         self.assertFalse(repo.record_webhook_event(self.conn, "evt_pg_1", "checkout.session.completed"))
 
 
+class FencingIntegrationTests(unittest.TestCase):
+    """Real-Postgres coverage for repo.finalize_job_attempt()'s fencing -
+    tests/test_backend_job_queue.py's own FinalizeJobAttemptTests already
+    proves this same property against SQLite; this file's own module
+    docstring explains why that is never assumed to carry over
+    unverified. Same (attempt_count, claimed_by)-keyed mechanism as
+    ReapExpiredJobsTests' own atomicity fix - CHECK-violation exception
+    classes differ from SQLite's (psycopg.errors.*, not sqlite3.
+    IntegrityError) but the property under test (does a losing race ever
+    raise, corrupt budget, or overwrite a newer attempt) is the same."""
+
+    def setUp(self):
+        self.conn, _ = _reset_database_and_migrate()
+        self.addCleanup(self.conn.close)
+
+    def _seed_job(self):
+        user_id = repo.create_user(self.conn, "fencing-pg@example.com")
+        workspace_id = repo.create_workspace(self.conn, "Fencing WS", user_id)
+        contract_id = repo.create_contract(self.conn, workspace_id, "s3://fencing", "hash", "Fencing.sol")
+        job_id = repo.enqueue_job(self.conn, workspace_id, contract_id, user_id, "quick")
+        return job_id, workspace_id
+
+    def _expire_lease(self, job_id):
+        db.execute(self.conn, "UPDATE analysis_jobs SET lease_expires_at = '2000-01-01T00:00:00+00:00' WHERE id = ?", (job_id,))
+        self.conn.commit()
+
+    def test_stale_attempt_after_reap_and_reclaim_cannot_finalize_on_real_postgres(self):
+        job_id, workspace_id = self._seed_job()
+        claimed = repo.claim_next_job(self.conn, "worker-A")
+        self.assertEqual(claimed["id"], job_id)
+        stale_attempt_count = claimed["attempt_count"]
+        stale_claimed_by = claimed["claimed_by"]
+        self.assertTrue(repo.reserve_workspace_budget(self.conn, workspace_id, repo.JOB_MODE_BUDGET_COST["quick"]))
+        self.assertTrue(repo.finalize_job_attempt(
+            self.conn, job_id, workspace_id, stale_attempt_count, stale_claimed_by,
+            from_status="claimed", to_status="running",
+        )["applied"])
+
+        self._expire_lease(job_id)
+        self.assertEqual(repo.reap_expired_jobs(self.conn), {"requeued": 1, "failed": 0})
+
+        reclaimed = repo.claim_next_job(self.conn, "worker-C")
+        self.assertEqual(reclaimed["id"], job_id)
+        new_attempt_count = reclaimed["attempt_count"]
+        self.assertNotEqual(new_attempt_count, stale_attempt_count)
+        self.assertTrue(repo.reserve_workspace_budget(self.conn, workspace_id, repo.JOB_MODE_BUDGET_COST["quick"]))
+        self.assertTrue(repo.finalize_job_attempt(
+            self.conn, job_id, workspace_id, new_attempt_count, "worker-C",
+            from_status="claimed", to_status="running",
+        )["applied"])
+        budget_before = repo.get_workspace_budget(self.conn, workspace_id)
+
+        try:
+            result = repo.finalize_job_attempt(
+                self.conn, job_id, workspace_id, stale_attempt_count, stale_claimed_by,
+                from_status="running", to_status="succeeded",
+                budget_units=repo.JOB_MODE_BUDGET_COST["quick"], budget_action="consume",
+                report_storage_ref="s3://stale-pg-report", report_score_status="computed",
+                report_score=42, report_risk_band="HIGH",
+            )
+        except Exception as exc:  # pragma: no cover - the whole point is that this never happens, on Postgres either.
+            self.fail("finalize_job_attempt() raised on a losing-fencing race against real Postgres: %r" % (exc,))
+
+        self.assertEqual(result, {"applied": False, "report_id": None})
+        job_after = repo.get_job(self.conn, job_id)
+        self.assertEqual(job_after["status"], "running")  # attempt N+1's own state - untouched.
+        self.assertEqual(job_after["attempt_count"], new_attempt_count)
+        self.assertEqual(job_after["claimed_by"], "worker-C")
+        reports = db.execute(self.conn, "SELECT * FROM reports WHERE job_id = ?", (job_id,)).fetchall()
+        self.assertEqual(reports, [])
+        budget_after = repo.get_workspace_budget(self.conn, workspace_id)
+        self.assertEqual(budget_after["reserved_units"], budget_before["reserved_units"])
+        self.assertEqual(budget_after["consumed_units"], budget_before["consumed_units"])
+
+        # The connection must remain fully usable afterward - Postgres
+        # (unlike SQLite) aborts a transaction on any error until
+        # rollback(). finalize_job_attempt()'s own rollback() on the
+        # rowcount==0 branch is not an error path, so this should never
+        # be at risk, but proving it end to end is exactly the "do not
+        # assume parity" discipline this file's own docstring asks for.
+        self.assertTrue(repo.reserve_workspace_budget(self.conn, workspace_id, repo.JOB_MODE_BUDGET_COST["quick"]))
+
+    def test_worker_wins_the_race_on_real_postgres_reaper_then_finds_nothing(self):
+        job_id, workspace_id = self._seed_job()
+        claimed = repo.claim_next_job(self.conn, "worker-A")
+        attempt_count = claimed["attempt_count"]
+        claimed_by = claimed["claimed_by"]
+        self.assertTrue(repo.reserve_workspace_budget(self.conn, workspace_id, repo.JOB_MODE_BUDGET_COST["quick"]))
+        self.assertTrue(repo.finalize_job_attempt(
+            self.conn, job_id, workspace_id, attempt_count, claimed_by,
+            from_status="claimed", to_status="running",
+        )["applied"])
+
+        result = repo.finalize_job_attempt(
+            self.conn, job_id, workspace_id, attempt_count, claimed_by,
+            from_status="running", to_status="succeeded",
+            budget_units=repo.JOB_MODE_BUDGET_COST["quick"], budget_action="consume",
+            report_storage_ref="s3://real-pg-report", report_score_status="computed",
+            report_score=10, report_risk_band="LOW",
+        )
+        self.assertTrue(result["applied"])
+        self.assertIsNotNone(result["report_id"])
+
+        self._expire_lease(job_id)
+        self.assertEqual(repo.reap_expired_jobs(self.conn), {"requeued": 0, "failed": 0})
+        budget = repo.get_workspace_budget(self.conn, workspace_id)
+        self.assertEqual(budget["reserved_units"], 0)
+        self.assertEqual(budget["consumed_units"], 1)
+
+
 class ConcurrentClaimIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.conn, _ = _reset_database_and_migrate()
