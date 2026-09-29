@@ -563,36 +563,144 @@ def reap_expired_jobs(conn: Any, max_attempts: int = _MAX_JOB_ATTEMPTS) -> Dict[
     """Finds every claimed/running job whose lease has expired (a
     crashed or hung worker never reported completion in time - Phase 4)
     and either requeues it (attempt_count below max_attempts) or marks
-    it permanently failed (attempts exhausted). Both branches are plain
-    conditional UPDATEs keyed on the SAME status+lease_expires_at WHERE
-    clause already proven safe throughout this module: if the worker
-    that actually owns the job finishes (any terminal transition) at the
-    last moment, its UPDATE and this one cannot both match the same row
-    - whichever commits first wins, the other's WHERE clause no longer
-    matches, exactly claim_next_job()'s own race safety. Requeuing
-    counts as a failed attempt (attempt_count + 1) - a job that never
-    stops timing out must still eventually hit max_attempts, or it could
-    loop through the queue forever. Returns {"requeued": n, "failed": n}
-    for the caller (backend/worker_supervisor.py) to log."""
+    it permanently failed (attempts exhausted). Returns
+    {"requeued": n, "failed": n} for the caller (backend/
+    worker_supervisor.py) to log - contract unchanged.
+
+    BUDGET RECONCILIATION (fixes a confirmed leak): a worker process that
+    dies while a job is 'running' never reaches claim_and_run_one_job()'s
+    own consume_reserved_workspace_budget()/release_workspace_budget()
+    call for the units it already reserved - this function used to leave
+    that reservation orphaned in workspace_budgets forever, since
+    DEFAULT_BUDGET_LIMIT_UNITS never resets on any cycle (see that
+    constant's own comment). A job found in 'running' status here is an
+    UNAMBIGUOUS signal that a reservation exists and is still
+    outstanding: the only path into 'running' is claim_next_job() ->
+    reserve_workspace_budget() returning True -> transition_job_status(
+    claimed, running), with nothing else in between - if the reservation
+    had failed, the job would be 'failed', never 'running'. This function
+    now releases that job's exact JOB_MODE_BUDGET_COST[mode] units
+    whenever it reaps a job found in 'running'.
+
+    A job still found in 'claimed' (never reached 'running') is
+    DELIBERATELY left alone budget-wise: reserve_workspace_budget() and
+    the claimed->running transition are two separate commits with nothing
+    atomic tying them together, so a crash in that narrow window can land
+    on EITHER side of the reservation - a 'claimed' job here might have a
+    real outstanding reservation, or might have none at all, and nothing
+    in this schema (no per-job reservation flag - none was authorized for
+    this fix) can tell the two apart without guessing. Under-releasing
+    (leaving that rare, narrow-window reservation orphaned - the same
+    class of leak this fix otherwise closes for the dominant 'running'
+    case) and over-releasing (silently returning units to the ceiling
+    that this job never actually reserved, corrupting a DIFFERENT job's
+    still-real reservation in the same workspace) are not symmetric
+    failure modes: the first only ever makes the ceiling too strict,
+    never lets a workspace spend beyond it; the second would. This is the
+    correct, honest boundary of what can be fixed without a schema
+    change.
+
+    RACE SAFETY (two reapers - e.g. two ROLE=worker processes - calling
+    this concurrently, or a reaper racing the job's own still-alive owner
+    finishing it for real at the last moment): identical in spirit to
+    claim_next_job()'s own conditional-UPDATE-and-check-rowcount pattern,
+    now applied per candidate row instead of in one bulk statement -
+    releasing budget must be gated on "did MY update actually perform
+    the transition", which a bulk UPDATE's aggregate rowcount cannot tell
+    a caller per-row. Each candidate found by the initial SELECT is
+    re-updated by id, re-checking the EXACT same status/lease_expires_at
+    conditions that SELECT used; whichever caller's UPDATE lands first
+    flips the row's status out of ('claimed', 'running'), so every other
+    concurrent UPDATE for that same id matches zero rows - see the
+    rowcount==0 branch below, an immediate rollback()+continue, exactly
+    like repository.record_webhook_event()'s own losing-race path. This
+    also covers the SELECT-to-UPDATE gap being crossed by the job's own
+    real completion rather than another reaper: if the true owner
+    finishes first, this function's UPDATE finds the row already
+    'succeeded'/'failed' and skips it entirely, exactly as before.
+
+    TRANSACTIONAL ATOMICITY (fixes a confirmed gap in an earlier version
+    of this fix: the job's own UPDATE and the budget release used to be
+    two independent commits - a process death in the narrow window
+    between them left the job already 'queued'/'failed' with its
+    reservation still orphaned FOREVER, since a job no longer in
+    'claimed'/'running' is never a reap candidate again; the exact same
+    permanent-leak shape this whole fix exists to close, just moved to a
+    new trigger). Neither repo.connect() (SQLite - no isolation_level
+    override, so it keeps sqlite3's own deferred-transaction default,
+    never autocommit) nor db.connect_postgres() (autocommit explicitly
+    False) commits anything on its own between two db.execute() calls -
+    only an explicit conn.commit()/conn.rollback() ever closes a
+    transaction on either backend. So the job UPDATE and (when
+    applicable) the workspace_budgets UPDATE below are issued back to
+    back on this SAME connection with NO commit() between them, and
+    closed out by exactly ONE commit() - both writes land together, or
+    (on any exception, or if the caller's own process dies before that
+    one commit) neither does, and the row is found exactly as before by
+    whichever reap call retries it next. The workspace_budgets write is
+    inlined here (the same statement release_workspace_budget() itself
+    runs) rather than calling that function, specifically because its
+    own commit() would defeat this - release_workspace_budget() and its
+    one other call site (claim_and_run_one_job()'s own release-on-failure
+    path, a single-write operation with nothing else to stay atomic
+    with) are both unchanged."""
     now = utcnow_iso()
-    requeue_cur = db.execute(
+    candidates_cur = db.execute(
         conn,
-        "UPDATE analysis_jobs SET status = 'queued', claimed_by = NULL, claimed_at = NULL, lease_expires_at = NULL, "
-        "attempt_count = attempt_count + 1 "
-        "WHERE status IN ('claimed', 'running') AND lease_expires_at IS NOT NULL AND lease_expires_at < ? AND attempt_count < ?",
-        (now, max_attempts),
+        "SELECT id, workspace_id, mode, status, attempt_count FROM analysis_jobs "
+        "WHERE status IN ('claimed', 'running') AND lease_expires_at IS NOT NULL AND lease_expires_at < ?",
+        (now,),
     )
-    conn.commit()
-    fail_cur = db.execute(
-        conn,
-        "UPDATE analysis_jobs SET status = 'failed', completed_at = ?, lease_expires_at = NULL, "
-        "attempt_count = attempt_count + 1, "
-        "last_error = 'lease expired: worker did not report completion within the allotted time' "
-        "WHERE status IN ('claimed', 'running') AND lease_expires_at IS NOT NULL AND lease_expires_at < ? AND attempt_count >= ?",
-        (now, now, max_attempts),
-    )
-    conn.commit()
-    return {"requeued": requeue_cur.rowcount, "failed": fail_cur.rowcount}
+    candidates = [db.normalize_row(row) for row in candidates_cur.fetchall()]
+
+    requeued = 0
+    failed = 0
+    for job in candidates:
+        will_requeue = job["attempt_count"] < max_attempts
+        if will_requeue:
+            cur = db.execute(
+                conn,
+                "UPDATE analysis_jobs SET status = 'queued', claimed_by = NULL, claimed_at = NULL, "
+                "lease_expires_at = NULL, attempt_count = attempt_count + 1 "
+                "WHERE id = ? AND status IN ('claimed', 'running') AND lease_expires_at IS NOT NULL AND lease_expires_at < ?",
+                (job["id"], now),
+            )
+        else:
+            cur = db.execute(
+                conn,
+                "UPDATE analysis_jobs SET status = 'failed', completed_at = ?, lease_expires_at = NULL, "
+                "attempt_count = attempt_count + 1, "
+                "last_error = 'lease expired: worker did not report completion within the allotted time' "
+                "WHERE id = ? AND status IN ('claimed', 'running') AND lease_expires_at IS NOT NULL AND lease_expires_at < ?",
+                (now, job["id"], now),
+            )
+        if cur.rowcount == 0:
+            conn.rollback()  # another reaper (or the job's own real completion) already won this exact row.
+            continue
+        try:
+            if job["status"] == "running":
+                # Same statement release_workspace_budget() itself runs -
+                # inlined, never that function, so this stays in the ONE
+                # transaction the job UPDATE above already opened (see
+                # this function's own TRANSACTIONAL ATOMICITY docstring
+                # section) - that function's own commit() would close
+                # this transaction out from under the job UPDATE too
+                # early, independently of whether this write succeeds.
+                db.execute(
+                    conn,
+                    "UPDATE workspace_budgets SET reserved_units = reserved_units - ?, updated_at = ? WHERE workspace_id = ?",
+                    (JOB_MODE_BUDGET_COST.get(job["mode"], 1), utcnow_iso(), job["workspace_id"]),
+                )
+            conn.commit()  # the ONE commit for this row - job transition and budget release land together, or neither does.
+        except Exception:
+            conn.rollback()
+            raise
+        if will_requeue:
+            requeued += 1
+        else:
+            failed += 1
+
+    return {"requeued": requeued, "failed": failed}
 
 
 # ---------------------------------------------------------------------------
