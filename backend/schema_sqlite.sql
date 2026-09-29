@@ -137,10 +137,17 @@ CREATE TABLE analysis_jobs (
     idempotency_key         TEXT UNIQUE,
     created_at              TEXT NOT NULL,
     -- Phase 4 (backend/migrations/0005_job_queue_hardening.sql's mirror).
-    lease_expires_at        TEXT
+    lease_expires_at        TEXT,
+    -- Admission control / queue fairness (backend/migrations/0008_queue_fairness.sql's
+    -- mirror): NULL for every freshly-enqueued job (immediately eligible,
+    -- no behavior change). Only reap_expired_jobs()'s own requeue branch
+    -- ever sets it, as a retry-backoff gate - see that function's own
+    -- docstring. Purely a WHERE-clause eligibility filter, never an
+    -- ORDER BY key - created_at remains the sole FIFO/audit timestamp.
+    next_eligible_at        TEXT
 );
 CREATE INDEX idx_analysis_jobs_workspace ON analysis_jobs(workspace_id);
-CREATE INDEX idx_analysis_jobs_claim_queue ON analysis_jobs(status, created_at);
+CREATE INDEX idx_analysis_jobs_claim_queue ON analysis_jobs(status, next_eligible_at, created_at);
 
 CREATE TABLE reports (
     id              TEXT PRIMARY KEY,
@@ -210,4 +217,18 @@ CREATE TABLE workspace_budgets (
     updated_at       TEXT NOT NULL,
     CHECK (reserved_units >= 0 AND consumed_units >= 0 AND limit_units >= 0),
     CHECK (reserved_units + consumed_units <= limit_units)
+);
+
+-- Admission control / queue fairness (backend/migrations/0008_queue_fairness.sql's
+-- mirror). One row per workspace, created lazily inside enqueue_job()'s OWN
+-- transaction (never on first claim, unlike workspace_budgets above) -
+-- a job must never become 'queued' without its workspace already having
+-- this row, or claim_next_job()'s own INNER JOIN would silently exclude
+-- that workspace from ever being selected. created_at breaks ties between
+-- two workspaces that have never been claimed (last_claimed_at IS NULL
+-- for both) - see claim_next_job()'s own docstring for the full ORDER BY.
+CREATE TABLE workspace_queue_state (
+    workspace_id     TEXT PRIMARY KEY REFERENCES workspaces(id),
+    created_at       TEXT NOT NULL,
+    last_claimed_at  TEXT
 );

@@ -121,19 +121,21 @@ class MigrationIntegrationTests(unittest.TestCase):
         self.conn, self.applied = _reset_database_and_migrate()
         self.addCleanup(self.conn.close)
 
-    def test_fresh_database_applies_all_seven_migrations_in_order(self):
+    def test_fresh_database_applies_all_eight_migrations_in_order(self):
         # 0002_auth_tokens.sql (Phase 2), 0003_entitlement_status_expand.sql
         # and 0004_entitlement_event_provenance.sql (Phase 3),
         # 0005_job_queue_hardening.sql (Phase 4, D-079),
-        # 0006_retention_purge.sql (Phase 6A, D-081), and
-        # 0007_billing_interval.sql (Phase 7, D-086) added alongside
-        # 0001_initial_schema.sql (Phase 1).
+        # 0006_retention_purge.sql (Phase 6A, D-081),
+        # 0007_billing_interval.sql (Phase 7, D-086), and
+        # 0008_queue_fairness.sql (admission control / queue fairness,
+        # post reap-atomicity-fix and worker-fencing hardening) added
+        # alongside 0001_initial_schema.sql (Phase 1).
         self.assertEqual(
             self.applied,
             [
                 "0001_initial_schema", "0002_auth_tokens", "0003_entitlement_status_expand",
                 "0004_entitlement_event_provenance", "0005_job_queue_hardening", "0006_retention_purge",
-                "0007_billing_interval",
+                "0007_billing_interval", "0008_queue_fairness",
             ],
         )
 
@@ -156,7 +158,7 @@ class MigrationIntegrationTests(unittest.TestCase):
             seen_statuses.add(repo.get_entitlement_by_workspace(self.conn, workspace_id)["status"])
         self.assertEqual(seen_statuses, {"incomplete_expired", "unpaid"})
 
-    def test_all_fourteen_tables_exist(self):
+    def test_all_fifteen_tables_exist(self):
         cur = db.execute(
             self.conn,
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
@@ -167,6 +169,7 @@ class MigrationIntegrationTests(unittest.TestCase):
             "entitlements", "projects", "contracts", "analysis_jobs", "reports",
             "audit_events", "webhook_events", "auth_tokens",
             "workspace_budgets",  # Phase 4, 0005_job_queue_hardening.sql (D-079).
+            "workspace_queue_state",  # Admission control / queue fairness, 0008_queue_fairness.sql.
         }
         self.assertEqual(tables, expected)
 
@@ -334,6 +337,12 @@ class FencingIntegrationTests(unittest.TestCase):
 
         self._expire_lease(job_id)
         self.assertEqual(repo.reap_expired_jobs(self.conn), {"requeued": 1, "failed": 0})
+        # The reap above set a retry-backoff next_eligible_at (queue
+        # fairness) - simulate that window having already passed, exactly
+        # like _expire_lease() above simulates state claim_next_job()'s
+        # own API can't produce.
+        db.execute(self.conn, "UPDATE analysis_jobs SET next_eligible_at = '2000-01-01T00:00:00+00:00' WHERE id = ?", (job_id,))
+        self.conn.commit()
 
         reclaimed = repo.claim_next_job(self.conn, "worker-C")
         self.assertEqual(reclaimed["id"], job_id)
@@ -441,6 +450,188 @@ class ConcurrentClaimIntegrationTests(unittest.TestCase):
         final = repo.get_job(self.conn, job_id)
         self.assertEqual(final["status"], "claimed")
         self.assertEqual(final["claimed_by"], winners[0])
+
+
+class QueueFairnessIntegrationTests(unittest.TestCase):
+    """Admission control / queue fairness against a REAL Postgres server
+    with REAL concurrent connections and threads - tests/test_backend_
+    job_queue.py's own QueueFairnessTests already proves the ORDERING
+    logic (sequential calls, SQLite); this class proves the LOCKING
+    discipline (FOR UPDATE OF s, j SKIP LOCKED - see claim_next_job()'s
+    own Postgres docstring) actually holds under genuine concurrency,
+    which a single-connection test cannot exercise."""
+
+    def setUp(self):
+        self.conn, _ = _reset_database_and_migrate()
+        self.addCleanup(self.conn.close)
+
+    def _seed(self, label, job_count=1):
+        user_id = repo.create_user(self.conn, "%s@example.com" % label)
+        workspace_id = repo.create_workspace(self.conn, label.upper(), user_id)
+        contract_id = repo.create_contract(self.conn, workspace_id, "s3://%s" % label, "hash-%s" % label, "%s.sol" % label)
+        job_ids = [repo.enqueue_job(self.conn, workspace_id, contract_id, user_id, "quick") for _ in range(job_count)]
+        return workspace_id, job_ids
+
+    def test_two_real_workers_racing_serve_two_distinct_workspaces_not_the_same_one_twice(self):
+        workspace_a, (a1, a2) = self._seed("a", job_count=2)
+        workspace_b, (b1,) = self._seed("b", job_count=1)
+
+        results, errors = {}, []
+        barrier = threading.Barrier(2)
+
+        def _claim(worker_id):
+            conn = db.connect_postgres(DSN)
+            try:
+                barrier.wait(timeout=5)
+                results[worker_id] = repo.claim_next_job(conn, worker_id)
+            except Exception as exc:  # pragma: no cover - the whole point of this test is that this never happens.
+                errors.append(exc)
+            finally:
+                conn.close()
+
+        threads = [threading.Thread(target=_claim, args=(w,)) for w in ("worker-1", "worker-2")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        self.assertEqual(errors, [], "unhandled error(s): %r" % (errors,))
+        claimed_ids = {r["id"] for r in results.values() if r is not None}
+        self.assertEqual(claimed_ids, {a1, b1}, "expected exactly A's oldest job + B's only job, got: %r" % (results,))
+        self.assertNotIn(a2, claimed_ids)  # never A1+A2 while B was eligible and unserved.
+
+    def test_five_real_workers_racing_across_five_workspaces_each_served_exactly_once(self):
+        workspaces_and_jobs = [self._seed(label, job_count=2) for label in ("a", "b", "c", "d", "e")]
+
+        results, errors = {}, []
+        worker_ids = ["worker-%d" % i for i in range(1, 6)]
+        barrier = threading.Barrier(len(worker_ids))
+
+        def _claim(worker_id):
+            conn = db.connect_postgres(DSN)
+            try:
+                barrier.wait(timeout=5)
+                results[worker_id] = repo.claim_next_job(conn, worker_id)
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+            finally:
+                conn.close()
+
+        threads = [threading.Thread(target=_claim, args=(w,)) for w in worker_ids]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
+
+        self.assertEqual(errors, [], "unhandled error(s): %r" % (errors,))
+        claimed = [r for r in results.values() if r is not None]
+        self.assertEqual(len(claimed), 5, "expected all 5 workers to claim something, got: %r" % (results,))
+        claimed_workspaces = {job["workspace_id"] for job in claimed}
+        self.assertEqual(
+            claimed_workspaces, {ws for ws, _ in workspaces_and_jobs},
+            "expected all 5 distinct workspaces served exactly once in the first round, got: %r" % (claimed_workspaces,),
+        )
+        claimed_ids = {job["id"] for job in claimed}
+        self.assertEqual(len(claimed_ids), 5)  # also no double-claim of any single job.
+
+    def test_concurrent_enqueues_for_a_brand_new_workspace_create_exactly_one_state_row(self):
+        # tests/test_backend_job_queue.py's own QueueFairnessTests already
+        # proves this SEQUENTIALLY (single connection) - this proves it
+        # against real GENUINE concurrency: two real connections racing
+        # to be the FIRST enqueue_job() call ever made for the same
+        # brand-new workspace, both attempting their own "INSERT ...
+        # ON CONFLICT (workspace_id) DO NOTHING" for workspace_queue_state
+        # inside their own transaction, at the same time.
+        user_id = repo.create_user(self.conn, "concurrent-enqueue@example.com")
+        workspace_id = repo.create_workspace(self.conn, "Concurrent Enqueue WS", user_id)
+        contract_id = repo.create_contract(self.conn, workspace_id, "s3://concurrent-enqueue", "hash", "C.sol")
+
+        results, errors = {}, []
+        barrier = threading.Barrier(2)
+
+        def _enqueue(worker_id):
+            conn = db.connect_postgres(DSN)
+            try:
+                barrier.wait(timeout=5)
+                results[worker_id] = repo.enqueue_job(conn, workspace_id, contract_id, user_id, "quick")
+            except Exception as exc:  # pragma: no cover - the whole point of ON CONFLICT DO NOTHING is that this never happens.
+                errors.append(exc)
+            finally:
+                conn.close()
+
+        threads = [threading.Thread(target=_enqueue, args=(w,)) for w in ("enqueuer-1", "enqueuer-2")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        self.assertEqual(errors, [], "unhandled error(s) racing to create workspace_queue_state: %r" % (errors,))
+        self.assertEqual(len(results), 2)  # both enqueues succeeded - each created its OWN job.
+        job_ids = set(results.values())
+        self.assertEqual(len(job_ids), 2)  # two distinct jobs, not a collision.
+
+        rows = db.execute(self.conn, "SELECT * FROM workspace_queue_state WHERE workspace_id = ?", (workspace_id,)).fetchall()
+        self.assertEqual(len(rows), 1, "expected exactly one workspace_queue_state row, got: %r" % (rows,))
+        # Both jobs must be genuine claim candidates - neither was silently
+        # excluded by a missing/duplicated state row.
+        first = repo.claim_next_job(self.conn, "worker-verify-1")
+        second = repo.claim_next_job(self.conn, "worker-verify-2")
+        self.assertEqual({first["id"], second["id"]}, job_ids)
+
+
+class BudgetContentionIntegrationTests(unittest.TestCase):
+    """The one gap the prior concurrency audit flagged and left open:
+    two real connections racing for the LAST unit of a workspace's
+    budget - a DIFFERENT race from ConcurrentClaimIntegrationTests'
+    own (that one races for a JOB; this one races for a budget
+    RESERVATION) and explicitly kept as its own regression, separate
+    from queue fairness above."""
+
+    def setUp(self):
+        self.conn, _ = _reset_database_and_migrate()
+        self.addCleanup(self.conn.close)
+
+    def test_two_real_connections_racing_for_the_last_unit_exactly_one_wins(self):
+        user_id = repo.create_user(self.conn, "budget-race@example.com")
+        workspace_id = repo.create_workspace(self.conn, "Budget Race WS", user_id)
+        # Exhaust the ceiling down to exactly 1 unit of headroom, so two
+        # simultaneous 1-unit reservations can never BOTH legitimately fit.
+        # The budget row does not exist yet (lazily created on first
+        # reserve - workspace_budgets' own docstring) - reserve_workspace_
+        # budget() itself creates it, so DEFAULT_BUDGET_LIMIT_UNITS (the
+        # known ceiling a fresh row always starts with) is used directly
+        # rather than reading a row that is not there yet.
+        almost_all = repo.DEFAULT_BUDGET_LIMIT_UNITS - 1
+        repo.reserve_workspace_budget(self.conn, workspace_id, almost_all)
+        repo.consume_reserved_workspace_budget(self.conn, workspace_id, almost_all)
+
+        results, errors = {}, []
+        barrier = threading.Barrier(2)
+
+        def _reserve(worker_id):
+            conn = db.connect_postgres(DSN)
+            try:
+                barrier.wait(timeout=5)
+                results[worker_id] = repo.reserve_workspace_budget(conn, workspace_id, 1)
+            except Exception as exc:  # pragma: no cover - a CHECK violation here would be the bug this test guards against.
+                errors.append(exc)
+            finally:
+                conn.close()
+
+        threads = [threading.Thread(target=_reserve, args=(w,)) for w in ("worker-A", "worker-B")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        self.assertEqual(errors, [], "unhandled error(s) - a real CHECK violation would land here: %r" % (errors,))
+        winners = [w for w, r in results.items() if r is True]
+        losers = [w for w, r in results.items() if r is False]
+        self.assertEqual(len(winners), 1, "expected exactly one winner, got: %r" % (results,))
+        self.assertEqual(len(losers), 1)
+
+        final = repo.get_workspace_budget(self.conn, workspace_id)
+        self.assertEqual(final["reserved_units"] + final["consumed_units"], final["limit_units"])  # exactly at the ceiling, never over.
 
 
 class AuthTokenIntegrationTests(unittest.TestCase):

@@ -424,14 +424,36 @@ def enqueue_job(
     mode: str,
     idempotency_key: Optional[str] = None,
 ) -> str:
+    """ADMISSION CONTROL / QUEUE FAIRNESS: ensures workspace_id's
+    workspace_queue_state row exists in the SAME transaction as the job
+    INSERT below, before it - a job must never reach 'queued' while its
+    workspace has no fairness-cursor row, or claim_next_job()'s own INNER
+    JOIN would silently exclude that workspace from ever being selected
+    (a self-inflicted, permanent starvation this function alone can
+    prevent). "INSERT ... ON CONFLICT DO NOTHING" (not a try/INSERT-
+    except-IntegrityError pattern like reserve_workspace_budget()'s own
+    _ensure_workspace_budget_row()) deliberately never raises for a
+    concurrent duplicate - an IntegrityError here would poison the whole
+    Postgres transaction (see this codebase's own established finding on
+    that), which would wrongly also lose the job INSERT that follows in
+    this SAME transaction. Same ON CONFLICT syntax on both backends - no
+    placeholder-style translation exists for it in backend/db.py, and
+    none is needed; both engines accept it identically."""
     if mode not in ("quick", "standard", "pro"):
         raise RepositoryError("mode must be one of quick/standard/pro, got %r" % mode)
     job_id = new_id()
+    now = utcnow_iso()
+    db.execute(
+        conn,
+        "INSERT INTO workspace_queue_state (workspace_id, created_at, last_claimed_at) VALUES (?, ?, NULL) "
+        "ON CONFLICT (workspace_id) DO NOTHING",
+        (workspace_id, now),
+    )
     db.execute(
         conn,
         "INSERT INTO analysis_jobs (id, workspace_id, contract_id, requested_by_user_id, mode, idempotency_key, created_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (job_id, workspace_id, contract_id, requested_by_user_id, mode, idempotency_key, utcnow_iso()),
+        (job_id, workspace_id, contract_id, requested_by_user_id, mode, idempotency_key, now),
     )
     conn.commit()
     return job_id
@@ -498,19 +520,60 @@ def list_jobs_by_workspace(
 
 LEASE_DURATION_SECONDS = 15 * 60  # generous for one analysis job; matches auth.py's own "short-lived by design" philosophy at job scale, not login-token scale.
 
+# Admission control / queue fairness (read-only design audit, this phase's
+# own docstring below) - retry backoff for reap_expired_jobs()'s requeue
+# branch. Growing (doubles per prior attempt) so a job that keeps timing
+# out gives progressively more room to genuinely new work, capped so the
+# growth never becomes unbounded - though in practice _MAX_JOB_ATTEMPTS=3
+# already bounds it to at most two requeue backoffs (5s, 10s) before a
+# third failure goes to the terminal 'failed' branch instead, which never
+# sets next_eligible_at at all (a terminal job is never a claim candidate
+# again). The cap exists as belt-and-suspenders in case _MAX_JOB_ATTEMPTS
+# is ever raised - not something the current values alone rely on.
+QUEUE_FAIRNESS_BACKOFF_BASE_SECONDS = 5
+QUEUE_FAIRNESS_BACKOFF_MAX_SECONDS = 60
+
+
+def _compute_next_eligible_at(now: datetime, attempt_count_before_requeue: int) -> str:
+    backoff = min(
+        QUEUE_FAIRNESS_BACKOFF_BASE_SECONDS * (2 ** attempt_count_before_requeue),
+        QUEUE_FAIRNESS_BACKOFF_MAX_SECONDS,
+    )
+    return (now + timedelta(seconds=backoff)).isoformat()
+
 
 def claim_next_job(conn: Any, worker_id: str) -> Optional[Dict[str, Any]]:
-    """Claims the oldest still-queued job for worker_id, or returns None
-    if there is nothing queued OR another claimant won the race for the
-    one job this call saw. Dispatches to a genuinely different query per
-    backend - this is the one place in this module that cannot be reduced
-    to a placeholder/value translation (see backend/db.py's docstring):
-    Postgres gets the real, verified `FOR UPDATE SKIP LOCKED` claim query;
-    SQLite keeps its existing conditional-UPDATE-and-check-rowcount
-    pattern, which is the only claim safety SQLite's locking model can
-    express (see schema_sqlite.sql's docstring). Stamps lease_expires_at
-    (Phase 4) so a crashed/hung worker's claim can later be found and
-    reclaimed by reap_expired_jobs() - see that function's docstring."""
+    """Claims one job for worker_id, or returns None if there is nothing
+    eligible OR another claimant won the race for the one job this call
+    saw. Dispatches to a genuinely different query per backend - this is
+    the one place in this module that cannot be reduced to a placeholder/
+    value translation (see backend/db.py's docstring). Stamps
+    lease_expires_at (Phase 4) so a crashed/hung worker's claim can later
+    be found and reclaimed by reap_expired_jobs() - see that function's
+    docstring.
+
+    ADMISSION CONTROL / QUEUE FAIRNESS (read-only design audit, post reap-
+    atomicity-fix and worker-fencing hardening): a confirmed audit found
+    plain "oldest queued job globally" selection let one workspace occupy
+    every idle worker while a different workspace's job waited, with no
+    bound - and reap_expired_jobs()'s requeue never touched created_at,
+    so a repeatedly-expiring job kept its original (favorable) FIFO
+    position ahead of genuinely newer jobs from other workspaces. This
+    function now selects the oldest ELIGIBLE job (next_eligible_at IS
+    NULL OR already past - see reap_expired_jobs()'s own docstring for
+    who sets it and why) belonging to the LEAST RECENTLY CLAIMED eligible
+    workspace (workspace_queue_state.last_claimed_at), never the
+    globally-oldest job outright. Deterministic tie-break chain, in
+    order: workspace last_claimed_at (NULL = never claimed, sorts first
+    on both backends - see the SQLite function's own note on why no
+    explicit NULLS FIRST is written there), that workspace's OWN
+    workspace_queue_state.created_at (breaks ties between two workspaces
+    both never claimed), the job's own created_at, and finally the job's
+    own id as a last-resort tie-break for a genuine created_at
+    collision - never relying on timestamp resolution alone. Budget
+    (workspace_budgets) and plan/entitlement are NEVER inputs to this
+    ordering - fairness here is completely independent of both, by
+    design (see the read-only design audit for why)."""
     if db.is_postgres(conn):
         return _claim_next_job_postgres(conn, worker_id)
     return _claim_next_job_sqlite(conn, worker_id)
@@ -520,38 +583,128 @@ def _lease_expiry(now: datetime) -> str:
     return (now + timedelta(seconds=LEASE_DURATION_SECONDS)).isoformat()
 
 
+_CLAIM_CANDIDATE_ORDER_SQL = (
+    "s.last_claimed_at ASC, s.created_at ASC, j.created_at ASC, j.id ASC"
+)
+
+
 def _claim_next_job_sqlite(conn: Any, worker_id: str) -> Optional[Dict[str, Any]]:
-    cur = db.execute(conn, "SELECT id FROM analysis_jobs WHERE status = 'queued' ORDER BY created_at LIMIT 1")
-    row = cur.fetchone()
-    if row is None:
-        return None
-    job_id = row["id"]
-    now = datetime.now(timezone.utc)
-    cur = db.execute(
-        conn,
-        "UPDATE analysis_jobs SET status = 'claimed', claimed_by = ?, claimed_at = ?, lease_expires_at = ? WHERE id = ? AND status = 'queued'",
-        (worker_id, now.isoformat(), _lease_expiry(now), job_id),
-    )
-    conn.commit()
-    if cur.rowcount == 0:
-        return None  # lost the race between our SELECT and our UPDATE.
-    return get_job(conn, job_id)
+    """No FOR UPDATE/SKIP LOCKED exists in SQLite. An explicit BEGIN
+    IMMEDIATE (rather than sqlite3's own default DEFERRED transaction)
+    acquires the RESERVED write lock BEFORE the fairness-ordered SELECT
+    below even runs - closing the exact TOCTOU window a plain SELECT-
+    then-conditional-UPDATE would leave open (two concurrent callers both
+    reading the SAME, not-yet-updated workspace_queue_state.
+    last_claimed_at before either commits - the gap a dedicated
+    concurrency review of the first draft of this design found and this
+    function was corrected to close). A second concurrent caller's own
+    BEGIN IMMEDIATE blocks (or raises sqlite3.OperationalError under a
+    zero busy_timeout) until this one commits or rolls back - full
+    serialization of EVERY claim against every other, not the
+    per-workspace granularity the Postgres path achieves; an accepted
+    trade-off given SQLite's own single-writer model, and given
+    production never actually uses this path - backend/main.py's
+    _connect_fn() is hardcoded to db.connect_postgres(), never a silent
+    SQLite fallback (that module's own docstring). This path is
+    test/dev-only, not the concurrent-production story.
+
+    No explicit NULLS FIRST in the ORDER BY below (unlike the Postgres
+    version) - SQLite's own default null-ordering for ASC already sorts
+    NULL as smaller than any other value, so a never-claimed workspace's
+    NULL last_claimed_at already sorts first without needing (and without
+    SQLite versions bundled with Python 3.8-3.9 even supporting) that
+    keyword - Postgres's own default is the OPPOSITE (NULLS LAST for
+    ASC), which is exactly why that version spells it out explicitly.
+    Never assume the two are equivalent."""
+    db.execute(conn, "BEGIN IMMEDIATE")
+    try:
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        cur = db.execute(
+            conn,
+            "SELECT j.id, j.workspace_id FROM analysis_jobs j "
+            "JOIN workspace_queue_state s ON s.workspace_id = j.workspace_id "
+            "WHERE j.status = 'queued' AND (j.next_eligible_at IS NULL OR j.next_eligible_at <= ?) "
+            "ORDER BY " + _CLAIM_CANDIDATE_ORDER_SQL + " LIMIT 1",
+            (now_iso,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            conn.commit()
+            return None
+        job_id, workspace_id = row["id"], row["workspace_id"]
+        cur = db.execute(
+            conn,
+            "UPDATE analysis_jobs SET status = 'claimed', claimed_by = ?, claimed_at = ?, lease_expires_at = ? "
+            "WHERE id = ? AND status = 'queued'",
+            (worker_id, now_iso, _lease_expiry(now), job_id),
+        )
+        if cur.rowcount == 0:
+            # Should not happen under BEGIN IMMEDIATE's full serialization -
+            # kept anyway for the same CAS discipline every other claim/
+            # transition function in this module already applies.
+            conn.commit()
+            return None
+        db.execute(
+            conn,
+            "UPDATE workspace_queue_state SET last_claimed_at = ? WHERE workspace_id = ?",
+            (now_iso, workspace_id),
+        )
+        conn.commit()  # the ONE commit - job claim and fairness cursor land together, or neither does.
+        return get_job(conn, job_id)
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def _claim_next_job_postgres(conn: Any, worker_id: str) -> Optional[Dict[str, Any]]:
-    # Same query verified by backend/verify_postgres.sh's step [5] (a real
-    # two-session concurrent race, exactly one winner) - RETURNING * in
-    # place of a hardcoded column list so this never drifts from the
-    # table's actual columns.
+    """FOR UPDATE OF s, j SKIP LOCKED (s = workspace_queue_state, j =
+    analysis_jobs) - locking s, not just j, is what makes fairness itself
+    safe under concurrency: it is the fix for a confirmed gap in this
+    design's first draft, which only locked j and therefore let two
+    concurrent claimers both select the SAME least-recently-served
+    workspace's two DIFFERENT jobs (SKIP LOCKED on j alone only prevents
+    two callers from picking the identical row, not two rows from the
+    identical workspace). Locking s means a workspace whose row a
+    concurrent caller already holds becomes entirely unavailable to this
+    one (every job joined to that s row is excluded by SKIP LOCKED, since
+    the join is 1:1 on workspace_id) - this caller's own ORDER BY then
+    naturally falls through to the next least-recently-served ELIGIBLE
+    workspace instead, never blocking. FOR UPDATE OF j is kept alongside
+    (defense in depth, matching the exclusivity the pre-fairness version
+    of this query already had). Different workspaces' own state rows are
+    independent - two callers converging on two different workspaces
+    never contend with each other at all; no single shared cursor row
+    exists anywhere in this design.
+
+    last_claimed_at is updated on the SAME connection, before the ONE
+    commit below - no other transaction can observe this workspace's
+    fairness state as anything other than "still locked by an in-flight
+    claim" or "already reflects this claim", never a stale in-between
+    value, closing the exact race a design review's first pass found."""
     now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
     cur = db.execute(
         conn,
+        "WITH candidate AS ("
+        "  SELECT j.id, j.workspace_id FROM analysis_jobs j "
+        "  JOIN workspace_queue_state s ON s.workspace_id = j.workspace_id "
+        "  WHERE j.status = 'queued' AND (j.next_eligible_at IS NULL OR j.next_eligible_at <= ?) "
+        "  ORDER BY s.last_claimed_at ASC NULLS FIRST, s.created_at ASC, j.created_at ASC, j.id ASC "
+        "  FOR UPDATE OF s, j SKIP LOCKED LIMIT 1"
+        ") "
         "UPDATE analysis_jobs SET status = 'claimed', claimed_by = ?, claimed_at = ?, lease_expires_at = ? "
-        "WHERE id = (SELECT id FROM analysis_jobs WHERE status = 'queued' "
-        "ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *",
-        (worker_id, now.isoformat(), _lease_expiry(now)),
+        "FROM candidate WHERE analysis_jobs.id = candidate.id "
+        "RETURNING analysis_jobs.*",
+        (now_iso, worker_id, now_iso, _lease_expiry(now)),
     )
     row = cur.fetchone()
+    if row is not None:
+        db.execute(
+            conn,
+            "UPDATE workspace_queue_state SET last_claimed_at = ? WHERE workspace_id = ?",
+            (now_iso, row["workspace_id"]),
+        )
     conn.commit()
     return db.normalize_row(row)
 
@@ -658,12 +811,22 @@ def reap_expired_jobs(conn: Any, max_attempts: int = _MAX_JOB_ATTEMPTS) -> Dict[
     for job in candidates:
         will_requeue = job["attempt_count"] < max_attempts
         if will_requeue:
+            # ADMISSION CONTROL / QUEUE FAIRNESS: next_eligible_at is the
+            # ONLY new thing this branch does - a retry-backoff
+            # eligibility gate (see _compute_next_eligible_at()'s own
+            # comment for the formula), added to this SAME UPDATE
+            # statement, inside the SAME single-commit transaction this
+            # function's own TRANSACTIONAL ATOMICITY section above
+            # already established. No new query, no new commit boundary -
+            # the atomicity property this function exists to guarantee is
+            # completely unaffected by this one extra SET clause.
+            next_eligible_at = _compute_next_eligible_at(datetime.now(timezone.utc), job["attempt_count"])
             cur = db.execute(
                 conn,
                 "UPDATE analysis_jobs SET status = 'queued', claimed_by = NULL, claimed_at = NULL, "
-                "lease_expires_at = NULL, attempt_count = attempt_count + 1 "
+                "lease_expires_at = NULL, attempt_count = attempt_count + 1, next_eligible_at = ? "
                 "WHERE id = ? AND status IN ('claimed', 'running') AND lease_expires_at IS NOT NULL AND lease_expires_at < ?",
-                (job["id"], now),
+                (next_eligible_at, job["id"], now),
             )
         else:
             cur = db.execute(

@@ -7,6 +7,9 @@ Run from the repository root: python -m unittest
 """
 from __future__ import annotations
 
+import os
+import tempfile
+import threading
 import unittest
 
 import backend.repository as repo
@@ -443,6 +446,13 @@ class FinalizeJobAttemptTests(unittest.TestCase):
         self.conn.execute("UPDATE analysis_jobs SET lease_expires_at = '2000-01-01T00:00:00+00:00' WHERE id = ?", (job_id,))
         self.conn.commit()
         self.assertEqual(repo.reap_expired_jobs(self.conn), {"requeued": 1, "failed": 0})
+        # The reap above set a retry-backoff next_eligible_at (queue
+        # fairness) - simulate that window having already passed, so this
+        # test can drive straight to "a different worker claims attempt
+        # N+1", exactly like ReapExpiredJobsTests's own _expire_lease()
+        # simulates state claim_next_job()'s own API can't produce.
+        self.conn.execute("UPDATE analysis_jobs SET next_eligible_at = '2000-01-01T00:00:00+00:00' WHERE id = ?", (job_id,))
+        self.conn.commit()
 
         # A DIFFERENT worker claims the SAME job_id for attempt N+1 and
         # drives it to 'running' again - status is 'running' again, but
@@ -562,6 +572,242 @@ class FinalizeJobAttemptTests(unittest.TestCase):
                 from_status="queued", to_status="running",
             )
         self.assertEqual(repo.get_job(self.conn, job_id)["status"], "queued")
+
+
+def _seed_workspace(conn, label):
+    user_id = repo.create_user(conn, "%s@example.com" % label)
+    workspace_id = repo.create_workspace(conn, label.upper(), user_id)
+    contract_id = repo.create_contract(conn, workspace_id, "s3://%s" % label, "hash-%s" % label, "%s.sol" % label)
+    return user_id, workspace_id, contract_id
+
+
+class QueueFairnessTests(unittest.TestCase):
+    """Admission control / queue fairness (read-only design audit, post
+    reap-atomicity-fix and worker-fencing hardening): claim_next_job()
+    now orders candidates by (workspace_queue_state.last_claimed_at,
+    that row's own created_at, job created_at, job id) instead of plain
+    global created_at - see that function's own docstring for the full
+    reasoning. These tests exercise the ordering logic directly via
+    SEQUENTIAL claim_next_job() calls on one connection - sufficient to
+    prove the ORDERING property itself (a genuinely concurrent race
+    additionally needs the locking discipline proven safe too, which is
+    what SqliteBeginImmediateConcurrencyTests below and the real-Postgres
+    tests in tests/test_backend_postgres_integration.py exercise)."""
+
+    def setUp(self):
+        self.conn = repo.connect(":memory:")
+        repo.init_schema(self.conn)
+        self.addCleanup(self.conn.close)
+
+    def test_two_sequential_claims_prefer_the_never_served_workspace_over_a_second_job_from_the_first(self):
+        user_a, workspace_a, contract_a = _seed_workspace(self.conn, "a")
+        a1 = repo.enqueue_job(self.conn, workspace_a, contract_a, user_a, "quick")
+        a2 = repo.enqueue_job(self.conn, workspace_a, contract_a, user_a, "quick")
+        user_b, workspace_b, contract_b = _seed_workspace(self.conn, "b")
+        b1 = repo.enqueue_job(self.conn, workspace_b, contract_b, user_b, "quick")
+
+        first = repo.claim_next_job(self.conn, "worker-1")
+        self.assertEqual(first["id"], a1)  # A registered first, never served - wins the opening tie-break.
+
+        second = repo.claim_next_job(self.conn, "worker-2")
+        self.assertEqual(second["id"], b1)  # NOT a2 - B has never been served, A now has.
+        self.assertNotEqual(second["id"], a2)
+
+    def test_monopolization_workspace_with_many_jobs_does_not_block_a_single_job_from_another(self):
+        user_a, workspace_a, contract_a = _seed_workspace(self.conn, "a")
+        for _ in range(100):
+            repo.enqueue_job(self.conn, workspace_a, contract_a, user_a, "quick")
+        user_b, workspace_b, contract_b = _seed_workspace(self.conn, "b")
+        b1 = repo.enqueue_job(self.conn, workspace_b, contract_b, user_b, "quick")
+
+        first = repo.claim_next_job(self.conn, "worker-1")
+        self.assertEqual(repo.get_job(self.conn, first["id"])["workspace_id"], workspace_a)
+
+        second = repo.claim_next_job(self.conn, "worker-2")
+        self.assertEqual(second["id"], b1)  # B's one job is served on the SECOND claim, not after A's other 99.
+
+    def test_three_workspaces_first_round_serves_each_exactly_once(self):
+        user_a, workspace_a, contract_a = _seed_workspace(self.conn, "a")
+        a1 = repo.enqueue_job(self.conn, workspace_a, contract_a, user_a, "quick")
+        a2 = repo.enqueue_job(self.conn, workspace_a, contract_a, user_a, "quick")
+        a3 = repo.enqueue_job(self.conn, workspace_a, contract_a, user_a, "quick")
+        user_b, workspace_b, contract_b = _seed_workspace(self.conn, "b")
+        b1 = repo.enqueue_job(self.conn, workspace_b, contract_b, user_b, "quick")
+        b2 = repo.enqueue_job(self.conn, workspace_b, contract_b, user_b, "quick")
+        user_c, workspace_c, contract_c = _seed_workspace(self.conn, "c")
+        c1 = repo.enqueue_job(self.conn, workspace_c, contract_c, user_c, "quick")
+
+        first_round = [repo.claim_next_job(self.conn, "worker-%d" % i)["id"] for i in (1, 2, 3)]
+        self.assertEqual(set(first_round), {a1, b1, c1})  # each workspace served exactly once - never a2/a3/b2 this round.
+
+        # Second round: C has nothing left and drops out cleanly (no
+        # "dead turn"); A and B split the two remaining live workers.
+        second_round = [repo.claim_next_job(self.conn, "worker-%d" % i)["id"] for i in (4, 5)]
+        self.assertEqual(set(second_round), {a2, b2})
+
+    def test_reaped_job_is_not_immediately_reclaimable_and_a_newer_job_gets_served_first(self):
+        user_a, workspace_a, contract_a = _seed_workspace(self.conn, "a")
+        a1 = repo.enqueue_job(self.conn, workspace_a, contract_a, user_a, "quick")
+        claimed = repo.claim_next_job(self.conn, "worker-A")
+        self.assertEqual(claimed["id"], a1)
+        self.conn.execute("UPDATE analysis_jobs SET lease_expires_at = '2000-01-01T00:00:00+00:00' WHERE id = ?", (a1,))
+        self.conn.commit()
+        self.assertEqual(repo.reap_expired_jobs(self.conn), {"requeued": 1, "failed": 0})
+        job_after_reap = repo.get_job(self.conn, a1)
+        self.assertEqual(job_after_reap["status"], "queued")
+        self.assertIsNotNone(job_after_reap["next_eligible_at"])  # retry-backoff gate is set.
+
+        # B1 arrives AFTER the reap.
+        user_b, workspace_b, contract_b = _seed_workspace(self.conn, "b")
+        b1 = repo.enqueue_job(self.conn, workspace_b, contract_b, user_b, "quick")
+
+        # Immediately (the backoff window has not passed), a1 must be
+        # gated out entirely - b1 wins, regardless of what the fairness
+        # cursor alone would have said.
+        next_claim = repo.claim_next_job(self.conn, "worker-2")
+        self.assertEqual(next_claim["id"], b1)
+
+    def test_backoff_is_bounded_and_eventually_makes_the_retry_eligible_again(self):
+        user_a, workspace_a, contract_a = _seed_workspace(self.conn, "a")
+        a1 = repo.enqueue_job(self.conn, workspace_a, contract_a, user_a, "quick")
+        repo.claim_next_job(self.conn, "worker-A")
+        self.conn.execute("UPDATE analysis_jobs SET lease_expires_at = '2000-01-01T00:00:00+00:00' WHERE id = ?", (a1,))
+        self.conn.commit()
+        repo.reap_expired_jobs(self.conn)
+        # Simulate the backoff window having fully elapsed.
+        self.conn.execute("UPDATE analysis_jobs SET next_eligible_at = '2000-01-01T00:00:00+00:00' WHERE id = ?", (a1,))
+        self.conn.commit()
+
+        reclaimed = repo.claim_next_job(self.conn, "worker-B")
+        self.assertEqual(reclaimed["id"], a1)  # eligible again once the gate has passed.
+
+    def test_both_workspaces_never_served_breaks_the_tie_by_state_row_creation_order(self):
+        # Neither A nor B has ever been claimed - last_claimed_at is NULL
+        # for both. B's workspace_queue_state row is created (at
+        # enqueue_job() time) strictly after A's, so A must win.
+        user_a, workspace_a, contract_a = _seed_workspace(self.conn, "a")
+        a1 = repo.enqueue_job(self.conn, workspace_a, contract_a, user_a, "quick")
+        user_b, workspace_b, contract_b = _seed_workspace(self.conn, "b")
+        repo.enqueue_job(self.conn, workspace_b, contract_b, user_b, "quick")
+
+        first = repo.claim_next_job(self.conn, "worker-1")
+        self.assertEqual(first["id"], a1)
+
+    def test_identical_job_created_at_within_a_workspace_breaks_the_tie_by_job_id(self):
+        # Forces a genuine created_at collision (enqueue_job()'s own
+        # utcnow_iso() call is never going to collide on its own) via a
+        # direct INSERT, same convention ClaimNextJobTests.test_claim_
+        # returns_the_oldest_queued_job_first() above already uses for
+        # state the public API can't produce.
+        user_a, workspace_a, contract_a = _seed_workspace(self.conn, "a")
+        # A raw INSERT bypasses enqueue_job() entirely, so it also skips
+        # THAT function's own workspace_queue_state creation - without a
+        # state row, claim_next_job()'s INNER JOIN would silently exclude
+        # this whole workspace (exactly the self-inflicted starvation
+        # enqueue_job()'s own docstring warns about), so create it
+        # directly here too, same raw-SQL convention as the jobs below.
+        self.conn.execute(
+            "INSERT INTO workspace_queue_state (workspace_id, created_at, last_claimed_at) VALUES (?, ?, NULL)",
+            (workspace_a, "2026-01-01T00:00:00+00:00"),
+        )
+        same_created_at = "2026-01-01T00:00:00+00:00"
+        lower_id, higher_id = "aaaa-lower", "zzzz-higher"
+        for job_id in (higher_id, lower_id):  # inserted out of id-order on purpose.
+            self.conn.execute(
+                "INSERT INTO analysis_jobs (id, workspace_id, contract_id, requested_by_user_id, mode, created_at) "
+                "VALUES (?, ?, ?, ?, 'quick', ?)",
+                (job_id, workspace_a, contract_a, user_a, same_created_at),
+            )
+        self.conn.commit()
+
+        first = repo.claim_next_job(self.conn, "worker-1")
+        self.assertEqual(first["id"], lower_id)  # j.id ASC is the final tie-break.
+        second = repo.claim_next_job(self.conn, "worker-2")
+        self.assertEqual(second["id"], higher_id)
+
+    def test_multiple_enqueues_for_the_same_workspace_create_exactly_one_state_row(self):
+        user_a, workspace_a, contract_a = _seed_workspace(self.conn, "a")
+        repo.enqueue_job(self.conn, workspace_a, contract_a, user_a, "quick")
+        repo.enqueue_job(self.conn, workspace_a, contract_a, user_a, "standard")
+        repo.enqueue_job(self.conn, workspace_a, contract_a, user_a, "pro")
+
+        rows = self.conn.execute("SELECT * FROM workspace_queue_state WHERE workspace_id = ?", (workspace_a,)).fetchall()
+        self.assertEqual(len(rows), 1)
+
+    def test_a_new_workspaces_job_is_immediately_a_claim_candidate(self):
+        # Directly demonstrates the gap enqueue_job()'s own docstring
+        # warns about: without the state row existing BEFORE the job
+        # reaches 'queued', an INNER JOIN would silently exclude it.
+        user_a, workspace_a, contract_a = _seed_workspace(self.conn, "a")
+        a1 = repo.enqueue_job(self.conn, workspace_a, contract_a, user_a, "quick")
+        state_row = self.conn.execute("SELECT * FROM workspace_queue_state WHERE workspace_id = ?", (workspace_a,)).fetchone()
+        self.assertIsNotNone(state_row)
+        claimed = repo.claim_next_job(self.conn, "worker-1")
+        self.assertEqual(claimed["id"], a1)
+
+
+class SqliteBeginImmediateConcurrencyTests(unittest.TestCase):
+    """Real multi-connection SQLite concurrency - a genuine file-backed
+    database (never :memory:, which is never shared across connections -
+    the same reason tests/test_backend_worker_supervisor_no_docker.py's
+    own ShutdownEventTests uses one) and real threads, proving BEGIN
+    IMMEDIATE genuinely serializes concurrent claimers rather than merely
+    being correct in the single-connection tests above. Not the
+    production concurrency story (backend/main.py's _connect_fn() is
+    hardcoded to Postgres - see claim_next_job()'s own SQLite-path
+    docstring), but must still be safe wherever this path IS used
+    (tests, local dev)."""
+
+    def setUp(self):
+        fd, self.db_path = tempfile.mkstemp(suffix=".sqlite3")
+        os.close(fd)
+        os.remove(self.db_path)
+        self.seed_conn = repo.connect(self.db_path)
+        repo.init_schema(self.seed_conn)
+        # Cleanups run LIFO: register removal FIRST so close() (registered
+        # LAST) runs FIRST - Windows cannot delete a file with any open
+        # sqlite3 handle on it (same convention already documented in
+        # tests/test_backend_worker_supervisor_no_docker.py).
+        self.addCleanup(lambda: os.remove(self.db_path) if os.path.exists(self.db_path) else None)
+        self.addCleanup(self.seed_conn.close)
+
+    def test_two_real_connections_racing_never_double_claim_the_same_workspaces_turn(self):
+        user_a, workspace_a, contract_a = _seed_workspace(self.seed_conn, "a")
+        a1 = repo.enqueue_job(self.seed_conn, workspace_a, contract_a, user_a, "quick")
+        a2 = repo.enqueue_job(self.seed_conn, workspace_a, contract_a, user_a, "quick")
+        user_b, workspace_b, contract_b = _seed_workspace(self.seed_conn, "b")
+        b1 = repo.enqueue_job(self.seed_conn, workspace_b, contract_b, user_b, "quick")
+
+        results: dict = {}
+        errors: list = []
+        barrier = threading.Barrier(2)
+
+        def _claim(worker_id):
+            conn = repo.connect(self.db_path)
+            try:
+                barrier.wait(timeout=5)  # maximize the chance both BEGIN IMMEDIATEs genuinely overlap.
+                results[worker_id] = repo.claim_next_job(conn, worker_id)
+            except Exception as exc:  # pragma: no cover - the whole point of this test is that this never happens.
+                errors.append(exc)
+            finally:
+                conn.close()
+
+        threads = [threading.Thread(target=_claim, args=(w,)) for w in ("worker-1", "worker-2")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        self.assertEqual(errors, [], "unhandled locking error(s): %r" % (errors,))
+        self.assertEqual(set(results.keys()), {"worker-1", "worker-2"})
+        claimed_ids = {r["id"] for r in results.values() if r is not None}
+        self.assertEqual(claimed_ids, {a1, b1})  # BEGIN IMMEDIATE's serialization means BOTH succeed distinctly - never a1+a2, never a double-claim of either.
+
+        # No transaction left open on either connection used for claiming
+        # (both closed cleanly above); the seed connection is still fully
+        # usable, proving no lock was left dangling anywhere.
+        sanity = repo.claim_next_job(self.seed_conn, "worker-3")
+        self.assertEqual(sanity["id"], a2)  # the one remaining job - reachable, so nothing is stuck locked.
 
 
 if __name__ == "__main__":
