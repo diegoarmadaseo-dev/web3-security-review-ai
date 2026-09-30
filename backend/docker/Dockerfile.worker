@@ -43,8 +43,12 @@
 # (Postgres) nor `stripe` (billing) is installed here - both are HOST-side-only
 # dependencies (backend/db.py, backend/billing.py) this container has no use
 # for and never imports; the worker's own imports are exactly backend/
-# worker_entrypoint.py + backend/llm_client.py + the analyzer's own scripts/
-# tree, confirmed by inspection.
+# worker_entrypoint.py + backend/llm_client.py + backend/context_selection.py
+# (imported at module level by llm_client.py; stdlib-only itself) + the
+# analyzer's own scripts/ tree, confirmed by inspection. Any new local import
+# of backend/llm_client.py must be COPYed below too - tests/
+# test_backend_worker_supervisor.py imports both modules inside the built
+# image to catch exactly that omission.
 #
 # EXISTING ANALYZER CODE: the full .claude/skills/web3-auditor/ tree (scripts/
 # + config/ + references/) is copied in - not just scripts/. preprocess.py's
@@ -76,6 +80,7 @@ RUN pip install --no-cache-dir "anthropic>=0.40,<1" "openai>=1.0,<2"
 COPY .claude/skills/web3-auditor/ /app/.claude/skills/web3-auditor/
 COPY backend/worker_entrypoint.py /app/backend/worker_entrypoint.py
 COPY backend/llm_client.py /app/backend/llm_client.py
+COPY backend/context_selection.py /app/backend/context_selection.py
 RUN touch /app/backend/__init__.py
 
 ENTRYPOINT ["python", "/app/backend/worker_entrypoint.py"]

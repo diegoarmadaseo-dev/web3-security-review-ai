@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -86,6 +87,42 @@ def _config(**overrides):
 
 def _container_exists(name: str) -> bool:
     return subprocess.run(["docker", "inspect", name], capture_output=True).returncode == 0
+
+
+class WorkerImageRuntimeDependencyTests(unittest.TestCase):
+    """The worker image COPYs individual backend/ files (minimal image), so
+    a new local import of backend/llm_client.py that is not also COPYed in
+    Dockerfile.worker only fails inside the real container, at import time,
+    before worker_entrypoint.main() can report anything ("worker entrypoint
+    crashed before producing a result"). This imports the worker's runtime
+    modules inside the image built from the current repository."""
+
+    def test_image_imports_worker_runtime_modules(self):
+        probe = (
+            "import backend.context_selection as cs, backend.llm_client as lc; "
+            "assert lc.context_selection is cs; "
+            "print(cs.APPLICATION_CONTEXT_BUDGET_BYTES)"
+        )
+        run = subprocess.run(
+            ["docker", "run", "--rm", "--network", "none", "--entrypoint", "python", IMAGE_TAG, "-c", probe],
+            capture_output=True, timeout=60,
+        )
+        self.assertEqual(run.returncode, 0, run.stderr.decode(errors="replace"))
+        self.assertEqual(run.stdout.decode().strip(), "1572864")
+
+    def test_every_local_backend_import_of_llm_client_is_in_the_image(self):
+        # Every backend.* module llm_client.py imports must exist in the image,
+        # not just the one known today.
+        with open(os.path.join(REPO_ROOT, "backend", "llm_client.py"), encoding="utf-8") as handle:
+            source = handle.read()
+        local = sorted(set(re.findall(r"^\s*(?:import|from)\s+backend\.(\w+)", source, re.M)))
+        self.assertIn("context_selection", local)
+        probe = "import importlib; [importlib.import_module('backend.' + m) for m in %r]" % (local,)
+        run = subprocess.run(
+            ["docker", "run", "--rm", "--network", "none", "--entrypoint", "python", IMAGE_TAG, "-c", probe],
+            capture_output=True, timeout=60,
+        )
+        self.assertEqual(run.returncode, 0, run.stderr.decode(errors="replace"))
 
 
 class RealContainerJobLifecycleTests(unittest.TestCase):
