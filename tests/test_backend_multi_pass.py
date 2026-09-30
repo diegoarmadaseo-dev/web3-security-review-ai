@@ -234,6 +234,58 @@ class PassArtifactTests(unittest.TestCase):
         self.assertNotIn("Multi-pass analysis", llm_client._build_step6_prompt(FAKE_ARTIFACT, None, "pro"))
 
 
+class PassPromptRulesTests(unittest.TestCase):
+    """The pass note states the pass's location and category-coverage rules,
+    and a pass prompt no longer carries the single-pass rule "partial needs a
+    NOT_ASSESSED category" (R-05 applies to the merged report only,
+    docs/decisiones.md D-098). Single-pass prompts are unchanged."""
+
+    OLD_RULE = 'If scope.completeness is "partial" or "failed", categoryCoverage MUST include at least one entry with status "NOT_ASSESSED"'
+
+    def setUp(self):
+        art = _art()
+        plan = _plan(art, V1, _budget_for(art, V1, 3))
+        self.pass_artifact = mp.build_pass_artifact(art, plan, plan.passes[1])
+        self.note = mp.pass_prompt_note(self.pass_artifact)
+
+    def test_note_states_the_locations_anchor_rule(self):  # A
+        self.assertIn("locations[0] is the identity and ownership anchor of the finding and MUST be a file listed in contextPass.primaryFiles", self.note)
+        self.assertIn("a context-only file must NEVER be used as locations[0]", self.note)
+        self.assertIn("keep the finding anchored to the primary file", self.note)
+        # Same rule pass_scope_errors() enforces for every other location.
+        self.assertIn("Every other location (locations[1..n]) and every gas suggestion location must also be a file listed in contextPass.primaryFiles", self.note)
+        self.assertIn("never a context-only, excluded or unknown file", self.note)
+
+    def test_note_defines_pass_category_coverage(self):  # B
+        self.assertIn("DETECTED is REQUIRED for any category that has at least one non-informational finding in this pass", self.note)
+        self.assertIn("NOT_ASSESSED means the category could not be properly evaluated within this pass's primary files", self.note)
+        self.assertIn("does NOT by itself require any category to be NOT_ASSESSED", self.note)
+
+    def test_pass_prompt_drops_the_old_partial_rule(self):  # C
+        for fmt in (V1, V2):
+            with self.subTest(fmt=fmt):
+                prompt = llm_client._build_step6_prompt(self.pass_artifact, ["previous error"], "pro", **({} if fmt == V1 else {"context_format": fmt}))
+                self.assertNotIn(self.OLD_RULE, prompt)
+                self.assertIn(self.note, prompt)
+
+    def test_single_pass_prompts_keep_the_rule_and_get_no_pass_rules(self):  # D
+        from tests.test_backend_context_selection import _artifact
+        selected = dict(_artifact([("src/A.sol", 5, 100)]), contextSelection={"status": "applied", "selectedFiles": [], "excludedFiles": []})
+        for artifact in (FAKE_ARTIFACT, selected):
+            for mode in ("quick", "standard", "pro"):
+                with self.subTest(mode=mode, selection="contextSelection" in artifact):
+                    prompt = llm_client._build_step6_prompt(artifact, None, mode)
+                    self.assertIn(llm_client._PARTIAL_COVERAGE_RULE, prompt)
+                    self.assertNotIn("Multi-pass analysis", prompt)
+                    self.assertNotIn("identity and ownership anchor", prompt)
+                    self.assertNotIn("Category coverage in this pass", prompt)
+
+    def test_pass_prompt_overhead_stays_within_the_reserve(self):
+        worst = llm_client._build_step6_prompt(self.pass_artifact, ["x" * 40000], "pro", context_format=V2)
+        artifact_bytes = len(ce.encode_context_artifact(self.pass_artifact, V2).encode("utf-8"))
+        self.assertLessEqual(len(worst.encode("utf-8")) - artifact_bytes, RESERVE)
+
+
 class PassScopeTests(unittest.TestCase):
     ENTRY = {"passIndex": 2, "passCount": 3, "primaryFiles": ["src/A.sol"], "contextFiles": ["src/B.sol"]}
 

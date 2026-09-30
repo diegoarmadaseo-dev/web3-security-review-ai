@@ -206,22 +206,41 @@ def build_pass_artifact(artifact: Dict[str, Any], plan: PassPlan, pass_entry: Di
     return result
 
 
+# The pass note replaces, for a pass prompt, the single-pass contract's rule
+# that a "partial" report needs a NOT_ASSESSED category (llm_client omits
+# that rule when the artifact carries contextPass): a pass is "partial"
+# because it covers part of the submission, and R-05 applies only to the
+# merged report (docs/decisiones.md D-098). Location rules state what
+# pass_scope_errors() enforces: every structured location in a primary file.
 _PASS_PROMPT_NOTE = (
     "\n\nMulti-pass analysis: this prompt is pass %d of %d of ONE review that was split deterministically into "
     "whole-file passes. The artifact's contextPass object is authoritative. Analyze ONLY the files in "
     "contextPass.primaryFiles. Files in contextPass.contextFiles are included solely as reference for "
-    "dependencies (another pass analyzes them): never place a finding or gas suggestion location in them. "
-    "Files in contextPass.excludedFiles are not in this prompt at all. Every finding location and gas "
-    "suggestion location must be a file listed in contextPass.primaryFiles. The report's scope.completeness "
-    "MUST be \"partial\" (this pass covers only part of the submission), and scope.reasons must carry over any "
-    "artifact completeness.reasons. Do not claim or imply that files outside contextPass.primaryFiles were "
-    "analyzed in this pass."
+    "dependencies (another pass analyzes them as primary). Files in contextPass.excludedFiles are not in this "
+    "prompt at all. The report's scope.completeness MUST be \"partial\" (this pass covers only part of the "
+    "submission), and scope.reasons must carry over any artifact completeness.reasons. Do not claim or imply "
+    "that files outside contextPass.primaryFiles were analyzed in this pass."
+    "\n\nLocations in this pass: locations[0] is the identity and ownership anchor of the finding and MUST be a "
+    "file listed in contextPass.primaryFiles - a context-only file must NEVER be used as locations[0]. If the "
+    "root cause is in a context-only file, do NOT report it in this pass: that file is owned and analyzed by its "
+    "own primary pass. If code in a context-only file affects a finding whose root/primary location is in a "
+    "primary file, keep the finding anchored to the primary file and describe the dependency in description or "
+    "evidence. Every other location (locations[1..n]) and every gas suggestion location must also be a file "
+    "listed in contextPass.primaryFiles - never a context-only, excluded or unknown file. Do not invent or "
+    "substitute a primary location merely to satisfy these rules."
+    "\n\nCategory coverage in this pass: categoryCoverage describes what this pass could assess within "
+    "contextPass.primaryFiles. DETECTED is REQUIRED for any category that has at least one non-informational "
+    "finding in this pass. NOT_DETECTED means the category was assessed within this pass's primary files and no "
+    "matching finding was identified. NOT_ASSESSED means the category could not be properly evaluated within "
+    "this pass's primary files. This pass being \"partial\" because it covers only part of the repository does "
+    "NOT by itself require any category to be NOT_ASSESSED - never mark a category NOT_ASSESSED merely because "
+    "other passes cover other files."
 )
 
 
 def pass_prompt_note(pass_artifact: Dict[str, Any]) -> str:
-    """Fixed-size paragraph (only the two pass numbers vary) for an
-    artifact carrying contextPass; "" otherwise, so every other prompt is
+    """Fixed-size note (only the two pass numbers vary) for an artifact
+    carrying contextPass; "" otherwise, so every other prompt is
     byte-identical to before."""
     metadata = pass_artifact.get(PASS_FIELD) if isinstance(pass_artifact, dict) else None
     if not isinstance(metadata, dict):
