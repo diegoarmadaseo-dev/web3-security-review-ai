@@ -88,9 +88,14 @@ in this codebase to look up an authoritative provider context window
 against, even in principle. APPLICATION_CONTEXT_BUDGET_BYTES below is
 therefore explicitly an APPLICATION-level ceiling this codebase itself
 chooses to stay under, not a claim about what any specific Anthropic or
-DeepSeek model's real context window is. Whether this budget is actually
-safe for a real, configured provider/model remains a separate,
-unimplemented validation step - see docs/decisiones.md.
+DeepSeek model's real context window is. A real provider SIZE check has
+since been done for DeepSeek "deepseek-flash" only (docs/decisiones.md,
+D-095): it accepted a real Step 6 prompt of 1,522,718 UTF-8 bytes and a
+padded prompt of exactly this budget. That is provider-side size
+acceptance only - not an end-to-end validation of the worker pipeline,
+not a validation of any other provider/model, and not a measure of
+model accuracy; this constant stays an application ceiling, never a
+provider guarantee.
 """
 from __future__ import annotations
 
