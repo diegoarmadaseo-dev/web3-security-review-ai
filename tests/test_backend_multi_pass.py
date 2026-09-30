@@ -381,18 +381,26 @@ class MultiPassRunTests(unittest.TestCase):
         third_pass = [c for c in provider.calls if c["pass"] == 3]
         self.assertNotIn("previous draft was INVALID", third_pass[0]["prompt"])  # errors never cross passes
 
-    def test_scope_violation_is_retried_then_fails(self):  # 12
+    def test_out_of_scope_location_is_discarded_not_retried(self):  # 12 (D-100: finding-level discard)
         plan = _plan(self.art, V1, self.budget)
         foreign = plan.passes[2]["primaryFiles"][0]  # primary in pass 3, so never valid in pass 1
         provider = ScriptedProvider({1: [_valid_draft([foreign])] * 3})
         result, _ = _run(self.art, self.budget, provider)
         first = result["multiPass"]["passes"][0]
-        self.assertEqual((first["status"], first["validationOutcome"]), (mp.PASS_FAILED, "scope_violation"))
-        retry_prompt = [c for c in provider.calls if c["pass"] == 1][1]["prompt"]
-        self.assertIn("locations must be in contextPass.primaryFiles", retry_prompt)
+        self.assertEqual((first["status"], first["attempts"], first["discardedFindings"]), (mp.PASS_SUCCESS, 1, 1))
+        self.assertEqual(len([c for c in provider.calls if c["pass"] == 1]), 1)  # a discard alone never consumes an attempt
         report_files = [f["locations"][0]["file"] for f in result["scoredReport"]["findings"]]
-        self.assertFalse(set(report_files) & set(plan.passes[0]["primaryFiles"]))  # the failed pass contributes nothing
+        self.assertFalse(set(report_files) & set(plan.passes[0]["primaryFiles"]))  # pass 1's only finding was discarded
         self.assertEqual(report_files.count(foreign), 1)  # only pass 3's own (primary) finding on that file
+
+    def test_complete_scope_is_still_retried(self):
+        complete = _valid_draft()
+        complete["scope"] = {"completeness": "complete", "reasons": []}
+        provider = ScriptedProvider({1: [complete]})
+        result, _ = _run(self.art, self.budget, provider)
+        first = result["multiPass"]["passes"][0]
+        self.assertEqual((first["status"], first["attempts"]), (mp.PASS_SUCCESS, 2))
+        self.assertIn("must not be 'complete'", [c for c in provider.calls if c["pass"] == 1][1]["prompt"])
 
     def test_all_passes_failing_fails_closed(self):
         err = llm_client.ProviderError("down")
@@ -669,6 +677,210 @@ class R05GlobalOnlyTests(unittest.TestCase):
         with self.assertRaises(llm_client.Step6Failed) as ctx:
             _run(self.art, self.budget, _AllAssessedProvider(), counters=_Counters())
         self.assertIn("R-05", str(ctx.exception))
+
+
+class DiscardOutOfScopeTests(unittest.TestCase):
+    """The pure filter of finding-level discard (docs/decisiones.md D-100)."""
+
+    ENTRY = {"passIndex": 1, "passCount": 2, "primaryFiles": ["src/A.sol"], "contextFiles": ["src/B.sol"]}
+    KNOWN = ["src/A.sol", "src/B.sol", "src/C.sol"]
+
+    def _draft(self, findings=(), gas=None, detected=()):
+        draft = _valid_draft()
+        draft["findings"] = [copy.deepcopy(f) for f in findings]
+        for entry in draft["categoryCoverage"]:
+            entry["status"] = "DETECTED" if entry["category"] in detected else ("NOT_ASSESSED" if entry["category"] == "SC01" else "NOT_DETECTED")
+        if gas is not None:
+            draft["gasSuggestions"] = gas
+        return draft
+
+    def _filter(self, draft):
+        return mp.discard_out_of_scope(draft, self.ENTRY, self.KNOWN)
+
+    def test_one_valid_one_invalid(self):  # A
+        valid, invalid = _finding("src/A.sol"), _finding("src/B.sol", function="g")
+        draft = self._draft([valid, invalid], detected=["SC08"])
+        filtered, record = self._filter(draft)
+        self.assertEqual(filtered["findings"], [valid])  # kept exactly as given
+        self.assertEqual(record["discardedFindings"], 1)
+        [d] = record["discards"]
+        self.assertEqual((d["kind"], d["index"], d["category"], d["severity"], d["status"], d["reason"]),
+                         ("finding", 1, "SC08", "LOW", "suspected", mp.DISCARD_REASON))
+        self.assertEqual(d["invalidLocations"], [{"index": 0, "file": "src/B.sol", "fileKind": "context"}])
+        self.assertEqual(filtered["categoryCoverage"][7]["status"], "DETECTED")  # still supported by the kept SC08 finding
+
+    def test_all_invalid(self):  # B
+        draft = self._draft([_finding("src/B.sol"), _finding("src/C.sol"), _finding("lib/X.sol")], detected=["SC08"])
+        filtered, record = self._filter(draft)
+        self.assertEqual(filtered["findings"], [])
+        self.assertEqual([d["invalidLocations"][0]["fileKind"] for d in record["discards"]], ["context", "excluded", "unknown"])
+        self.assertEqual(validate_report(score_report(filtered), enforce_partial_coverage_rule=False), [])
+
+    def test_invalid_anchor_discards_whole_finding(self):  # C
+        finding = _finding("src/B.sol")
+        finding["locations"].append({"file": "src/A.sol"})
+        filtered, record = self._filter(self._draft([finding], detected=["SC08"]))
+        self.assertEqual(filtered["findings"], [])
+        self.assertEqual(record["discards"][0]["invalidLocations"], [{"index": 0, "file": "src/B.sol", "fileKind": "context"}])
+
+    def test_invalid_secondary_discards_whole_finding(self):  # D
+        finding = _finding("src/A.sol")
+        finding["locations"].append({"file": "src/B.sol"})
+        filtered, record = self._filter(self._draft([finding], detected=["SC08"]))
+        self.assertEqual(filtered["findings"], [])  # never kept with only its secondary removed
+        self.assertEqual(record["discards"][0]["invalidLocations"], [{"index": 1, "file": "src/B.sol", "fileKind": "context"}])
+
+    def test_invalid_gas_location_discards_only_that_suggestion(self):  # E
+        ok = {"title": "t", "description": "d", "location": {"file": "src/A.sol"}}
+        bad = {"title": "t2", "description": "d2", "location": {"file": "src/C.sol"}}
+        filtered, record = self._filter(self._draft([_finding("src/A.sol")], gas=[ok, bad], detected=["SC08"]))
+        self.assertEqual(filtered["gasSuggestions"], [ok])
+        self.assertEqual(len(filtered["findings"]), 1)
+        self.assertEqual(record["discards"], [{"kind": "gas", "index": 1, "location": "src/C.sol", "fileKind": "excluded", "reason": mp.DISCARD_REASON}])
+        self.assertEqual((record["discardedFindings"], record["discardedGasSuggestions"]), (0, 1))
+
+    def test_detected_without_a_kept_finding_becomes_not_assessed(self):  # F
+        filtered, record = self._filter(self._draft([_finding("src/B.sol", category="SC03")], detected=["SC03"]))
+        coverage = {c["category"]: c["status"] for c in filtered["categoryCoverage"]}
+        self.assertEqual(coverage["SC03"], "NOT_ASSESSED")
+        self.assertEqual(record["coverageAdjusted"], ["SC03"])
+
+    def test_detected_kept_when_another_finding_supports_it(self):  # G
+        filtered, record = self._filter(self._draft([_finding("src/B.sol", category="SC03"), _finding("src/A.sol", category="SC03", function="g")], detected=["SC03"]))
+        self.assertEqual({c["category"]: c["status"] for c in filtered["categoryCoverage"]}["SC03"], "DETECTED")
+        self.assertEqual(record["coverageAdjusted"], [])
+
+    def test_unaffected_categories_and_informational_discards_keep_their_status(self):
+        info = _finding("src/B.sol", category="SC05", severity="INFORMATIONAL")
+        info["status"] = "informational"
+        draft = self._draft([info], detected=["SC05"])
+        filtered, record = self._filter(draft)
+        self.assertEqual(filtered["categoryCoverage"], draft["categoryCoverage"])
+        self.assertEqual(record["coverageAdjusted"], [])
+
+    def test_pure_and_deterministic(self):  # M
+        draft = self._draft([_finding("src/A.sol"), _finding("src/B.sol")], gas=[{"title": "t", "description": "d", "location": {"file": "src/C.sol"}}], detected=["SC08"])
+        before = copy.deepcopy(draft)
+        first = self._filter(draft)
+        self.assertEqual(draft, before)  # never mutates its input
+        self.assertEqual(first, self._filter(draft))
+
+    def test_no_invalid_location_changes_nothing(self):  # N
+        draft = self._draft([_finding("src/A.sol")], gas=[{"title": "t", "description": "d", "location": {"file": "src/A.sol"}}], detected=["SC08"])
+        filtered, record = self._filter(draft)
+        self.assertEqual(filtered, draft)
+        self.assertEqual(record, {"discards": [], "discardedFindings": 0, "discardedGasSuggestions": 0, "coverageAdjusted": []})
+        self.assertEqual(mp.pass_location_errors(filtered, self.ENTRY), [])
+
+    def test_scope_rules_are_split(self):
+        draft = self._draft([_finding("src/B.sol")])
+        draft["scope"] = {"completeness": "complete", "reasons": []}
+        self.assertEqual(len(mp.pass_completeness_errors(draft, self.ENTRY)), 1)
+        self.assertEqual(len(mp.pass_location_errors(draft, self.ENTRY)), 1)
+        self.assertEqual(mp.pass_scope_errors(draft, self.ENTRY), mp.pass_completeness_errors(draft, self.ENTRY) + mp.pass_location_errors(draft, self.ENTRY))
+        partial = self._draft([_finding("src/A.sol")])
+        self.assertEqual(mp.pass_completeness_errors(partial, self.ENTRY), [])  # "partial" is never an error by itself
+
+
+class FindingLevelDiscardRunTests(unittest.TestCase):
+    """Finding-level discard through the real run: pass validation, merge,
+    global scope, one scoring/validation/render (docs/decisiones.md D-100)."""
+
+    def setUp(self):
+        self.art = _art()
+        self.budget = _budget_for(self.art, V1, 3)
+        self.plan = _plan(self.art, V1, self.budget)
+        self.own = [p["primaryFiles"] for p in self.plan.passes]
+
+    def _run(self, script):
+        return _run(self.art, self.budget, ScriptedProvider(script), counters=_WorkerCounters())
+
+    def _draft(self, findings, detected=("SC08",)):
+        draft = _valid_draft()
+        draft["findings"] = findings
+        for entry in draft["categoryCoverage"]:
+            if entry["category"] != "SC01":
+                entry["status"] = "DETECTED" if entry["category"] in detected else "NOT_DETECTED"
+        return draft
+
+    def test_valid_kept_invalid_discarded_pass_succeeds_and_report_says_so(self):  # A, J, L
+        bad = _finding(self.own[2][0], function="g")
+        bad["description"] = "DISCARD-ME-UNIQUE"
+        result, counters = self._run({1: [self._draft([_finding(self.own[0][0]), bad])]})
+        first = result["multiPass"]["passes"][0]
+        self.assertEqual((first["status"], first["attempts"], first["discardedFindings"]), (mp.PASS_SUCCESS, 1, 1))
+        self.assertEqual(first["discards"][0]["invalidLocations"][0]["fileKind"], "excluded")
+        scope = result["scoredReport"]["scope"]
+        self.assertEqual(scope["completeness"], "partial")  # every pass succeeded, but a discard forbids "complete"
+        [reason] = [r for r in scope["reasons"] if r["code"] == mp.DISCARDED_REASON_CODE]
+        self.assertIn("1 finding(s) and 0 gas suggestion(s) discarded", reason["detail"])
+        self.assertIn("pass 1 of 3: SC08/LOW at %s" % self.own[2][0], reason["detail"])
+        self.assertIn(mp.MULTI_PASS_DISCARD_LIMITATION, result["scoredReport"]["limitations"])
+        rendered = result["rendered"]
+        self.assertIn(mp.DISCARDED_REASON_CODE, rendered)
+        self.assertIn(mp.MULTI_PASS_DISCARD_LIMITATION, rendered)
+        self.assertNotIn("DISCARD-ME-UNIQUE", rendered)  # never rendered as a finding
+        self.assertEqual((counters.pipeline, counters.render), (1, 1))
+
+    def test_all_findings_discarded_pass_still_succeeds(self):  # B
+        result, _ = self._run({1: [self._draft([_finding(self.own[1][0]), _finding(self.own[2][0])])]})
+        first = result["multiPass"]["passes"][0]
+        self.assertEqual((first["status"], first["discardedFindings"]), (mp.PASS_SUCCESS, 2))
+        self.assertEqual(result["scoredReport"]["scope"]["completeness"], "partial")
+        self.assertFalse(any(f["locations"][0]["file"] in self.own[0] for f in result["scoredReport"]["findings"]))
+
+    def test_discarded_duplicate_never_reaches_merge(self):  # H
+        target = self.own[1][0]
+        intruder = _finding(target, severity="CRITICAL")
+        intruder["description"] = "from pass 1"
+        result, _ = self._run({1: [self._draft([intruder])], 2: [self._draft([_finding(target)])]})
+        on_target = [f for f in result["scoredReport"]["findings"] if f["locations"][0]["file"] == target]
+        self.assertEqual(len(on_target), 1)
+        self.assertEqual((on_target[0]["severity"], on_target[0]["description"], on_target[0]["mergedCount"]), ("LOW", "d", 1))
+        self.assertEqual(on_target[0]["stableKey"], compute_stable_key(_finding(target)))
+
+    def test_owner_pass_failed_no_discarded_finding_appears(self):  # I
+        err = llm_client.ProviderError("down")
+        result, _ = self._run({1: [self._draft([_finding(self.own[1][0], severity="HIGH")])], 2: [err, err, err]})
+        passes = result["multiPass"]["passes"]
+        self.assertEqual((passes[0]["status"], passes[1]["status"]), (mp.PASS_SUCCESS, mp.PASS_FAILED))
+        self.assertFalse(any(f["locations"][0]["file"] in self.own[1] for f in result["scoredReport"]["findings"]))
+        codes = [r["code"] for r in result["scoredReport"]["scope"]["reasons"]]
+        self.assertIn(mp.FAILED_PASSES_REASON_CODE, codes)
+        self.assertIn(mp.DISCARDED_REASON_CODE, codes)
+
+    def test_dropped_category_is_not_falsely_detected_globally(self):  # K
+        sc03 = _finding(self.own[1][0], category="SC03")
+        result, _ = self._run({1: [self._draft([sc03], detected=("SC03",))]})
+        report = result["scoredReport"]
+        coverage = {c["category"]: c["status"] for c in report["categoryCoverage"]}
+        self.assertNotIn("SC03", [f["category"] for f in report["findings"]])
+        self.assertNotEqual(coverage["SC03"], "DETECTED")
+        self.assertEqual(validate_report(report), [])  # global R-04 / R-05 hold
+        self.assertEqual(result["multiPass"]["passes"][0]["coverageAdjusted"], ["SC03"])
+
+    def test_same_input_same_discard_record(self):  # M
+        script = {1: [self._draft([_finding(self.own[0][0]), _finding(self.own[2][0], function="g")])]}
+        first, _ = self._run(copy.deepcopy(script))
+        second, _ = self._run(copy.deepcopy(script))
+        self.assertEqual(first["multiPass"], second["multiPass"])
+        self.assertEqual(first["rendered"], second["rendered"])
+
+    def test_no_discard_run_is_unchanged(self):  # N
+        result, _ = self._run({})
+        self.assertEqual(result["scoredReport"]["scope"]["completeness"], "complete")
+        self.assertNotIn(mp.MULTI_PASS_DISCARD_LIMITATION, result["scoredReport"]["limitations"])
+        self.assertNotIn(mp.DISCARDED_REASON_CODE, [r["code"] for r in result["scoredReport"]["scope"]["reasons"]])
+        self.assertTrue(all(p["discardedFindings"] == 0 and p["discards"] == [] for p in result["multiPass"]["passes"]))
+
+    def test_global_scope_forbids_complete_with_any_discard(self):  # J
+        outcomes = [{"passIndex": p["passIndex"], "passCount": p["passCount"], "primaryFiles": p["primaryFiles"], "status": mp.PASS_SUCCESS,
+                     "discardedFindings": 0, "discardedGasSuggestions": 0, "discards": []} for p in self.plan.passes]
+        self.assertEqual(mp.global_scope(self.art, self.plan, outcomes)["completeness"], "complete")
+        outcomes[1].update(discardedGasSuggestions=1, discards=[{"kind": "gas", "index": 0, "location": "x.sol", "fileKind": "unknown", "reason": mp.DISCARD_REASON}])
+        scope = mp.global_scope(self.art, self.plan, outcomes)
+        self.assertEqual(scope["completeness"], "partial")
+        self.assertIn("0 finding(s) and 1 gas suggestion(s) discarded", [r for r in scope["reasons"] if r["code"] == mp.DISCARDED_REASON_CODE][0]["detail"])
 
 
 class _FakeSdkTimeout(Exception):

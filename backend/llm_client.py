@@ -1214,6 +1214,7 @@ def _run_one_pass(
         "selectedBytes": pass_artifact[multi_pass.PASS_FIELD]["estimatedContextBytes"], "promptBytes": 0,
         "attempts": 0, "status": multi_pass.PASS_FAILED, "providerOutcome": "not_started",
         "validationOutcome": "not_reached", "failureReason": "no attempt was made",
+        "discardedFindings": 0, "discardedGasSuggestions": 0, "discards": [], "coverageAdjusted": [],
     }
     pass_end = deadline.pass_end(passes_left) if deadline is not None else None
     previous_errors: Optional[List[str]] = None
@@ -1254,11 +1255,22 @@ def _run_one_pass(
             outcome["failureReason"] = _bounded_failure("invalid JSON on attempt %d: %s" % (attempt, exc))
             previous_errors = [str(exc)]
             continue
-        scope_errors = multi_pass.pass_scope_errors(draft, pass_entry)
+        scope_errors = multi_pass.pass_completeness_errors(draft, pass_entry)
         if scope_errors:
             outcome["validationOutcome"] = "scope_violation"
             outcome["failureReason"] = _bounded_failure("scope violation on attempt %d: %s" % (attempt, "; ".join(scope_errors)))
             previous_errors = scope_errors
+            continue
+        # Finding-level discard (docs/decisiones.md D-100): findings and gas
+        # suggestions with a location outside the pass's primary files are
+        # dropped whole and recorded - that alone never consumes an attempt.
+        # Everything below (validation, merge) sees only the filtered draft.
+        draft, discard_record = multi_pass.discard_out_of_scope(draft, pass_entry, plan.ranked_files)
+        residual = multi_pass.pass_location_errors(draft, pass_entry)
+        if residual:  # never expected after the filter; fail closed rather than merge an out-of-scope location
+            outcome["validationOutcome"] = "scope_violation"
+            outcome["failureReason"] = _bounded_failure("scope violation on attempt %d: %s" % (attempt, "; ".join(residual)))
+            previous_errors = residual
             continue
         try:
             errors = list(validate_pass_draft(draft))
@@ -1270,6 +1282,7 @@ def _run_one_pass(
             previous_errors = errors
             continue
         outcome.update({"status": multi_pass.PASS_SUCCESS, "validationOutcome": "valid", "failureReason": None, "draft": draft})
+        outcome.update(discard_record)
         return outcome
     return outcome
 

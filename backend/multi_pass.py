@@ -35,7 +35,10 @@ model can read its dependencies, but it is analyzed as primary in another
 pass. A pass may only place structured locations (findings, gas
 suggestions) in its own PRIMARY files - never in context files, excluded
 files or unknown paths - so a finding always comes from the one pass that
-analyzed its file as primary, and never from a file no pass received.
+analyzed its file as primary, and never from a file no pass received. A
+finding or gas suggestion that breaks this rule is discarded whole and
+recorded (discard_out_of_scope, docs/decisiones.md D-100): never edited,
+never reassigned, never merged.
 
 MERGE (merge_pass_drafts): successful pass drafts, in pass order, become
 one draft: findings concatenated (score.py deduplicates by stableKey, its
@@ -48,14 +51,16 @@ removed; categoryCoverage combined conservatively (DETECTED if any pass
 detected it, NOT_ASSESSED if any pass did not assess it or if any file was
 not analyzed); scope built from the plan and the pass outcomes only, never
 from the model: "complete" only when every ranked file was analyzed as
-primary by a successful pass, no pass failed, and preprocessing reported
-no completeness reason other than the mode size limits multi-pass exists
-to cover (LOC_LIMIT_EXCEEDED / FILE_LIMIT_EXCEEDED).
+primary by a successful pass, no pass failed, no finding or gas suggestion
+was discarded, and preprocessing reported no completeness reason other than
+the mode size limits multi-pass exists to cover (LOC_LIMIT_EXCEEDED /
+FILE_LIMIT_EXCEEDED).
 
 Standard library only.
 """
 from __future__ import annotations
 
+import copy
 import json
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -72,6 +77,8 @@ UNASSIGNED_MAX_PASSES = "max_passes_reached"
 MULTI_PASS_REASON_CODE = "MULTI_PASS_ANALYSIS"
 FAILED_PASSES_REASON_CODE = "MULTI_PASS_FAILED_PASSES"
 UNASSIGNED_REASON_CODE = "MULTI_PASS_UNASSIGNED_FILES"
+DISCARDED_REASON_CODE = "MULTI_PASS_DISCARDED_FINDINGS"
+DISCARD_REASON = "location outside pass primary files"
 
 # The preprocessing completeness reasons multi-pass exists to cover: the
 # mode's size limits. Any OTHER reason (missing import, Vyper, low parse
@@ -81,6 +88,12 @@ SIZE_LIMIT_REASONS = frozenset({"LOC_LIMIT_EXCEEDED", "FILE_LIMIT_EXCEEDED"})
 MULTI_PASS_LIMITATION = (
     "This review was performed in several deterministic passes, each covering whole files within one "
     "context budget; interactions between files analyzed as primary in different passes may not be detected."
+)
+
+
+MULTI_PASS_DISCARD_LIMITATION = (
+    "This report contains only findings and gas suggestions whose locations were within the primary files of the "
+    "pass that produced them; items with a location outside that scope were discarded and are not part of this result."
 )
 
 
@@ -269,15 +282,20 @@ def _structured_locations(draft: Dict[str, Any]) -> List[Tuple[str, Any]]:
     return out
 
 
-def pass_scope_errors(draft: Dict[str, Any], pass_entry: Dict[str, Any]) -> List[str]:
-    """Deterministic scope rules of ONE pass draft (handled like a
-    validation failure: the attempt is consumed and the errors go to that
-    pass's next attempt): scope must be "partial", and every structured
-    location must be one of the pass's primary files."""
-    errors: List[str] = []
+def pass_completeness_errors(draft: Dict[str, Any], pass_entry: Dict[str, Any]) -> List[str]:
+    """A pass draft's scope must be "partial" (it covers part of the
+    submission); "complete" is a validation failure - the attempt is
+    consumed and the error goes to that pass's next attempt."""
     scope = draft.get("scope")
     if isinstance(scope, dict) and scope.get("completeness") == "complete":
-        errors.append("scope.completeness must not be 'complete': this is pass %d of %d of a multi-pass analysis - use 'partial'" % (pass_entry["passIndex"], pass_entry["passCount"]))
+        return ["scope.completeness must not be 'complete': this is pass %d of %d of a multi-pass analysis - use 'partial'" % (pass_entry["passIndex"], pass_entry["passCount"])]
+    return []
+
+
+def pass_location_errors(draft: Dict[str, Any], pass_entry: Dict[str, Any]) -> List[str]:
+    """Every structured location (finding locations, gas suggestion
+    locations) that is not one of the pass's primary files."""
+    errors: List[str] = []
     primary = {_normalize(f) for f in pass_entry["primaryFiles"]}
     context = {_normalize(f) for f in pass_entry["contextFiles"]}
     for path, loc in _structured_locations(draft):
@@ -285,6 +303,100 @@ def pass_scope_errors(draft: Dict[str, Any], pass_entry: Dict[str, Any]) -> List
             kind = "a context-only file of this pass (reference, analyzed in another pass)" if _normalize(loc["file"]) in context else "not a primary file of this pass"
             errors.append("%s.file %r is %s - locations must be in contextPass.primaryFiles; remove or relocate that entry" % (path, loc["file"], kind))
     return errors
+
+
+def pass_scope_errors(draft: Dict[str, Any], pass_entry: Dict[str, Any]) -> List[str]:
+    """Both scope rules of ONE pass draft: pass_completeness_errors() plus
+    pass_location_errors(). A pass run applies them separately: location
+    errors are handled by discard_out_of_scope() (finding-level discard,
+    docs/decisiones.md D-100), not by failing the attempt."""
+    return pass_completeness_errors(draft, pass_entry) + pass_location_errors(draft, pass_entry)
+
+
+def _file_kind(path: str, primary: Set[str], context: Set[str], known: Optional[Set[str]]) -> str:
+    normalized = _normalize(path)
+    if normalized in primary:
+        return "primary"
+    if normalized in context:
+        return "context"
+    if known is not None and normalized in known:
+        return "excluded"
+    return "unknown"
+
+
+def discard_out_of_scope(draft: Dict[str, Any], pass_entry: Dict[str, Any], known_files: Optional[List[str]] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Finding-level discard (docs/decisiones.md D-100). Pure: never mutates
+    draft; same input -> same output. Returns (filtered_draft, record).
+
+    * A finding with ANY location (locations[0] or locations[1..n]) outside
+      the pass's primary files is discarded whole - never edited, never
+      reassigned. A gas suggestion with such a location is discarded alone.
+      Every other finding and gas suggestion is kept exactly as given.
+    * A category the draft marked DETECTED whose non-informational findings
+      were all discarded (at least one was) becomes NOT_ASSESSED: nothing
+      retained supports DETECTED, and the pass did find something there, so
+      NOT_DETECTED would be false too.
+    * record = {"discards": [...], "discardedFindings": n,
+      "discardedGasSuggestions": m, "coverageAdjusted": [categories]}; each
+      discard lists every invalid location with its fileKind ("context",
+      "excluded" when the file is in known_files, else "unknown").
+    Only locations that are objects with a string file are checked here, as
+    in pass_location_errors(); any other shape is left to validation."""
+    primary = {_normalize(f) for f in pass_entry["primaryFiles"]}
+    context = {_normalize(f) for f in pass_entry["contextFiles"]}
+    known = {_normalize(f) for f in known_files} if known_files is not None else None
+    filtered = copy.deepcopy(draft)
+    discards: List[Dict[str, Any]] = []
+
+    def invalid(loc: Any, index: Optional[int]) -> Optional[Dict[str, Any]]:
+        if not (isinstance(loc, dict) and isinstance(loc.get("file"), str)):
+            return None
+        kind = _file_kind(loc["file"], primary, context, known)
+        if kind == "primary":
+            return None
+        entry: Dict[str, Any] = {"file": loc["file"], "fileKind": kind}
+        if index is not None:
+            entry = {"index": index, **entry}
+        return entry
+
+    findings = filtered.get("findings")
+    if isinstance(findings, list):
+        kept = []
+        for index, finding in enumerate(findings):
+            locations = finding.get("locations") if isinstance(finding, dict) else None
+            bad = [b for b in (invalid(loc, i) for i, loc in enumerate(locations if isinstance(locations, list) else [])) if b]
+            if not bad:
+                kept.append(finding)
+                continue
+            discards.append({"kind": "finding", "index": index, "category": finding.get("category"), "severity": finding.get("severity"),
+                             "status": finding.get("status"), "invalidLocations": bad, "reason": DISCARD_REASON})
+        filtered["findings"] = kept
+    gas = filtered.get("gasSuggestions")
+    if isinstance(gas, list):
+        kept_gas = []
+        for index, item in enumerate(gas):
+            bad_loc = invalid(item.get("location"), None) if isinstance(item, dict) else None
+            if bad_loc is None:
+                kept_gas.append(item)
+                continue
+            discards.append({"kind": "gas", "index": index, "location": bad_loc["file"], "fileKind": bad_loc["fileKind"], "reason": DISCARD_REASON})
+        filtered["gasSuggestions"] = kept_gas
+
+    def non_informational(finding: Any) -> bool:
+        return isinstance(finding, dict) and finding.get("status") != "informational"
+
+    dropped = {d["category"] for d in discards if d["kind"] == "finding" and d.get("status") != "informational"}
+    still = {f.get("category") for f in filtered.get("findings") or [] if non_informational(f)}
+    adjusted: List[str] = []
+    coverage = filtered.get("categoryCoverage")
+    if isinstance(coverage, list):
+        for entry in coverage:
+            if isinstance(entry, dict) and entry.get("status") == "DETECTED" and entry.get("category") in dropped and entry.get("category") not in still:
+                entry["status"] = "NOT_ASSESSED"
+                adjusted.append(entry["category"])
+    record = {"discards": discards, "discardedFindings": sum(1 for d in discards if d["kind"] == "finding"),
+              "discardedGasSuggestions": sum(1 for d in discards if d["kind"] == "gas"), "coverageAdjusted": adjusted}
+    return filtered, record
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +437,10 @@ def global_scope(artifact: Dict[str, Any], plan: PassPlan, outcomes: List[Dict[s
     analyzed = sorted({f for o in outcomes if o["status"] == PASS_SUCCESS for f in o["primaryFiles"]})
     total = len(plan.ranked_files)
     other_reasons = [r for r in pre_reasons if r.get("code") not in SIZE_LIMIT_REASONS]
-    complete = not failed and not plan.unassigned and not other_reasons and len(analyzed) == total
+    # Discards count only for passes whose (filtered) draft is merged.
+    with_discards = sorted((o for o in outcomes if o["status"] == PASS_SUCCESS and (o.get("discardedFindings") or o.get("discardedGasSuggestions"))),
+                           key=lambda o: o["passIndex"])
+    complete = not failed and not plan.unassigned and not other_reasons and len(analyzed) == total and not with_discards
 
     reasons: List[Dict[str, str]] = [{"code": str(r.get("code")), "detail": str(r.get("detail", ""))} for r in pre_reasons]
     reasons.append({
@@ -343,7 +458,21 @@ def global_scope(artifact: Dict[str, Any], plan: PassPlan, outcomes: List[Dict[s
             "code": UNASSIGNED_REASON_CODE,
             "detail": "Files not assigned to any pass (not analyzed): %s" % ", ".join("%s (%s)" % (u["file"], u["reason"]) for u in plan.unassigned),
         })
+    if with_discards:
+        reasons.append({
+            "code": DISCARDED_REASON_CODE,
+            "detail": "%d finding(s) and %d gas suggestion(s) discarded because a location was outside the primary files of the pass that produced them (not included in this report): %s"
+                      % (sum(o.get("discardedFindings") or 0 for o in with_discards), sum(o.get("discardedGasSuggestions") or 0 for o in with_discards),
+                         "; ".join("pass %d of %d: %s" % (o["passIndex"], o["passCount"], ", ".join(_discard_label(d) for d in o.get("discards") or [])) for o in with_discards)),
+        })
     return {"completeness": "complete" if complete else "partial", "reasons": reasons}
+
+
+def _discard_label(discard: Dict[str, Any]) -> str:
+    if discard["kind"] == "gas":
+        return "gas suggestion at %s" % discard["location"]
+    anchor = discard["invalidLocations"][0]["file"]
+    return "%s/%s at %s" % (discard.get("category"), discard.get("severity"), anchor)
 
 
 _SC_CATEGORIES = ["SC%02d" % n for n in range(1, 11)]
@@ -396,7 +525,8 @@ def merge_pass_drafts(artifact: Dict[str, Any], plan: PassPlan, outcomes: List[D
     merged["scope"] = scope
     merged["categoryCoverage"] = _merge_coverage(drafts, scope["completeness"] == "complete")
     merged["findings"] = [finding for _, _, finding in ordered]
-    merged["limitations"] = _dedupe([item for d in drafts for item in (d.get("limitations") or [])] + [MULTI_PASS_LIMITATION])
+    fixed = [MULTI_PASS_LIMITATION] + ([MULTI_PASS_DISCARD_LIMITATION] if any(o.get("discardedFindings") or o.get("discardedGasSuggestions") for o in successes) else [])
+    merged["limitations"] = _dedupe([item for d in drafts for item in (d.get("limitations") or [])] + fixed)
     gas = [item for d in drafts for item in (d.get("gasSuggestions") or [])]
     if any("gasSuggestions" in d for d in drafts):
         merged["gasSuggestions"] = _dedupe(gas)
@@ -438,7 +568,8 @@ def plan_summary(plan: PassPlan, outcomes: Optional[List[Dict[str, Any]]] = None
         "passes": [
             {
                 "passIndex": p["passIndex"], "primaryFiles": len(p["primaryFiles"]), "contextFiles": len(p["contextFiles"]),
-                **({k: v for k, v in (outcomes[i] if outcomes else {}).items() if k in ("status", "attempts", "promptBytes", "selectedBytes", "providerOutcome", "validationOutcome", "failureReason")}),
+                **({k: v for k, v in (outcomes[i] if outcomes else {}).items() if k in ("status", "attempts", "promptBytes", "selectedBytes", "providerOutcome", "validationOutcome", "failureReason",
+                                                                                         "discardedFindings", "discardedGasSuggestions", "discards", "coverageAdjusted")}),
             }
             for i, p in enumerate(plan.passes)
         ],
