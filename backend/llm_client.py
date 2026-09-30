@@ -68,6 +68,8 @@ import json
 import os
 from typing import Any, Callable, Dict, List, Optional, Protocol
 
+import backend.context_selection as context_selection
+
 try:
     import anthropic
 except ImportError:  # optional - see module docstring.
@@ -249,11 +251,108 @@ DEFAULT_PER_ATTEMPT_TIMEOUT_SECONDS = 120
 
 
 class Step6Failed(Exception):
-    """Raised when every attempt is exhausted (provider failures and/or
-    validation failures, in any combination) without producing a
-    rendered report - the worker entrypoint catches this and marks the
-    job failed with this exception's own message as last_error, never a
-    raw traceback."""
+    """Raised in two distinct situations, both handled identically by
+    worker_entrypoint.py (job marked failed with this exception's own
+    message as the error, never a raw traceback):
+      1. every attempt is exhausted (provider failures and/or validation
+         failures, in any combination) without producing a rendered
+         report - the original, pre-existing case, raised at the bottom
+         of run_step6_with_retries()'s attempt loop.
+      2. the completeness gate below blocks BEFORE any attempt is made,
+         either because deterministic context selection was never even
+         attempted (no blocking completeness reason) - it was not - or
+         because selection WAS attempted and could not produce any
+         non-empty bounded context - see _apply_completeness_gate()'s own
+         docstring. Distinguishable from case 1 by message shape alone
+         (this case's message always starts with "Step 6 blocked before
+         any provider attempt" - never "Step 6 failed after N
+         attempt(s)"), so no second exception type was needed to keep the
+         two cases separately identifiable."""
+
+
+_BLOCKING_COMPLETENESS_CODES = frozenset({"LOC_LIMIT_EXCEEDED", "FILE_LIMIT_EXCEEDED"})
+
+
+def _apply_completeness_gate(preprocess_artifact: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The automated-worker equivalent of SKILL.md's Step 4 rule for a
+    human-driven session ("If completeness.reasons includes
+    LOC_LIMIT_EXCEEDED or FILE_LIMIT_EXCEEDED: stop here... show what
+    priorityRanking proposes covering first, and ask how they want to
+    proceed - narrow the input, accept a partial review of the
+    top-priority items, or switch mode"): an unattended worker has no
+    human to ask, so instead of the two options only a human could
+    exercise (narrow the input / switch mode), it exercises the third
+    itself - deterministic context selection (backend/context_selection.py)
+    is exactly "accept a partial review of the top-priority items",
+    automated. Returns the artifact Step 6 should actually use - either
+    `preprocess_artifact` itself unchanged (no gating needed), or a
+    context-selected subset of it (see below) - never raises for the
+    ordinary case; only raises Step6Failed when selection itself could
+    not produce any usable context.
+
+    Deliberately narrower than "any partial completeness" - only
+    LOC_LIMIT_EXCEEDED/FILE_LIMIT_EXCEEDED mean "the artifact itself is
+    short of what the requested mode is supposed to cover" (a real,
+    mode-limit-driven fact this module has no basis to route around
+    other than by selecting a smaller context). Every OTHER completeness
+    reason (missing import, unresolved base, truncated file, Vyper's
+    limited coverage, low parse confidence, encoding error, etc.) is, per
+    that same SKILL.md rule, meant to continue to Step 6 with the reason
+    carried into the report - unaffected by this gate, exactly as before;
+    selection is never invoked for those.
+
+    When a blocking reason IS present, context_selection.select_context()
+    is invoked exactly once (never inside the retry loop - see
+    run_step6_with_retries()'s own call site) with
+    context_selection.APPLICATION_CONTEXT_BUDGET_BYTES:
+      * selection status "not_needed" or "applied" -> the (possibly
+        filtered) selected artifact is returned; the CALLER proceeds to
+        Step 6 with it. The original completeness.reasons are NEVER
+        removed or edited - completeness.status stays "partial" exactly
+        as preprocessing produced it (context_selection.py never mutates
+        it - see that module's own docstring) - this gate does not, and
+        must not, convert a genuinely partial preprocessing result into
+        one that looks complete.
+      * selection status "failed" (not even the single highest-priority
+        file's own closure fits the budget) -> Step6Failed is raised here,
+        the same as the pre-selection version of this gate always did for
+        every blocking case - provider is never called, no attempt is
+        consumed.
+
+    preprocess_artifact may be None (the default no-op preprocess_run a
+    caller can omit) or a dict with no "completeness" key at all (e.g.
+    this module's own tests' FAKE_ARTIFACT) - both degrade to "nothing to
+    gate, return unchanged", never a crash here; that mirrors
+    _mode_restrictions_note()'s own "missing data never crashes, only
+    skips" discipline elsewhere in this module.
+
+    Raises Step6Failed - reusing the exact exception type/handling
+    worker_entrypoint.py already catches by name for this module (see
+    that function's own try/except), rather than falling through to its
+    generic except Exception clause, which would discard this message
+    and report only the exception's type name instead."""
+    completeness = (preprocess_artifact or {}).get("completeness") or {}
+    if completeness.get("status") != "partial":
+        return preprocess_artifact
+    blocking = [r for r in (completeness.get("reasons") or []) if isinstance(r, dict) and r.get("code") in _BLOCKING_COMPLETENESS_CODES]
+    if not blocking:
+        return preprocess_artifact
+
+    reason_codes = [r.get("code") for r in blocking]
+    selected_artifact, selection_meta = context_selection.select_context(
+        preprocess_artifact, budget_bytes=context_selection.APPLICATION_CONTEXT_BUDGET_BYTES, selection_reasons=reason_codes,
+    )
+    if selection_meta["status"] != "failed":
+        return selected_artifact
+
+    detail = "; ".join("%s: %s" % (r.get("code"), r.get("detail", "")) for r in blocking)
+    raise Step6Failed(
+        "Step 6 blocked before any provider attempt: preprocessing completeness is "
+        "'partial' due to %s, and deterministic context selection could not produce any "
+        "bounded context within the application context budget (%d bytes - see "
+        "backend/context_selection.py). No prompt was built and no provider was called."
+        % (detail, context_selection.APPLICATION_CONTEXT_BUDGET_BYTES)
+    )
 
 
 _MODES_CONFIG_PATH = os.path.join(
@@ -416,9 +515,12 @@ def run_step6_with_retries(
     limit) is treated as an ATTEMPT-CONSUMED failure, same as an invalid
     report - a flaky provider is not exempt from the same total-attempts
     cap a stubborn validation error is. Raises Step6Failed if every
-    attempt is exhausted."""
+    attempt is exhausted, or immediately (before any attempt, consuming
+    none of them) if _enforce_completeness_gate() blocks - see that
+    function's own docstring."""
     preprocess_run = preprocess_run or (lambda **kwargs: None)
     preprocess_artifact = preprocess_run(source_paths, mode=mode, max_loc=None, use_stdin=False, include_timestamp=False, modes_config=modes_config)
+    _enforce_completeness_gate(preprocess_artifact)
 
     previous_errors: Optional[List[str]] = None
     last_failure = "unknown failure"

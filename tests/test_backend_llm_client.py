@@ -907,5 +907,189 @@ class Step6RetryLoopStillWiresCorrectlyTests(unittest.TestCase):
         self.assertIn("For mode 'pro' these ARE allowed", sent_prompt)
 
 
+class CompletenessGateBlocksStep6Tests(unittest.TestCase):
+    """The automated-worker equivalent of SKILL.md's Step 4 rule for a
+    human-driven session ("If completeness.reasons includes
+    LOC_LIMIT_EXCEEDED or FILE_LIMIT_EXCEEDED: stop here. Do not proceed
+    to Step 6... ask how they want to proceed") - see
+    llm_client._enforce_completeness_gate()'s own docstring for the full
+    rationale. Reuses Step6Failed, the exact exception type
+    worker_entrypoint.py's main() already catches by name
+    (`except llm_client.Step6Failed as exc: _write_result("failed",
+    error=str(exc))`), so the blocking reason reaches the same
+    machine-readable result field every other Step-6 failure already
+    uses - never worker_entrypoint.py's generic `except Exception`
+    clause, which would discard this message and keep only the
+    exception's type name."""
+
+    def _artifact_with(self, status, reasons):
+        artifact = dict(FAKE_ARTIFACT)
+        artifact["completeness"] = {"status": status, "reasons": reasons}
+        return artifact
+
+    def _fake_preprocess_run(self, artifact):
+        def _run(paths, **kwargs):
+            return artifact
+        return _run
+
+    def _unreachable_run_analyze_pipeline(self, paths, **kwargs):
+        self.fail("run_analyze_pipeline must never be called when the completeness gate blocks")
+
+    def _fake_run_analyze_pipeline_success(self, paths, *, mode, draft_report, attempt, use_stdin, render_format, modes_config):
+        scored = score_report(draft_report)
+        errors = validate_report(scored)
+        if errors:
+            return {"status": "needs_revision", "errors": errors}
+        return {"status": "rendered", "scoredReport": scored, "renderFormat": render_format, "rendered": "# ok"}
+
+    # --- A: LOC_LIMIT_EXCEEDED ---
+
+    def test_loc_limit_exceeded_blocks_before_any_attempt(self):
+        artifact = self._artifact_with("partial", [
+            {"code": "LOC_LIMIT_EXCEEDED", "detail": "Effective LOC (9700) exceeds the pro mode limit (4000)."},
+        ])
+        provider = llm_client.MockLLMProvider(["should never be consumed"])
+        with self.assertRaises(llm_client.Step6Failed) as ctx:
+            llm_client.run_step6_with_retries(
+                ["/fake/path.sol"], "pro", provider, self._unreachable_run_analyze_pipeline,
+                preprocess_run=self._fake_preprocess_run(artifact),
+            )
+        self.assertIn("LOC_LIMIT_EXCEEDED", str(ctx.exception))
+        self.assertIn("blocked before any provider attempt", str(ctx.exception))
+        self.assertEqual(provider.calls, [])
+
+    # --- B: FILE_LIMIT_EXCEEDED ---
+
+    def test_file_limit_exceeded_blocks_before_any_attempt(self):
+        artifact = self._artifact_with("partial", [
+            {"code": "FILE_LIMIT_EXCEEDED", "detail": "159 source files exceed the pro mode file limit (implicit)."},
+        ])
+        provider = llm_client.MockLLMProvider(["should never be consumed"])
+        with self.assertRaises(llm_client.Step6Failed) as ctx:
+            llm_client.run_step6_with_retries(
+                ["/fake/path.sol"], "pro", provider, self._unreachable_run_analyze_pipeline,
+                preprocess_run=self._fake_preprocess_run(artifact),
+            )
+        self.assertIn("FILE_LIMIT_EXCEEDED", str(ctx.exception))
+        self.assertIn("blocked before any provider attempt", str(ctx.exception))
+        self.assertEqual(provider.calls, [])
+
+    # --- C: combined reasons ---
+
+    def test_both_limit_reasons_present_blocks_exactly_once_preserving_both(self):
+        artifact = self._artifact_with("partial", [
+            {"code": "LOC_LIMIT_EXCEEDED", "detail": "loc detail"},
+            {"code": "FILE_LIMIT_EXCEEDED", "detail": "file detail"},
+        ])
+        provider = llm_client.MockLLMProvider(["should never be consumed"])
+        with self.assertRaises(llm_client.Step6Failed) as ctx:
+            llm_client.run_step6_with_retries(
+                ["/fake/path.sol"], "pro", provider, self._unreachable_run_analyze_pipeline,
+                preprocess_run=self._fake_preprocess_run(artifact),
+            )
+        message = str(ctx.exception)
+        self.assertIn("LOC_LIMIT_EXCEEDED", message)
+        self.assertIn("FILE_LIMIT_EXCEEDED", message)
+        self.assertIn("loc detail", message)
+        self.assertIn("file detail", message)
+        self.assertEqual(provider.calls, [])
+
+    # --- D: non-blocking partial reason ---
+
+    def test_non_blocking_partial_reason_proceeds_to_step6_unaffected(self):
+        artifact = self._artifact_with("partial", [{"code": "VYPER_LIMITED", "detail": "Vyper coverage is limited."}])
+        prompt_probe = llm_client._build_step6_prompt(artifact, None, "quick")
+        example = _extract_example(prompt_probe)
+        example["mode"] = "quick"
+        provider = llm_client.MockLLMProvider([json.dumps(example)])
+
+        result = llm_client.run_step6_with_retries(
+            ["/fake/path.sol"], "quick", provider, self._fake_run_analyze_pipeline_success,
+            preprocess_run=self._fake_preprocess_run(artifact),
+        )
+        self.assertEqual(result["status"], "rendered")
+        self.assertEqual(len(provider.calls), 1)
+
+    # --- E: complete artifact ---
+
+    def test_complete_artifact_proceeds_to_step6_unaffected(self):
+        artifact = self._artifact_with("complete", [])
+        prompt_probe = llm_client._build_step6_prompt(artifact, None, "quick")
+        example = _extract_example(prompt_probe)
+        example["mode"] = "quick"
+        provider = llm_client.MockLLMProvider([json.dumps(example)])
+
+        result = llm_client.run_step6_with_retries(
+            ["/fake/path.sol"], "quick", provider, self._fake_run_analyze_pipeline_success,
+            preprocess_run=self._fake_preprocess_run(artifact),
+        )
+        self.assertEqual(result["status"], "rendered")
+        self.assertEqual(len(provider.calls), 1)
+
+    def test_artifact_with_no_completeness_key_is_unaffected_legacy_behavior(self):
+        # FAKE_ARTIFACT itself (module-level, used throughout this file)
+        # has no "completeness" key at all - the gate must degrade to a
+        # no-op, never crash, preserving every pre-existing test in this
+        # file (e.g. Step6RetryLoopStillWiresCorrectlyTests) unchanged.
+        prompt_probe = llm_client._build_step6_prompt(FAKE_ARTIFACT, None, "quick")
+        example = _extract_example(prompt_probe)
+        example["mode"] = "quick"
+        provider = llm_client.MockLLMProvider([json.dumps(example)])
+
+        result = llm_client.run_step6_with_retries(
+            ["/fake/path.sol"], "quick", provider, self._fake_run_analyze_pipeline_success,
+            preprocess_run=lambda paths, **kwargs: FAKE_ARTIFACT,
+        )
+        self.assertEqual(result["status"], "rendered")
+
+    def test_default_noop_preprocess_run_none_artifact_is_unaffected_by_the_gate(self):
+        # preprocess_run omitted entirely -> run_step6_with_retries's own
+        # default no-op returns None as preprocess_artifact. The gate must
+        # not itself raise/crash on that (it degrades to "nothing to
+        # gate") - whatever happens next is pre-existing behavior this
+        # task does not change.
+        llm_client._enforce_completeness_gate(None)  # must not raise
+
+    # --- F: retry semantics ---
+
+    def test_blocking_never_consumes_a_step6_attempt(self):
+        artifact = self._artifact_with("partial", [{"code": "LOC_LIMIT_EXCEEDED", "detail": "d"}])
+        # 3 scripted responses (one per possible attempt) - none may be consumed.
+        provider = llm_client.MockLLMProvider(["a", "b", "c"])
+        with self.assertRaises(llm_client.Step6Failed):
+            llm_client.run_step6_with_retries(
+                ["/fake/path.sol"], "pro", provider, self._unreachable_run_analyze_pipeline,
+                preprocess_run=self._fake_preprocess_run(artifact),
+            )
+        self.assertEqual(len(provider.calls), 0)
+
+    # --- G: worker/result visibility ---
+
+    def test_raised_exception_is_the_same_type_worker_entrypoint_catches_by_name(self):
+        # worker_entrypoint.py's main() has exactly:
+        #   except llm_client.Step6Failed as exc:
+        #       _write_result("failed", error=str(exc))
+        # A different exception type here would instead fall through to
+        # its generic `except Exception` clause, which discards this
+        # message and reports only the exception's type name - so
+        # asserting the TYPE (not just "some exception") is what proves
+        # the blocking reason stays visible in the worker's result,
+        # through the exact mechanism already used for every other
+        # Step-6 failure.
+        artifact = self._artifact_with("partial", [{"code": "LOC_LIMIT_EXCEEDED", "detail": "d"}])
+        provider = llm_client.MockLLMProvider([])
+        try:
+            llm_client.run_step6_with_retries(
+                ["/fake/path.sol"], "pro", provider, self._unreachable_run_analyze_pipeline,
+                preprocess_run=self._fake_preprocess_run(artifact),
+            )
+            self.fail("expected Step6Failed")
+        except llm_client.Step6Failed as exc:
+            # Mirrors worker_entrypoint.main()'s own except-clause body exactly.
+            worker_result = {"status": "failed", "error": str(exc)}
+        self.assertEqual(worker_result["status"], "failed")
+        self.assertIn("LOC_LIMIT_EXCEEDED", worker_result["error"])
+
+
 if __name__ == "__main__":
     unittest.main()
