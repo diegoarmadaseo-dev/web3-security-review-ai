@@ -124,6 +124,42 @@ class WorkerImageRuntimeDependencyTests(unittest.TestCase):
         )
         self.assertEqual(run.returncode, 0, run.stderr.decode(errors="replace"))
 
+    def test_image_round_trips_the_compact_v2_context_encoding(self):
+        # Phase 15K-A (D-096): backend/context_encoding.py is a new local
+        # import of llm_client.py - it must be in the image and behave the
+        # same there (lossless round trip of the opt-in compact-v2 format).
+        probe = (
+            "import json, backend.context_encoding as ce, backend.llm_client as lc; "
+            "assert lc.context_encoding is ce; "
+            "a = {'signals': [{'file': 'A.sol', 'line': 1}, {'file': 'A.sol', 'line': 2}], 'x': [None, False, '']}; "
+            "t = ce.encode_context_artifact(a, ce.CONTEXT_FORMAT_V2); "
+            "assert ce.decode_context_artifact(t, ce.CONTEXT_FORMAT_V2) == a; "
+            "assert ce.encode_context_artifact(a) == json.dumps(a, ensure_ascii=False); "
+            "print(json.loads(t)['contextArtifactFormat'])"
+        )
+        run = subprocess.run(
+            ["docker", "run", "--rm", "--network", "none", "--entrypoint", "python", IMAGE_TAG, "-c", probe],
+            capture_output=True, timeout=60,
+        )
+        self.assertEqual(run.returncode, 0, run.stderr.decode(errors="replace"))
+        self.assertEqual(run.stdout.decode().strip(), "compact-v2")
+
+
+def _large_bundle_source(target_bytes):
+    """A multi-file pro bundle just under target_bytes of UTF-8 (the HTTP
+    raw-source limit, D-096), in preprocess.py's === FILE === format."""
+    parts, size, index = [], 0, 0
+    while True:
+        lines = ["pragma solidity ^0.8.20;", "/// @notice Vault %d - dep\u00f3sito" % index, "contract Vault%d {" % index, "    mapping(address => uint256) public balances;"]
+        for fn in range(10):
+            lines += ["    function move%d(address to, uint256 amount) external {" % fn, "        balances[msg.sender] -= amount;", "        balances[to] += amount;", "    }"]
+        part = "=== FILE: src/Vault%d.sol ===\n%s\n}\n=== END FILE ===\n" % (index, "\n".join(lines))
+        if size + len(part.encode("utf-8")) > target_bytes:
+            return "".join(parts)
+        parts.append(part)
+        size += len(part.encode("utf-8"))
+        index += 1
+
 
 class RealContainerJobLifecycleTests(unittest.TestCase):
     """Section 3 (D-079 fix) + Section 2 (isolation) - requirement list
@@ -184,6 +220,23 @@ class RealContainerJobLifecycleTests(unittest.TestCase):
             self.assertIs(inspect["HostConfig"]["ReadonlyRootfs"], True)
         finally:
             subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+
+    def test_source_near_the_raw_source_limit_reaches_the_worker_over_stdin(self):
+        # Phase 15K-A (D-096): a submission just under the new 2 MiB HTTP
+        # raw-source limit travels host -> stdin envelope -> container ->
+        # /scratch (tmpfs) -> preprocess -> context selection -> Step 6 prompt
+        # (default canonical format) and back. It is a pro job over the mode's
+        # LOC limit, so selection runs and the report must be scoped partial.
+        source = _large_bundle_source(2 * 1024 * 1024 - 1024)
+        self.assertGreater(len(source.encode("utf-8")), 512 * 1024)
+        draft = _valid_draft("pro")
+        draft["scope"] = {"completeness": "partial", "reasons": [{"code": "LOC_LIMIT_EXCEEDED", "detail": "scoped"}]}
+        draft["categoryCoverage"][0]["status"] = "NOT_ASSESSED"
+        result = ws.run_job_in_container(
+            _config(wall_clock_timeout_seconds=240), "t-large-source", "pro", source, mock_responses=[json.dumps(draft)],
+        )
+        self.assertEqual(result.get("status"), "succeeded", result)
+        self.assertIn("CONTEXT_SELECTION_APPLIED", result.get("rendered", ""))
 
     def test_scratch_remains_writable_end_to_end(self):
         # Implicit but real: a successful job requires writing

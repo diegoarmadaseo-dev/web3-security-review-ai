@@ -258,7 +258,15 @@ def get_in_flight_count(server: ThreadingHTTPServer) -> int:
 # already fails a job cleanly if exceeded (see backend/worker_entrypoint.py).
 # This is only a cheap, fast rejection of the obviously-oversized case
 # before it ever reaches the queue.
-MAX_RAW_SOURCE_BYTES = 512 * 1024
+#
+# 2 MiB since phase 15K-A (docs/decisiones.md D-096; was 512 KiB): real
+# Solidity measures ~53-94 source bytes per effective LOC, so 512 KiB
+# already rejected a real ~10K effLOC submission (~0.78 MB), and a real
+# ~15K/~20K one measures ~1.31-1.36 MB/~1.73 MB. This bounds only what may
+# be SUBMITTED; what reaches the LLM stays bounded separately by
+# backend/context_selection.py's application prompt budget and the final
+# pre-provider check in backend/llm_client.py.
+MAX_RAW_SOURCE_BYTES = 2 * 1024 * 1024
 
 # _handle_job_submit()'s request body is not raw source alone - it is a
 # JSON envelope ({"mode","source","idempotency_key"}) around it, and JSON

@@ -100,7 +100,7 @@ provider guarantee.
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 SELECTION_VERSION = "1.0"
 
@@ -212,10 +212,18 @@ def _filtered_artifact(artifact: Dict[str, Any], files: Set[str]) -> Dict[str, A
 
 
 def _serialized_bytes(value: Dict[str, Any]) -> int:
+    """The default measure: UTF-8 bytes of the canonical JSON form - the
+    representation Step 6 embeds by default (backend/context_encoding.py's
+    CONTEXT_FORMAT_V1, byte-identical to this). A caller embedding another
+    representation passes its own measure to select_context() so the budget
+    is always applied to the exact bytes that will be sent."""
     return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
 
 
-def _metadata_reserve_bytes(all_files: List[str], reasons: List[str], budget_bytes: int) -> int:
+MeasureBytes = Callable[[Dict[str, Any]], int]
+
+
+def _metadata_reserve_bytes(all_files: List[str], reasons: List[str], budget_bytes: int, measure_bytes: Optional[MeasureBytes] = None) -> int:
     """A safe upper bound for contextSelection's OWN serialized size:
     every file double-counted, once as included and once as excluded - a
     real run only ever lists each file in exactly one of the two, so this
@@ -225,15 +233,17 @@ def _metadata_reserve_bytes(all_files: List[str], reasons: List[str], budget_byt
     metadata object actually attached to the final result. Exposed (not
     just inlined) so callers - including this module's own tests, which
     need to construct exact-boundary budgets - can reproduce the exact
-    same reservation select_context() itself applies."""
+    same reservation select_context() itself applies. measure_bytes
+    defaults to _serialized_bytes (see select_context())."""
+    measure = measure_bytes or _serialized_bytes
     worst_case_metadata = _metadata(
         "applied", budget_bytes, budget_bytes, all_files,
         [{"file": f, "reason": _CLOSURE_EXCEEDS_BUDGET} for f in all_files], reasons,
     )
-    return _serialized_bytes({"contextSelection": worst_case_metadata}) - _serialized_bytes({"contextSelection": None})
+    return measure({"contextSelection": worst_case_metadata}) - measure({"contextSelection": None})
 
 
-def _exact_total_bytes(result: Dict[str, Any], metadata: Dict[str, Any]) -> int:
+def _exact_total_bytes(result: Dict[str, Any], metadata: Dict[str, Any], measure_bytes: Optional[MeasureBytes] = None) -> int:
     """result["contextSelection"] IS metadata (same object, not a copy) -
     estimatedContextBytes is self-referential (the field measures the very
     structure it is part of), so this converges it by fixed point: each
@@ -241,13 +251,15 @@ def _exact_total_bytes(result: Dict[str, Any], metadata: Dict[str, Any]) -> int:
     and a total's digit count only ever changes by crossing a power-of-10
     boundary, so two passes are enough in every realistic case (a third
     pass is taken purely as a belt-and-suspenders check, not because it
-    is expected to differ)."""
+    is expected to differ). measure_bytes defaults to _serialized_bytes
+    (see select_context())."""
+    measure = measure_bytes or _serialized_bytes
     for _ in range(3):
-        total = _serialized_bytes(result)
+        total = measure(result)
         if metadata["estimatedContextBytes"] == total:
             return total
         metadata["estimatedContextBytes"] = total
-    return _serialized_bytes(result)
+    return measure(result)
 
 
 def _metadata(status: str, budget_bytes: int, estimated_bytes: int, included: List[str], excluded: List[Dict[str, str]], reasons: List[str]) -> Dict[str, Any]:
@@ -266,6 +278,7 @@ def select_context(
     artifact: Dict[str, Any],
     budget_bytes: int = APPLICATION_CONTEXT_BUDGET_BYTES,
     selection_reasons: Optional[List[str]] = None,
+    measure_bytes: Optional[MeasureBytes] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Runs the algorithm described in this module's own docstring.
     Returns (result_artifact, metadata) where metadata is also embedded
@@ -273,6 +286,16 @@ def select_context(
     see below). Pure/deterministic: never touches a clock, never reads
     global state besides its own module-level constants, never mutates
     `artifact`.
+
+    measure_bytes: how an artifact's size is counted against budget_bytes
+    - every fitting decision, the metadata reserve and
+    estimatedContextBytes use it. Defaults to _serialized_bytes (canonical
+    JSON, the default Step 6 representation); a caller that embeds a
+    different representation (backend/context_encoding.py) must pass that
+    representation's own measure, so the selector never budgets one
+    encoding while the prompt sends another. Selection itself - whole
+    files, forward closure, priority order, first-fit - is identical for
+    every measure.
 
     metadata["status"]:
       "not_needed" - the complete, unfiltered artifact already fits the
@@ -293,17 +316,19 @@ def select_context(
     dependencies = _forward_dependencies(artifact, contract_key_to_file)
     reasons = list(selection_reasons or [])
 
-    def _bare_size(files: Set[str]) -> int:
-        return _serialized_bytes(_filtered_artifact(artifact, files))
+    measure = measure_bytes or _serialized_bytes
 
-    effective_budget = budget_bytes - _metadata_reserve_bytes(all_files, reasons, budget_bytes)
+    def _bare_size(files: Set[str]) -> int:
+        return measure(_filtered_artifact(artifact, files))
+
+    effective_budget = budget_bytes - _metadata_reserve_bytes(all_files, reasons, budget_bytes, measure)
 
     full_size = _bare_size(all_files_set)
     if full_size <= effective_budget:
         metadata = _metadata("not_needed", budget_bytes, 0, all_files, [], reasons)
         result = dict(artifact)
         result["contextSelection"] = metadata
-        metadata["estimatedContextBytes"] = _exact_total_bytes(result, metadata)
+        metadata["estimatedContextBytes"] = _exact_total_bytes(result, metadata, measure)
         return result, metadata
 
     selected: Set[str] = set()
@@ -334,5 +359,5 @@ def select_context(
     metadata = _metadata("applied", budget_bytes, 0, sorted(selected), excluded, reasons)
     result = _filtered_artifact(artifact, selected)
     result["contextSelection"] = metadata
-    metadata["estimatedContextBytes"] = _exact_total_bytes(result, metadata)
+    metadata["estimatedContextBytes"] = _exact_total_bytes(result, metadata, measure)
     return result, metadata

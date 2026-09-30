@@ -1150,6 +1150,125 @@ class JobSubmitBodySizeTests(_WorkspaceStorageTestCase):
         self.assertTrue(json.loads(body)["ok"])
 
 
+def _representative_15k_source(target_bytes=1_360_000):
+    """A multi-file bundle (preprocess.py's === FILE === format) of the
+    size a real ~15K effLOC submission measured (1.31-1.36 MB, phase 15K
+    audit - docs/decisiones.md D-096): larger than the previous 512 KiB
+    ceiling, smaller than the current one."""
+    parts, index, size = [], 0, 0
+    while size < target_bytes:
+        body = ["// SPDX-License-Identifier: MIT", "pragma solidity ^0.8.20;", "/// @notice Vault %d" % index, "contract Vault%d {" % index, "    mapping(address => uint256) public balances;"]
+        for fn in range(12):
+            body += [
+                "    /// @notice Moves funds between two accounts, step %d." % fn,
+                "    function move%d(address to, uint256 amount) external {" % fn,
+                "        require(balances[msg.sender] >= amount, \"insufficient\");",
+                "        balances[msg.sender] -= amount;",
+                "        balances[to] += amount;",
+                "    }",
+            ]
+        body.append("}")
+        part = "=== FILE: src/Vault%d.sol ===\n%s\n=== END FILE ===\n" % (index, "\n".join(body))
+        parts.append(part)
+        size += len(part.encode("utf-8"))
+        index += 1
+    return "".join(parts)
+
+
+class JobSubmitRawSourceLimitTests(JobSubmitBodySizeTests):
+    """Phase 15K-A (docs/decisiones.md D-096): MAX_RAW_SOURCE_BYTES is 2 MiB
+    (was 512 KiB), JOB_SUBMIT_MAX_BODY_BYTES still derives from it by the
+    same proven formula, the size is always counted in UTF-8 bytes, and the
+    body can only be sized by a valid Content-Length. Inherits the body-size
+    helpers (and, harmlessly, re-runs that class's tests against the new
+    limit)."""
+
+    def test_limits_are_two_mib_and_the_body_bound_still_derives_from_them(self):
+        self.assertEqual(http_app.MAX_RAW_SOURCE_BYTES, 2 * 1024 * 1024)
+        self.assertEqual(http_app.JOB_SUBMIT_MAX_BODY_BYTES, 6 * http_app.MAX_RAW_SOURCE_BYTES + 3072)
+        self.assertEqual(http_app.MAX_BODY_BYTES, 64 * 1024)  # every other endpoint unchanged
+
+    def test_source_exactly_at_the_limit_is_accepted(self):
+        cookie, workspace_id = self._workspace_with_pro_plan("raw-limit-1@example.com")
+        source = "x" * http_app.MAX_RAW_SOURCE_BYTES
+        status, _, body = self.post_json("/workspaces/%s/jobs" % workspace_id, {"mode": "pro", "source": source}, headers={"Cookie": cookie})
+        self.assertEqual(status, 200, body)
+        self.assertTrue(json.loads(body)["ok"])
+
+    def test_source_one_byte_over_the_limit_is_rejected(self):
+        source = "x" * (http_app.MAX_RAW_SOURCE_BYTES + 1)
+        status, data = self._raw_post("/workspaces/does-not-matter/jobs", json.dumps({"mode": "pro", "source": source}).encode("utf-8"))
+        self.assertEqual(status, 413)
+        self.assertEqual(json.loads(data)["error"], "source exceeds the maximum submission size")
+
+    def test_representative_15k_source_over_the_old_512kib_limit_is_accepted(self):
+        source = _representative_15k_source()
+        size = len(source.encode("utf-8"))
+        self.assertGreater(size, 512 * 1024)
+        self.assertLessEqual(size, http_app.MAX_RAW_SOURCE_BYTES)
+        cookie, workspace_id = self._workspace_with_pro_plan("raw-limit-2@example.com")
+        status, _, body = self.post_json("/workspaces/%s/jobs" % workspace_id, {"mode": "pro", "source": source}, headers={"Cookie": cookie})
+        self.assertEqual(status, 200, body)
+        self.assertTrue(json.loads(body)["ok"])
+
+    def test_multibyte_source_is_measured_in_utf8_bytes_not_characters(self):
+        # 3-byte characters: fewer characters than the limit, more bytes.
+        source = "€" * (http_app.MAX_RAW_SOURCE_BYTES // 3 + 1)
+        self.assertLess(len(source), http_app.MAX_RAW_SOURCE_BYTES)
+        self.assertGreater(len(source.encode("utf-8")), http_app.MAX_RAW_SOURCE_BYTES)
+        body = json.dumps({"mode": "pro", "source": source}).encode("utf-8")  # \\u20ac-escaped, still within the body bound
+        self.assertLessEqual(len(body), http_app.JOB_SUBMIT_MAX_BODY_BYTES)
+        status, data = self._raw_post("/workspaces/does-not-matter/jobs", body)
+        self.assertEqual(status, 413)
+        self.assertEqual(json.loads(data)["error"], "source exceeds the maximum submission size")
+
+    def test_four_byte_characters_exactly_at_the_limit_are_accepted(self):
+        source = "\U0001F680" * (http_app.MAX_RAW_SOURCE_BYTES // 4)
+        self.assertEqual(len(source.encode("utf-8")), http_app.MAX_RAW_SOURCE_BYTES)
+        cookie, workspace_id = self._workspace_with_pro_plan("raw-limit-3@example.com")
+        status, _, body = self.post_json("/workspaces/%s/jobs" % workspace_id, {"mode": "pro", "source": source}, headers={"Cookie": cookie})
+        self.assertEqual(status, 200, body)
+
+    def _post_headers_then_bytes(self, path, headers, payload):
+        conn = self._conn()
+        hdrs = {"Content-Type": "application/json", "Host": self.host_header, "Origin": self.same_origin}
+        hdrs.update(headers)
+        conn.putrequest("POST", path, skip_host=True, skip_accept_encoding=True)
+        for key, value in hdrs.items():
+            conn.putheader(key, value)
+        conn.endheaders()
+        if payload:
+            conn.send(payload)
+        resp = conn.getresponse()
+        data = resp.read()
+        conn.close()
+        return resp.status, data
+
+    def test_chunked_body_without_content_length_is_rejected(self):
+        # A chunked body carries no Content-Length: _read_body() refuses it
+        # before reading anything, so chunking cannot bypass the size bound.
+        chunk = b'{"mode": "pro", "source": "' + b"x" * 1024 + b'"}'
+        payload = b"%x\r\n%s\r\n0\r\n\r\n" % (len(chunk), chunk)
+        status, data = self._post_headers_then_bytes("/workspaces/does-not-matter/jobs", {"Transfer-Encoding": "chunked"}, payload)
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(data)["error"], "a valid Content-Length header is required")
+
+    def test_invalid_content_length_values_are_rejected(self):
+        for value in ("-1", "abc", ""):
+            with self.subTest(value=value):
+                status, data = self._post_headers_then_bytes("/workspaces/does-not-matter/jobs", {"Content-Length": value}, b"")
+                self.assertEqual(status, 400)
+                self.assertEqual(json.loads(data)["error"], "a valid Content-Length header is required")
+
+    def test_understated_content_length_cannot_smuggle_a_larger_source(self):
+        # Only the declared number of bytes is ever read: the truncated JSON
+        # is rejected; the undeclared remainder is never parsed as source.
+        body = json.dumps({"mode": "pro", "source": "x" * (http_app.MAX_RAW_SOURCE_BYTES + 10)}).encode("utf-8")
+        status, data = self._post_headers_then_bytes("/workspaces/does-not-matter/jobs", {"Content-Length": "64"}, body[:4096])
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(data)["error"], "request body is not valid UTF-8 JSON")
+
+
 class JobReadTests(_WorkspaceStorageTestCase):
     def _seed_workspace_with_job(self, email):
         cookie = self.request_and_confirm_login(email)

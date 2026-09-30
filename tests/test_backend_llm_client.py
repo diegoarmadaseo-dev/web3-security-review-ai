@@ -1641,7 +1641,7 @@ def _dense_bundle_source(n_files=20, n_funcs=384):
 
 class PromptBudgetTriggeredSelectionTests(unittest.TestCase):
     """Blocker from the final hardening audit: a VALID pro job (completeness
-    "complete", within 4,000 effLOC and the 512 KiB raw-source limit) can
+    "complete", within 4,000 effLOC and the HTTP raw-source limit, MAX_RAW_SOURCE_BYTES) can
     still produce an artifact whose prompt exceeds
     APPLICATION_CONTEXT_BUDGET_BYTES. Such an artifact now triggers the same
     deterministic whole-file selection (selectionReasons =

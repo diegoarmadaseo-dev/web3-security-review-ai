@@ -68,6 +68,7 @@ import json
 import os
 from typing import Any, Callable, Dict, List, Optional, Protocol
 
+import backend.context_encoding as context_encoding
 import backend.context_selection as context_selection
 
 try:
@@ -288,7 +289,10 @@ _BLOCKING_COMPLETENESS_CODES = frozenset({"LOC_LIMIT_EXCEEDED", "FILE_LIMIT_EXCE
 # context-selection note (<1 KB), the previous-errors header plus at most
 # STEP6_PREVIOUS_ERRORS_MAX_BYTES of error payload (16 KiB), and the
 # gate's own promptBudgetBytes metadata field (<40 bytes) - ~25 KB total,
-# with the remainder as fixed headroom. A fixed constant, never a
+# with the remainder as fixed headroom. The opt-in compact-v2 artifact
+# encoding (backend/context_encoding.py) adds its fixed-size legend
+# (<1 KB), still inside this same reserve (see the v2 prompt-budget
+# tests). A fixed constant, never a
 # percentage of the current artifact.
 STEP6_PROMPT_RESERVE_BYTES = 32 * 1024
 STEP6_PREVIOUS_ERRORS_MAX_BYTES = 16 * 1024
@@ -300,13 +304,17 @@ STEP6_PREVIOUS_ERRORS_MAX_BYTES = 16 * 1024
 PROMPT_BUDGET_SELECTION_REASON = "PROMPT_BUDGET_EXCEEDED"
 
 
-def _serialized_artifact_bytes(preprocess_artifact: Any) -> int:
+def _serialized_artifact_bytes(preprocess_artifact: Any, context_format: str = context_encoding.CONTEXT_FORMAT_V1) -> int:
     """Byte size of the artifact exactly as _build_step6_prompt() embeds
-    it (same json.dumps call), without building the rest of the prompt."""
-    return len(json.dumps(preprocess_artifact, ensure_ascii=False).encode("utf-8"))
+    it in `context_format` (the same context_encoding call), without
+    building the rest of the prompt."""
+    return context_encoding.context_artifact_bytes(preprocess_artifact, context_format)
 
 
-def _apply_completeness_gate(preprocess_artifact: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def _apply_completeness_gate(
+    preprocess_artifact: Optional[Dict[str, Any]],
+    context_format: str = context_encoding.CONTEXT_FORMAT_V1,
+) -> Optional[Dict[str, Any]]:
     """The automated-worker equivalent of SKILL.md's Step 4 rule for a
     human-driven session ("If completeness.reasons includes
     LOC_LIMIT_EXCEEDED or FILE_LIMIT_EXCEEDED: stop here... show what
@@ -371,11 +379,18 @@ def _apply_completeness_gate(preprocess_artifact: Optional[Dict[str, Any]]) -> O
     _mode_restrictions_note()'s own "missing data never crashes, only
     skips" discipline elsewhere in this module.
 
+    context_format (backend/context_encoding.py) is the representation
+    the prompt will embed: the artifact-budget trigger, the selector's
+    every size decision and estimatedContextBytes are all measured in
+    exactly that representation. The default (canonical JSON) keeps this
+    gate's behavior - including its select_context() call - unchanged.
+
     Raises Step6Failed - reusing the exact exception type/handling
     worker_entrypoint.py already catches by name for this module (see
     that function's own try/except), rather than falling through to its
     generic except Exception clause, which would discard this message
     and report only the exception's type name instead."""
+    context_encoding.check_context_format(context_format)
     if not isinstance(preprocess_artifact, dict):
         return preprocess_artifact
     completeness = preprocess_artifact.get("completeness") or {}
@@ -387,7 +402,7 @@ def _apply_completeness_gate(preprocess_artifact: Optional[Dict[str, Any]]) -> O
     artifact_budget = prompt_budget - STEP6_PROMPT_RESERVE_BYTES
     if blocking:
         reason_codes = [r.get("code") for r in blocking]
-    elif _serialized_artifact_bytes(preprocess_artifact) > artifact_budget:
+    elif _serialized_artifact_bytes(preprocess_artifact, context_format) > artifact_budget:
         # Prompt-budget trigger: no blocking completeness reason (status
         # "complete", a non-blocking "partial", or no completeness at all),
         # but the full artifact cannot fit the artifact budget, so no
@@ -398,16 +413,22 @@ def _apply_completeness_gate(preprocess_artifact: Optional[Dict[str, Any]]) -> O
         reason_codes = [PROMPT_BUDGET_SELECTION_REASON]
     else:
         return preprocess_artifact
+    # The default format keeps the historical call shape exactly; any
+    # other format hands the selector that format's own measure.
+    measure_kwargs: Dict[str, Any] = {}
+    if context_format != context_encoding.CONTEXT_FORMAT_V1:
+        measure_kwargs["measure_bytes"] = context_encoding.context_bytes_measure(context_format)
     selected_artifact, selection_meta = context_selection.select_context(
-        preprocess_artifact, budget_bytes=artifact_budget, selection_reasons=reason_codes,
+        preprocess_artifact, budget_bytes=artifact_budget, selection_reasons=reason_codes, **measure_kwargs,
     )
     if selection_meta["status"] != "failed":
         # contextSelection.budgetBytes is the ARTIFACT budget the selector
         # applied; promptBudgetBytes records the separate FINAL-prompt
         # budget. estimatedContextBytes is re-converged with the
-        # selector's own helper so it still measures the artifact exactly.
+        # selector's own helper so it still measures the artifact exactly,
+        # in the representation the prompt embeds.
         selection_meta["promptBudgetBytes"] = prompt_budget
-        context_selection._exact_total_bytes(selected_artifact, selection_meta)
+        context_selection._exact_total_bytes(selected_artifact, selection_meta, measure_kwargs.get("measure_bytes"))
         return selected_artifact
 
     if blocking:
@@ -416,7 +437,7 @@ def _apply_completeness_gate(preprocess_artifact: Optional[Dict[str, Any]]) -> O
         )
     else:
         trigger = "%s: the full artifact (%d bytes) does not fit the artifact budget" % (
-            PROMPT_BUDGET_SELECTION_REASON, _serialized_artifact_bytes(preprocess_artifact),
+            PROMPT_BUDGET_SELECTION_REASON, _serialized_artifact_bytes(preprocess_artifact, context_format),
         )
     raise Step6Failed(
         "Step 6 blocked before any provider attempt: %s, and deterministic whole-file context "
@@ -647,13 +668,24 @@ Minimal structural example (illustrates shape only - do not reuse this content, 
 Respond with ONLY the raw JSON object - no markdown code fences, no prose before or after it."""
 
 
-def _build_step6_prompt(preprocess_artifact: Dict[str, Any], previous_errors: Optional[List[str]], mode: str) -> str:
+def _build_step6_prompt(
+    preprocess_artifact: Dict[str, Any],
+    previous_errors: Optional[List[str]],
+    mode: str,
+    context_format: str = context_encoding.CONTEXT_FORMAT_V1,
+) -> str:
     """Embeds the real report-schema.json contract explicitly - see module
     docstring's PROMPT CONTRACT section for why, and _REPORT_CONTRACT's
     own comment for why this is a compact restatement rather than the raw
     schema file. mode is required (not optional) because both the "mode"
     field instruction and the mode-specific restrictions paragraph must
-    match the actual requested mode, never a guessed/default one."""
+    match the actual requested mode, never a guessed/default one.
+
+    context_format selects the artifact's representation
+    (backend/context_encoding.py). The default embeds exactly
+    json.dumps(artifact, ensure_ascii=False), so the default prompt is
+    byte-identical to before; compact-v2 embeds the lossless compact
+    envelope preceded by its fixed-size legend."""
     input_hash = preprocess_artifact.get("inputHash", "")
     contract = _REPORT_CONTRACT % {
         "mode": mode,
@@ -666,8 +698,9 @@ def _build_step6_prompt(preprocess_artifact: Dict[str, Any], previous_errors: Op
         "You are performing a smart contract security analysis (SKILL.md Step 6). "
         "Given the preprocessed artifact below (already secret-redacted, deterministic "
         "structural signals only), produce a JSON object that matches this exact output "
-        "contract.\n\n%s\n\nPreprocessed artifact:\n%s"
-        % (contract, json.dumps(preprocess_artifact, ensure_ascii=False))
+        "contract.\n\n%s\n\n%sPreprocessed artifact:\n%s"
+        % (contract, context_encoding.prompt_legend(context_format),
+           context_encoding.encode_context_artifact(preprocess_artifact, context_format))
     )
     base += _context_selection_prompt_note(preprocess_artifact)
     if previous_errors:
@@ -718,6 +751,7 @@ def run_step6_with_retries(
     modes_config: Optional[Dict[str, Any]] = None,
     render_format: str = "markdown",
     preprocess_run: Optional[Callable[..., Dict[str, Any]]] = None,
+    context_format: str = context_encoding.CONTEXT_FORMAT_V1,
 ) -> Dict[str, Any]:
     """Orchestrates Step 6 (this module) around the existing mechanized
     Steps 3/7/8/9 (analyze_pipeline.run_analyze_pipeline, injected by the
@@ -739,15 +773,25 @@ def run_step6_with_retries(
     none of them) if _apply_completeness_gate() blocks - see that
     function's own docstring. The artifact that gate RETURNS (possibly a
     context-selected subset) replaces preprocess_artifact once, before
-    the loop, so every attempt's prompt is built from the same selection."""
+    the loop, so every attempt's prompt is built from the same selection.
+
+    context_format (backend/context_encoding.py) is opt-in: the default
+    canonical JSON keeps every call below exactly as before; compact-v2
+    is used for BOTH selection and the prompt (never one without the
+    other), and the final hard check below always measures the real
+    prompt text whatever the format."""
+    context_encoding.check_context_format(context_format)
+    format_kwargs: Dict[str, Any] = {}
+    if context_format != context_encoding.CONTEXT_FORMAT_V1:
+        format_kwargs["context_format"] = context_format
     preprocess_run = preprocess_run or (lambda **kwargs: None)
     preprocess_artifact = preprocess_run(source_paths, mode=mode, max_loc=None, use_stdin=False, include_timestamp=False, modes_config=modes_config)
-    preprocess_artifact = _apply_completeness_gate(preprocess_artifact)
+    preprocess_artifact = _apply_completeness_gate(preprocess_artifact, **format_kwargs)
 
     previous_errors: Optional[List[str]] = None
     last_failure = "unknown failure"
     for attempt in range(1, MAX_STEP6_ATTEMPTS + 1):
-        prompt = _build_step6_prompt(preprocess_artifact, previous_errors, mode)
+        prompt = _build_step6_prompt(preprocess_artifact, previous_errors, mode, **format_kwargs)
         prompt_bytes = len(prompt.encode("utf-8"))
         prompt_budget = context_selection.APPLICATION_CONTEXT_BUDGET_BYTES
         if prompt_bytes > prompt_budget:
@@ -763,7 +807,7 @@ def run_step6_with_retries(
                 "application prompt budget of %d bytes (artifact %d bytes, previous-error context "
                 "%d bytes). No provider call was made for this attempt."
                 % (attempt, prompt_bytes, prompt_budget,
-                   len(json.dumps(preprocess_artifact, ensure_ascii=False).encode("utf-8")),
+                   _serialized_artifact_bytes(preprocess_artifact, context_format),
                    len(_bounded_previous_errors(previous_errors).encode("utf-8")) if previous_errors else 0)
             )
         try:
