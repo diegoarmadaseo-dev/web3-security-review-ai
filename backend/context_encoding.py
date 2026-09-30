@@ -199,11 +199,143 @@ def context_artifact_bytes(artifact: Any, context_format: str = CONTEXT_FORMAT_V
     return len(encode_context_artifact(artifact, context_format).encode("utf-8"))
 
 
+class _ContextBytesMeasure:
+    """Callable measure carrying its format, so context_selection can pair
+    it with the matching size model (see size_model()) - the measure
+    itself stays the single source of truth for every byte count."""
+
+    def __init__(self, context_format: str) -> None:
+        self.context_format = check_context_format(context_format)
+
+    def __call__(self, value: Any) -> int:
+        return context_artifact_bytes(value, self.context_format)
+
+
 def context_bytes_measure(context_format: str) -> Callable[[Any], int]:
     """The measuring function context_selection.select_context() is given,
     so selection counts exactly the representation the prompt embeds."""
+    return _ContextBytesMeasure(context_format)
+
+
+# ---------------------------------------------------------------------------
+# Size models (pre-15K-B hardening, docs/decisiones.md D-096): the exact
+# byte arithmetic of each format's LIST encodings, so context selection can
+# size a file-filtered artifact incrementally instead of re-serializing it
+# for every candidate. Each function below is derived line by line from the
+# encoder above (v1: json.dumps' ", " separators; v2: _encode_list,
+# _encode_file_runs and the compact separators) and is cross-checked against
+# encode_context_artifact() itself by the selector (final check) and by
+# tests/test_backend_context_selection.py.
+# ---------------------------------------------------------------------------
+
+def _utf8_len(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
+def _compact(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+class _SizeModelV1:
+    """canonical-json-v1: a list is "[" + items joined by ", " + "]", and
+    every nested value serializes identically wherever it appears."""
+
+    context_format = CONTEXT_FORMAT_V1
+    order_free = True       # a list's size never depends on its items' order or neighbours
+    file_run_sections = ()  # v1 has no file runs
+
+    def item_parts(self, item: Any) -> Tuple[Tuple[str, ...], int, int]:
+        return (), _utf8_len(json.dumps(item, ensure_ascii=False)), 0
+
+    def header_bytes(self, signature: Tuple[str, ...]) -> int:
+        return 0
+
+    def homogeneous_list_bytes(self, count: int, item_bytes: int, row_bytes: int, header_bytes: int) -> int:
+        return 2 if count == 0 else 2 + item_bytes + 2 * (count - 1)
+
+    def list_bytes(self, parts: List[Tuple[Tuple[str, ...], int, int]]) -> int:
+        return self.homogeneous_list_bytes(len(parts), sum(p[1] for p in parts), 0, 0)
+
+
+class _SizeModelV2:
+    """compact-v2: the byte length of _encode_list() / _encode_file_runs()
+    output, computed from per-item parts (signature, bytes as a plain item,
+    bytes as a table row) instead of encoding the list."""
+
+    context_format = CONTEXT_FORMAT_V2
+    order_free = False
+    file_run_sections = FILE_RUN_SECTIONS
+
+    def item_parts(self, item: Any) -> Tuple[Tuple[str, ...], int, int]:
+        signature = _key_signature(item)
+        item_bytes = _utf8_len(_compact(_encode_value(item)))
+        row_bytes = _utf8_len(_compact([_encode_value(item[key]) for key in signature])) if signature else 0
+        return signature, item_bytes, row_bytes
+
+    def header_bytes(self, signature: Tuple[str, ...]) -> int:
+        return _utf8_len(_compact(list(signature)))
+
+    def homogeneous_list_bytes(self, count: int, item_bytes: int, row_bytes: int, header_bytes: int) -> int:
+        """Exact size of a list whose items all share one table signature:
+        [] | [item] | {"$t":[header,row,...]}."""
+        if count == 0:
+            return 2
+        if count == 1:
+            return 2 + item_bytes
+        return 9 + header_bytes + row_bytes + count
+
+    def list_bytes(self, parts: List[Tuple[Tuple[str, ...], int, int]]) -> int:
+        """Exact size of _encode_list() for items with these ordered parts
+        (same segmentation rule: maximal runs of >= 2 equal non-empty
+        signatures become tables)."""
+        count = len(parts)
+        # Each segment: ["table", its bytes] or ["items", item count, sum of item bytes].
+        segments: List[List[Any]] = []
+        index = 0
+        while index < count:
+            signature = parts[index][0]
+            end = index + 1
+            if signature:
+                while end < count and parts[end][0] == signature:
+                    end += 1
+            if signature and end - index >= 2:
+                rows = parts[index:end]
+                segments.append(["table", 9 + self.header_bytes(signature) + sum(p[2] for p in rows) + len(rows)])
+            elif segments and segments[-1][0] == "items":
+                segments[-1][1] += 1
+                segments[-1][2] += parts[index][1]
+            else:
+                segments.append(["items", 1, parts[index][1]])
+            index = end
+        if not any(segment[0] == "table" for segment in segments):
+            return 2 if count == 0 else 2 + sum(p[1] for p in parts) + (count - 1)
+        if len(segments) == 1:
+            return segments[0][1]
+        total = sum(s[1] if s[0] == "table" else 9 + s[2] + (s[1] - 1) for s in segments)
+        return 9 + total + (len(segments) - 1)
+
+    def file_run_parts(self, path: str, records: List[Dict[str, Any]]) -> Tuple[int, int]:
+        """(number of runs, total run bytes) that _encode_file_runs() emits
+        for ONE file's contiguous records."""
+        runs: List[Tuple[int, List[Dict[str, Any]]]] = []
+        for record in records:
+            position = list(record.keys()).index("file")
+            stripped = {key: item for key, item in record.items() if key != "file"}
+            if runs and runs[-1][0] == position:
+                runs[-1][1].append(stripped)
+            else:
+                runs.append((position, [stripped]))
+        return len(runs), sum(_utf8_len(_compact([path, position, _encode_list(group)])) for position, group in runs)
+
+    def run_section_bytes(self, runs: int, run_bytes: int) -> int:
+        """{"$r":[run,...]}, or [] for an empty section."""
+        return 2 if runs == 0 else 9 + run_bytes + (runs - 1)
+
+
+def size_model(context_format: str) -> Any:
+    """The exact list-size arithmetic of `context_format` (see above)."""
     check_context_format(context_format)
-    return lambda value: context_artifact_bytes(value, context_format)
+    return _SizeModelV1() if context_format == CONTEXT_FORMAT_V1 else _SizeModelV2()
 
 
 # ---------------------------------------------------------------------------

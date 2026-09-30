@@ -404,5 +404,240 @@ class GraphIntegrityTests(unittest.TestCase):
         self.assertEqual(result["priorityRanking"], artifact["priorityRanking"])
 
 
+
+# ---------------------------------------------------------------------------
+# Pre-15K-B hardening (docs/decisiones.md D-096): exact incremental sizing.
+# select_context() now sizes candidates with context_selection._ExactSizer
+# (built from context_encoding.size_model) instead of filtering and
+# re-serializing the whole artifact per candidate. These tests prove the
+# sizes are exact, the selections identical to the full-measure path, the
+# real measure's call count independent of the number of files, and every
+# fallback safe.
+# ---------------------------------------------------------------------------
+
+import random  # noqa: E402
+from unittest import mock  # noqa: E402
+
+import backend.context_encoding as ce  # noqa: E402
+
+V1 = ce.CONTEXT_FORMAT_V1
+V2 = ce.CONTEXT_FORMAT_V2
+
+
+class _CountingMeasure:
+    """The real measure of `context_format`, counting its calls. With
+    `modeled=False` it hides its format, so select_context() cannot pair it
+    with a size model and measures every candidate directly - the
+    original, full-measure path, used here as the reference."""
+
+    def __init__(self, context_format, modeled=True):
+        self._format = context_format
+        if modeled:
+            self.context_format = context_format
+        self.calls = 0
+
+    def __call__(self, value):
+        self.calls += 1
+        return ce.context_artifact_bytes(value, self._format)
+
+
+def _rich_artifact(seed, n_files=24):
+    """A random artifact exercising every list the selector filters:
+    imports (resolved, unresolved, cyclic), heterogeneous systemGraph edges
+    (inherits vs. calls records with extra keys), proxies with and without
+    an implementation, a node key shared by two files, per-file signal/call
+    records with varying key order (so v2 file runs split), multibyte text,
+    and a documentation file record outside the ranking."""
+    rnd = random.Random(seed)
+    names = ["src/F%02d.sol" % i for i in range(n_files)]
+    specs = [(name, rnd.randint(0, 9), rnd.randint(0, 3000)) for name in names]
+    imports, edges, signals, calls = [], [], [], []
+    for index, name in enumerate(names):
+        for _ in range(rnd.randint(0, 2)):
+            target = rnd.choice(names)
+            resolved = rnd.random() < 0.8 and target != name
+            imports.append({"file": name, "line": 1, "shape": "relative", "path": "./x.sol", "resolved": resolved, "resolvedTo": target if resolved else None, "symbols": [], "alias": None})
+        for line in range(rnd.randint(0, 3)):
+            record = {"file": name, "line": line, "column": 1, "family": rnd.choice(["low-level-call", "tx-origin"]), "snippet": "café → %d" % line}
+            if rnd.random() < 0.3:
+                record = {"line": line, "file": name, "family": "delegatecall", "extra": [1, None, False]}
+            signals.append(record)
+        for line in range(rnd.randint(0, 2)):
+            calls.append({"file": name, "contract": "C", "function": "f", "line": line, "target": "t%d" % line})
+    art = _artifact(specs, imports=imports, signals=signals, calls=calls)
+    keys = [c["key"] for c in art["contracts"]]
+    for _ in range(n_files):
+        a, b = rnd.choice(keys), rnd.choice(keys)
+        if rnd.random() < 0.5:
+            edges.append({"kind": "inherits", "from": a, "to": b})
+        else:
+            edges.append({"kind": "calls", "from": a, "to": b, "function": "f", "line": 3, "method": "g"})
+    edges.append({"kind": "inherits", "from": keys[0], "to": "not-a-node"})
+    art["systemGraph"]["edges"] = edges
+    art["systemGraph"]["proxies"] = [
+        {"proxy": keys[1], "implementation": keys[2], "status": "paired", "reason": None},
+        {"proxy": keys[3], "implementation": None, "status": "unpaired", "reason": "none"},
+        {"proxy": keys[4], "implementation": "not-a-node", "status": "paired", "reason": None},
+    ]
+    art["systemGraph"]["nodes"].append({"key": keys[5], "file": names[6], "name": "dup", "kind": "contract"})
+    art["files"].append({"path": "README.md", "origin": "directory", "language": "documentation", "kind": "documentation", "hash": "sha256:1", "lineEndings": "lf", "lines": {"total": 1, "effective": 0, "blank": 0, "commentOnly": 0}, "issues": []})
+    return art
+
+
+def _select(artifact, budget, measure):
+    return cs.select_context(artifact, budget_bytes=budget, selection_reasons=["LOC_LIMIT_EXCEEDED"], measure_bytes=measure)
+
+
+class ExactSizerTests(unittest.TestCase):
+    def test_incremental_size_equals_the_real_measure_for_random_subsets(self):
+        rnd = random.Random(42)
+        for seed in range(6):
+            art = _rich_artifact(seed)
+            known = {e["file"] for e in art["priorityRanking"]}
+            for fmt in (V1, V2):
+                measure = ce.context_bytes_measure(fmt)
+                sizer = cs._build_exact_sizer(art, known, measure, measure)  # noqa: SLF001
+                self.assertIsNotNone(sizer, (seed, fmt))
+                for _ in range(25):
+                    subset = set(rnd.sample(sorted(known), rnd.randint(0, len(known))))
+                    state = sizer.add_files(sizer.empty_state(), sorted(subset))
+                    self.assertEqual(sizer.size(state), measure(cs._filtered_artifact(art, subset)), (seed, fmt))  # noqa: SLF001
+
+    def test_sizes_stay_exact_when_files_are_added_in_steps(self):
+        art = _rich_artifact(7)
+        order = [e["file"] for e in art["priorityRanking"]]
+        for fmt in (V1, V2):
+            measure = ce.context_bytes_measure(fmt)
+            sizer = cs._build_exact_sizer(art, set(order), measure, measure)  # noqa: SLF001
+            state, included = sizer.empty_state(), set()
+            for start in range(0, len(order), 3):
+                step = order[start:start + 3]
+                before = dict(state)
+                state = sizer.add_files(state, step)
+                self.assertEqual(before, dict(before))  # add_files never mutates the state it was given
+                included |= set(step)
+                self.assertEqual(sizer.size(state), measure(cs._filtered_artifact(art, included)), fmt)  # noqa: SLF001
+
+    def test_real_preprocess_artifact_sizes_are_exact_in_both_formats(self):
+        from tests.test_backend_context_encoding import _real_artifact
+        art = _real_artifact()
+        known = sorted(e["file"] for e in art["priorityRanking"])
+        rnd = random.Random(3)
+        for fmt in (V1, V2):
+            measure = ce.context_bytes_measure(fmt)
+            sizer = cs._build_exact_sizer(art, set(known), measure, measure)  # noqa: SLF001
+            self.assertIsNotNone(sizer)
+            for _ in range(30):
+                subset = set(rnd.sample(known, rnd.randint(0, len(known))))
+                self.assertEqual(sizer.size(sizer.add_files(sizer.empty_state(), sorted(subset))), measure(cs._filtered_artifact(art, subset)))  # noqa: SLF001
+
+
+class IncrementalSelectionEquivalenceTests(unittest.TestCase):
+    """Same selections, byte for byte, as measuring every candidate."""
+
+    def assertSameSelection(self, art, budget, fmt):
+        modeled = _select(art, budget, _CountingMeasure(fmt))
+        reference = _select(art, budget, _CountingMeasure(fmt, modeled=False))
+        self.assertEqual(modeled[1], reference[1])
+        self.assertEqual(ce.encode_context_artifact(modeled[0], fmt), ce.encode_context_artifact(reference[0], fmt))
+        return modeled[1]
+
+    def test_random_artifacts_and_budgets_select_identically(self):
+        statuses = set()
+        for seed in range(8):
+            art = _rich_artifact(seed)
+            for fmt in (V1, V2):
+                full = ce.context_artifact_bytes(art, fmt)
+                for fraction in (0.02, 0.2, 0.45, 0.8, 1.2):
+                    statuses.add(self.assertSameSelection(art, int(full * fraction), fmt)["status"])
+        self.assertEqual(statuses, {"failed", "applied", "not_needed"})
+
+    def test_default_measure_uses_the_v1_model_and_matches_the_reference(self):
+        art = _rich_artifact(11)
+        budget = _size_with(art, [e["file"] for e in art["priorityRanking"]][:10])
+        default = cs.select_context(art, budget_bytes=budget, selection_reasons=["LOC_LIMIT_EXCEEDED"])
+        reference = _select(art, budget, _CountingMeasure(V1, modeled=False))
+        self.assertEqual(default[1], reference[1])
+        self.assertEqual(json.dumps(default[0], ensure_ascii=False), json.dumps(reference[0], ensure_ascii=False))
+
+    def test_large_dependency_closures_select_identically(self):
+        # A chain F00 -> F01 -> ... plus the random graph: closures up to the
+        # whole bundle, rejected and accepted.
+        art = _rich_artifact(5, n_files=40)
+        names = [f["path"] for f in art["files"] if f["path"].endswith(".sol")]
+        for a, b in zip(names, names[1:]):
+            art["imports"].append({"file": a, "line": 2, "shape": "relative", "path": "./n.sol", "resolved": True, "resolvedTo": b, "symbols": [], "alias": None})
+        art["imports"].sort(key=lambda i: (i["file"], i["line"]))
+        for fmt in (V1, V2):
+            full = ce.context_artifact_bytes(art, fmt)
+            for fraction in (0.3, 0.6, 0.95):
+                self.assertSameSelection(art, int(full * fraction), fmt)
+
+    def test_many_small_files_select_identically(self):
+        art = _artifact([("s/f%04d.sol" % i, i % 3, 5) for i in range(150)])
+        for fmt in (V1, V2):
+            self.assertEqual(self.assertSameSelection(art, ce.context_artifact_bytes(art, fmt) // 3, fmt)["status"], "applied")
+
+
+class IncrementalSelectionWorkTests(unittest.TestCase):
+    """The regression the optimization fixes, without timing assertions:
+    the number of real (full-artifact) measurements no longer grows with
+    the number of candidate files."""
+
+    def _calls(self, n_files, fmt, modeled):
+        art = _artifact([("s/f%05d.sol" % i, i % 5, 3) for i in range(n_files)])
+        measure = _CountingMeasure(fmt, modeled=modeled)
+        _, meta = _select(art, ce.context_artifact_bytes(art, fmt) // 4, measure)
+        self.assertEqual(meta["status"], "applied")
+        return measure.calls
+
+    def test_real_measure_calls_are_constant_in_the_number_of_files(self):
+        for fmt in (V1, V2):
+            small, large = self._calls(40, fmt, True), self._calls(400, fmt, True)
+            self.assertEqual(small, large, fmt)
+            self.assertLessEqual(large, 8, fmt)
+
+    def test_reference_path_measures_every_candidate(self):
+        # The original path's cost, kept as the fallback: at least one full
+        # measurement per candidate file.
+        self.assertGreaterEqual(self._calls(60, V1, False), 60)
+
+
+class IncrementalSelectionFallbackTests(unittest.TestCase):
+    def test_unknown_measure_uses_the_full_measure_path(self):
+        self.assertIsNone(cs._size_model_for(lambda value: 0))  # noqa: SLF001
+        self.assertIsNotNone(cs._size_model_for(None))  # noqa: SLF001
+        self.assertIsNotNone(cs._size_model_for(cs._serialized_bytes))  # noqa: SLF001
+        self.assertIsNotNone(cs._size_model_for(ce.context_bytes_measure(V2)))  # noqa: SLF001
+
+    def test_non_contiguous_file_runs_fall_back_under_v2_only(self):
+        art = _rich_artifact(2)
+        a, b = art["signals"][0]["file"], next(s["file"] for s in art["signals"] if s["file"] != art["signals"][0]["file"])
+        art["signals"] = [{"file": a, "line": 1}, {"file": b, "line": 1}, {"file": a, "line": 2}]
+        known = {e["file"] for e in art["priorityRanking"]}
+        self.assertIsNone(cs._build_exact_sizer(art, known, ce.context_bytes_measure(V2), ce.context_bytes_measure(V2)))  # noqa: SLF001
+        self.assertIsNotNone(cs._build_exact_sizer(art, known, ce.context_bytes_measure(V1), ce.context_bytes_measure(V1)))  # noqa: SLF001
+        full = ce.context_artifact_bytes(art, V2)
+        IncrementalSelectionEquivalenceTests.assertSameSelection(self, art, full // 2, V2)
+
+    def test_unexpected_record_shape_falls_back(self):
+        art = _rich_artifact(3)
+        del art["systemGraph"]["nodes"][0]["key"]
+        known = {e["file"] for e in art["priorityRanking"]}
+        self.assertIsNone(cs._build_exact_sizer(art, known, ce.context_bytes_measure(V1), None))  # noqa: SLF001
+
+    def test_a_disagreeing_model_is_caught_by_the_final_check(self):
+        # If the model ever disagreed with the real measure, the final exact
+        # check discards its decisions and redoes the selection directly.
+        art = _rich_artifact(4)
+        full = ce.context_artifact_bytes(art, V1)
+        reference = _select(art, full // 2, _CountingMeasure(V1, modeled=False))
+        real_size = cs._ExactSizer.size  # noqa: SLF001
+        with mock.patch.object(cs._ExactSizer, "size", lambda self, state: real_size(self, state) - 1000):  # noqa: SLF001
+            guarded = _select(art, full // 2, _CountingMeasure(V1))
+        self.assertEqual(guarded[1], reference[1])
+        self.assertEqual(json.dumps(guarded[0], ensure_ascii=False), json.dumps(reference[0], ensure_ascii=False))
+
+
 if __name__ == "__main__":
     unittest.main()

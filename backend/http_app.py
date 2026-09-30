@@ -319,6 +319,17 @@ JOB_SUBMIT_MAX_BODY_BYTES = 6 * MAX_RAW_SOURCE_BYTES + 3072
 _SENSITIVE_QUERY_PARAM_NAMES = frozenset({"token"})
 
 
+def _is_utf8_encodable(text: str) -> bool:
+    """False for text holding an unpaired surrogate (json.loads() produces
+    one from an escape such as "\\ud800"), which cannot be encoded as
+    UTF-8, stored or hashed."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _redact_query_string(path: str) -> str:
     """Parser-aware redaction of any sensitive query parameter in `path`
     (e.g. "/auth/verify?token=xyz") - see module docstring on token-
@@ -796,6 +807,17 @@ def make_handler(
             JOB_SUBMIT_MAX_BODY_BYTES explicitly (see that constant's own
             comment) so its body can actually reach MAX_RAW_SOURCE_BYTES's
             source-specific check instead of being rejected here first."""
+            content_length, err_status, err_msg = self._check_content_length(max_body_bytes)
+            if err_status:
+                return None, err_status, err_msg
+            return self.rfile.read(content_length), None, None
+
+        def _check_content_length(self, max_body_bytes: int) -> Tuple[int, Optional[int], Optional[str]]:
+            """The Content-Length checks of _read_body(), from the header
+            alone - nothing is read from the socket. A request without a
+            valid Content-Length (e.g. a chunked body) or declaring more
+            than max_body_bytes is rejected and its connection closed, so
+            the unread body is never parsed as a next request."""
             length_header = self.headers.get("Content-Length")
             try:
                 content_length = int(length_header) if length_header is not None else -1
@@ -803,11 +825,11 @@ def make_handler(
                 content_length = -1
             if content_length < 0:
                 self.close_connection = True
-                return None, 400, "a valid Content-Length header is required"
+                return -1, 400, "a valid Content-Length header is required"
             if content_length > max_body_bytes:
                 self.close_connection = True
-                return None, 413, "request body too large"
-            return self.rfile.read(content_length), None, None
+                return -1, 413, "request body too large"
+            return content_length, None, None
 
         def _current_user_id(self, conn: Any) -> Optional[str]:
             session_token = _get_cookie(self.headers, SESSION_COOKIE_NAME)
@@ -1316,11 +1338,51 @@ def make_handler(
         # this endpoint never executes/compiles the submitted source -
         # see module docstring and backend/worker_supervisor.py.
         # -------------------------------------------------------------
+        def _authorize_job_submit_before_body(self, workspace_id: str) -> bool:
+            """Session and workspace-role checks of _handle_job_submit(),
+            run before its body is read (see the call site). Same checks,
+            statuses and messages as the ones after the body; on refusal the
+            connection is closed because the body was never read. Returns
+            True when the request may proceed to reading its body."""
+            conn = connect_fn()
+            try:
+                current_user_id = self._current_user_id(conn)
+                if current_user_id is None:
+                    self.close_connection = True
+                    self._send_json(401, {"ok": False, "error": "authentication required"})
+                    return False
+                try:
+                    tenant_scope.require_workspace_role(conn, current_user_id, workspace_id, allowed_roles=("owner", "admin", "member"))
+                except tenant_scope.TenantScopeError:
+                    self.close_connection = True
+                    self._send_json(403, {"ok": False, "error": "forbidden"})
+                    return False
+                return True
+            except Exception:
+                self.close_connection = True
+                self._send_json(500, {"ok": False, "error": "internal error"})
+                return False
+            finally:
+                conn.close()
+
         def _handle_job_submit(self, workspace_id: str) -> None:
             if self._reject_if_cross_origin():
                 return
             if storage is None:
                 self._send_json(503, {"ok": False, "error": "job execution is not configured"})
+                return
+            # Pre-15K-B hardening (docs/decisiones.md D-096): everything
+            # decidable from the request line and headers runs BEFORE the
+            # body (up to JOB_SUBMIT_MAX_BODY_BYTES) is read - the declared
+            # size, then the session cookie and the caller's workspace role.
+            # An unauthenticated or unauthorized caller is refused without
+            # its body ever being read. The full checks below still run
+            # unchanged after the body, in their original order.
+            _, err_status, err_msg = self._check_content_length(JOB_SUBMIT_MAX_BODY_BYTES)
+            if err_status:
+                self._send_json(err_status, {"ok": False, "error": err_msg})
+                return
+            if not self._authorize_job_submit_before_body(workspace_id):
                 return
             raw, err_status, err_msg = self._read_body(max_body_bytes=JOB_SUBMIT_MAX_BODY_BYTES)
             if err_status:
@@ -1343,6 +1405,13 @@ def make_handler(
             if not isinstance(source, str) or not source.strip():
                 self._send_json(400, {"ok": False, "error": "source is required"})
                 return
+            # json.loads() turns a "\\ud800"-style escape into an unpaired
+            # surrogate, which has no UTF-8 encoding: refuse it here instead
+            # of letting .encode("utf-8") raise below (which closed the
+            # connection with no response).
+            if not _is_utf8_encodable(source):
+                self._send_json(400, {"ok": False, "error": "source must be valid Unicode text (unpaired surrogates are not allowed)"})
+                return
             # Cheap, fast rejection only - see MAX_RAW_SOURCE_BYTES's own
             # comment on why the authoritative maxEffectiveLoc/
             # maxSourceFiles check happens inside the worker, not here.
@@ -1351,6 +1420,13 @@ def make_handler(
                 return
             if client_idempotency_key is not None and (not isinstance(client_idempotency_key, str) or not (1 <= len(client_idempotency_key) <= 200)):
                 self._send_json(400, {"ok": False, "error": "idempotency_key must be a string of 1-200 characters"})
+                return
+            if client_idempotency_key is not None and not _is_utf8_encodable(client_idempotency_key):
+                self._send_json(400, {"ok": False, "error": "idempotency_key must be valid Unicode text (unpaired surrogates are not allowed)"})
+                return
+            filename = payload.get("filename")
+            if isinstance(filename, str) and not _is_utf8_encodable(filename):
+                self._send_json(400, {"ok": False, "error": "filename must be valid Unicode text (unpaired surrogates are not allowed)"})
                 return
             conn = connect_fn()
             try:

@@ -100,7 +100,9 @@ provider guarantee.
 from __future__ import annotations
 
 import json
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+
+import backend.context_encoding as context_encoding
 
 SELECTION_VERSION = "1.0"
 
@@ -274,6 +276,246 @@ def _metadata(status: str, budget_bytes: int, estimated_bytes: int, included: Li
     }
 
 
+# ---------------------------------------------------------------------------
+# Exact incremental sizing (pre-15K-B hardening, docs/decisiones.md D-096).
+#
+# The first-fit loop below needs the size of _filtered_artifact(artifact, S)
+# for one candidate set S per ranked file. Measuring that by filtering every
+# record and re-serializing the whole artifact costs O(total records) plus
+# the full priorityRanking per candidate - O(n * N) overall, which made a
+# 2 MiB submission of thousands of tiny files exceed the worker's wall
+# clock. Both context formats are exactly additive over the artifact's
+# top-level keys, and _filtered_artifact() only changes the file-scoped
+# lists, so:
+#     size(S) = size(filtered to no file) + sum over those lists of
+#               (list size for S - 2)                 # 2 = "[]"
+# where each list size comes from the format's own size model
+# (context_encoding.size_model) and per-record byte counts computed once.
+# Nothing is approximated; the final selected set is re-measured with the
+# real measure and any mismatch falls back to the original full-measure
+# path, as does any input the model's preconditions do not cover.
+# ---------------------------------------------------------------------------
+
+_FILE_KEYED_LISTS = (
+    ("contracts", "file"), ("signals", "file"), ("comments", "file"), ("calls", "file"),
+    ("imports", "file"), ("freeFunctions", "file"), ("files", "path"),
+)
+
+
+class _SizerUnsupported(Exception):
+    """The artifact does not meet a size-model precondition - use the
+    full-measure path instead."""
+
+
+def _size_model_for(measure_bytes: Optional[MeasureBytes]) -> Any:
+    """The size model matching `measure_bytes`, or None for a measure this
+    module cannot model (then every size is taken from the measure itself)."""
+    if measure_bytes is None or measure_bytes is _serialized_bytes:
+        return context_encoding.size_model(context_encoding.CONTEXT_FORMAT_V1)
+    context_format = getattr(measure_bytes, "context_format", None)
+    if context_format in context_encoding.SUPPORTED_CONTEXT_FORMATS:
+        return context_encoding.size_model(context_format)
+    return None
+
+
+class _ListModel:
+    """One list of the filtered artifact whose items are included
+    independently (a generic list in the format's model): per-item parts
+    by original index, and whether its size can be taken from running
+    totals alone (order_free) or needs the included items in order."""
+
+    def __init__(self, model: Any, parts: List[Tuple[Tuple[str, ...], int, int]]) -> None:
+        self.parts = parts
+        signatures = {part[0] for part in parts}
+        homogeneous = len(signatures) <= 1 and () not in signatures
+        self.order_free = model.order_free or homogeneous
+        self.header = model.header_bytes(next(iter(signatures))) if (homogeneous and signatures and not model.order_free) else 0
+
+    def size(self, model: Any, state: Tuple[int, int, int, Tuple[int, ...]]) -> int:
+        count, item_bytes, row_bytes, indices = state
+        if self.order_free:
+            return model.homogeneous_list_bytes(count, item_bytes, row_bytes, self.header)
+        return model.list_bytes([self.parts[i] for i in indices])
+
+    def add(self, state: Tuple[int, int, int, Tuple[int, ...]], new: Iterable[int]) -> Tuple[int, int, int, Tuple[int, ...]]:
+        new = sorted(new)
+        if not new:
+            return state
+        count, item_bytes, row_bytes, indices = state
+        count += len(new)
+        item_bytes += sum(self.parts[i][1] for i in new)
+        row_bytes += sum(self.parts[i][2] for i in new)
+        if not self.order_free:
+            indices = tuple(sorted(indices + tuple(new)))
+        return count, item_bytes, row_bytes, indices
+
+
+_EMPTY_LIST_STATE = (0, 0, 0, ())
+
+
+class _ExactSizer:
+    """size(S) of _filtered_artifact(artifact, S) for S within known_files,
+    built once per select_context() call. States are immutable tuples/dicts,
+    so a rejected candidate never touches the committed state."""
+
+    def __init__(self, artifact: Dict[str, Any], known_files: Set[str], model: Any, base_bytes: int) -> None:
+        self.model = model
+        self.base = base_bytes
+        self.lists: Dict[str, _ListModel] = {}
+        self.indices_by_file: Dict[str, Dict[str, List[int]]] = {}
+        self.runs_by_file: Dict[str, Dict[str, Tuple[int, int]]] = {}
+        for key, field in _FILE_KEYED_LISTS:
+            records = [r for r in artifact.get(key) or [] if r.get(field) in known_files]
+            if key in model.file_run_sections:
+                self.runs_by_file[key] = self._file_runs(key, records)
+            else:
+                self._add_file_keyed_list(key, field, records)
+
+        self.graph = False
+        self.keys_by_file: Dict[str, List[Any]] = {}
+        self.edges_by_key: Dict[Any, List[int]] = {}
+        self.proxies_by_key: Dict[Any, List[int]] = {}
+        system_graph = artifact.get("systemGraph") or {}
+        if system_graph.get("status") == "computed":
+            self.graph = True
+            nodes = [n for n in system_graph.get("nodes") or [] if n.get("file") in known_files]
+            self._add_file_keyed_list("systemGraph.nodes", "file", nodes)
+            for node in nodes:
+                self.keys_by_file.setdefault(node["file"], []).append(node["key"])
+            edges = list(system_graph.get("edges") or [])
+            self.edge_ends = [(e.get("from"), e.get("to")) for e in edges]
+            for index, (start, end) in enumerate(self.edge_ends):
+                for key in {start, end}:
+                    self.edges_by_key.setdefault(key, []).append(index)
+            self.lists["systemGraph.edges"] = _ListModel(model, [model.item_parts(e) for e in edges])
+            proxies = list(system_graph.get("proxies") or [])
+            self.proxy_ends = [(p.get("proxy"), p.get("implementation")) for p in proxies]
+            for index, (proxy, implementation) in enumerate(self.proxy_ends):
+                for key in {proxy, implementation} if implementation else {proxy}:
+                    self.proxies_by_key.setdefault(key, []).append(index)
+            self.lists["systemGraph.proxies"] = _ListModel(model, [model.item_parts(p) for p in proxies])
+
+    def _add_file_keyed_list(self, key: str, field: str, records: List[Dict[str, Any]]) -> None:
+        self.lists[key] = _ListModel(self.model, [self.model.item_parts(r) for r in records])
+        by_file: Dict[str, List[int]] = {}
+        for index, record in enumerate(records):
+            by_file.setdefault(record[field], []).append(index)
+        self.indices_by_file[key] = by_file
+
+    def _file_runs(self, key: str, records: List[Dict[str, Any]]) -> Dict[str, Tuple[int, int]]:
+        # Runs of different files never merge, and a file's own runs are
+        # the same in any subset, only if each file's records are contiguous.
+        blocks: Dict[str, List[Dict[str, Any]]] = {}
+        previous = None
+        for record in records:
+            path = record["file"]
+            if path != previous and path in blocks:
+                raise _SizerUnsupported("%s records of %s are not contiguous" % (key, path))
+            blocks.setdefault(path, []).append(record)
+            previous = path
+        return {path: self.model.file_run_parts(path, block) for path, block in blocks.items()}
+
+    def empty_state(self) -> Dict[str, Any]:
+        state: Dict[str, Any] = {key: _EMPTY_LIST_STATE for key in self.lists}
+        state.update({key: (0, 0) for key in self.runs_by_file})
+        state["keyCounts"] = {}
+        return state
+
+    def size(self, state: Dict[str, Any]) -> int:
+        total = self.base
+        for key, list_model in self.lists.items():
+            total += list_model.size(self.model, state[key]) - 2
+        for key in self.runs_by_file:
+            total += self.model.run_section_bytes(*state[key]) - 2
+        return total
+
+    def add_files(self, state: Dict[str, Any], files: Iterable[str]) -> Dict[str, Any]:
+        """A NEW state with `files` (none of them already in `state`) added."""
+        files = list(files)
+        new = dict(state)
+        for key, by_file in self.indices_by_file.items():
+            new[key] = self.lists[key].add(state[key], [i for f in files for i in by_file.get(f, ())])
+        for key, by_file in self.runs_by_file.items():
+            runs, run_bytes = state[key]
+            for path in files:
+                file_runs, file_bytes = by_file.get(path, (0, 0))
+                runs += file_runs
+                run_bytes += file_bytes
+            new[key] = (runs, run_bytes)
+        if self.graph:
+            counts = dict(state["keyCounts"])
+            activated = set()
+            for path in files:
+                for key in self.keys_by_file.get(path, ()):
+                    if not counts.get(key):
+                        activated.add(key)
+                    counts[key] = counts.get(key, 0) + 1
+            new["keyCounts"] = counts
+            edges = {i for key in activated for i in self.edges_by_key.get(key, ())
+                     if counts.get(self.edge_ends[i][0]) and counts.get(self.edge_ends[i][1])}
+            new["systemGraph.edges"] = self.lists["systemGraph.edges"].add(state["systemGraph.edges"], edges)
+            proxies = {i for key in activated for i in self.proxies_by_key.get(key, ())
+                       if counts.get(self.proxy_ends[i][0]) and (not self.proxy_ends[i][1] or counts.get(self.proxy_ends[i][1]))}
+            new["systemGraph.proxies"] = self.lists["systemGraph.proxies"].add(state["systemGraph.proxies"], proxies)
+        return new
+
+
+def _build_exact_sizer(artifact: Dict[str, Any], known_files: Set[str], measure: MeasureBytes, measure_bytes: Optional[MeasureBytes]) -> Optional[_ExactSizer]:
+    """None when the measure has no size model or the artifact does not
+    meet a model precondition (non-contiguous file runs, unexpected record
+    shapes): the caller then measures every candidate directly, exactly as
+    before this optimization."""
+    model = _size_model_for(measure_bytes)
+    if model is None:
+        return None
+    try:
+        return _ExactSizer(artifact, known_files, model, measure(_filtered_artifact(artifact, set())))
+    except (_SizerUnsupported, AttributeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def _first_fit(
+    priority_ranking: List[Dict[str, Any]],
+    dependencies: Dict[str, Set[str]],
+    all_files_set: Set[str],
+    effective_budget: int,
+    bare_size: Callable[[Set[str]], int],
+    sizer: Optional[_ExactSizer],
+) -> Tuple[Set[str], List[Dict[str, str]], Optional[int]]:
+    """The first-fit loop described in the module docstring. Sizes come
+    from `sizer` when given (exact, incremental) or from bare_size() (the
+    real measure of the filtered artifact); the decisions are identical
+    either way. Returns (selected, excluded, size of the selected set as
+    computed by the sizer, or None without one)."""
+    selected: Set[str] = set()
+    excluded: List[Dict[str, str]] = []
+    state = sizer.empty_state() if sizer is not None else None
+    empty = sizer.empty_state() if sizer is not None else None
+    for entry in priority_ranking:
+        file = entry["file"]
+        if file in selected:
+            continue
+        solo_size = sizer.size(sizer.add_files(empty, [file])) if sizer is not None else bare_size({file})
+        if solo_size > effective_budget:
+            excluded.append({"file": file, "reason": _FILE_EXCEEDS_BUDGET_ALONE})
+            continue
+        closure_files = set(_closure(file, dependencies, all_files_set)) - selected
+        if not closure_files:
+            continue  # already fully covered by an earlier candidate's closure.
+        if sizer is not None:
+            trial_state = sizer.add_files(state, sorted(closure_files))
+            trial_size = sizer.size(trial_state)
+        else:
+            trial_size = bare_size(selected | closure_files)
+        if trial_size <= effective_budget:
+            selected = selected | closure_files
+            if sizer is not None:
+                state = trial_state
+        else:
+            excluded.append({"file": file, "reason": _CLOSURE_EXCEEDS_BUDGET})
+    return selected, excluded, (sizer.size(state) if sizer is not None else None)
+
+
 def select_context(
     artifact: Dict[str, Any],
     budget_bytes: int = APPLICATION_CONTEXT_BUDGET_BYTES,
@@ -331,25 +573,13 @@ def select_context(
         metadata["estimatedContextBytes"] = _exact_total_bytes(result, metadata, measure)
         return result, metadata
 
-    selected: Set[str] = set()
-    excluded: List[Dict[str, str]] = []
-    for entry in priority_ranking:
-        file = entry["file"]
-        if file in selected:
-            continue
-        solo_size = _bare_size({file})
-        if solo_size > effective_budget:
-            excluded.append({"file": file, "reason": _FILE_EXCEEDS_BUDGET_ALONE})
-            continue
-        closure_files = set(_closure(file, dependencies, all_files_set)) - selected
-        if not closure_files:
-            continue  # already fully covered by an earlier candidate's closure.
-        trial = selected | closure_files
-        trial_size = _bare_size(trial)
-        if trial_size <= effective_budget:
-            selected = trial
-        else:
-            excluded.append({"file": file, "reason": _CLOSURE_EXCEEDS_BUDGET})
+    sizer = _build_exact_sizer(artifact, all_files_set, measure, measure_bytes)
+    selected, excluded, final_size = _first_fit(priority_ranking, dependencies, all_files_set, effective_budget, _bare_size, sizer)
+    if sizer is not None and selected and final_size != _bare_size(selected):
+        # Defensive: the size model disagreed with the real measure, so no
+        # decision it made is trusted - redo the selection measuring every
+        # candidate directly (the original path).
+        selected, excluded, _ = _first_fit(priority_ranking, dependencies, all_files_set, effective_budget, _bare_size, None)
 
     excluded.sort(key=lambda e: e["file"])
     if not selected:

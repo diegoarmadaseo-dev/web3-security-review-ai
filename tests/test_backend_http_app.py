@@ -993,19 +993,9 @@ class JobSubmitAuthorizationTests(_WorkspaceStorageTestCase):
         self.assertEqual(status, 403)
 
 
-class JobSubmitBodySizeTests(_WorkspaceStorageTestCase):
-    """The route-specific body-size fix: _read_body() now takes an optional
-    max_body_bytes (default MAX_BODY_BYTES, 64 KiB), and _handle_job_submit()
-    is the only caller passing the larger JOB_SUBMIT_MAX_BODY_BYTES so its
-    body can actually reach the MAX_RAW_SOURCE_BYTES check instead of being
-    rejected by the generic gate first (the bug this fix corrects - every
-    case here failed differently, or not at all, before it).
-
-    Every 413 case asserts the exact "error" message, not just the status
-    code: "request body too large" is the generic _read_body() gate,
-    "source exceeds the maximum submission size" is the source-specific
-    MAX_RAW_SOURCE_BYTES gate below it - the two layers this fix makes both
-    reachable and observably distinguishable."""
+class _JobSubmitRequestTestCase(_WorkspaceStorageTestCase):
+    """Request helpers shared by the job-submission size/auth/Unicode test
+    classes below (helpers only - no tests, so nothing runs twice)."""
 
     def _workspace_with_pro_plan(self, email):
         cookie = self.request_and_confirm_login(email)
@@ -1047,6 +1037,43 @@ class JobSubmitBodySizeTests(_WorkspaceStorageTestCase):
         conn.close()
         return resp.status, data
 
+    def _post_headers_then_bytes(self, path, headers, payload):
+        conn = self._conn()
+        hdrs = {"Content-Type": "application/json", "Host": self.host_header, "Origin": self.same_origin}
+        hdrs.update(headers)
+        conn.putrequest("POST", path, skip_host=True, skip_accept_encoding=True)
+        for key, value in hdrs.items():
+            conn.putheader(key, value)
+        conn.endheaders()
+        if payload:
+            conn.send(payload)
+        resp = conn.getresponse()
+        data = resp.read()
+        conn.close()
+        return resp.status, data
+
+    def _jobs_count(self):
+        conn = repo.connect(self.db_path)
+        try:
+            return conn.execute("SELECT COUNT(*) FROM analysis_jobs").fetchone()[0], conn.execute("SELECT COUNT(*) FROM contracts").fetchone()[0]
+        finally:
+            conn.close()
+
+
+class JobSubmitBodySizeTests(_JobSubmitRequestTestCase):
+    """The route-specific body-size fix: _read_body() now takes an optional
+    max_body_bytes (default MAX_BODY_BYTES, 64 KiB), and _handle_job_submit()
+    is the only caller passing the larger JOB_SUBMIT_MAX_BODY_BYTES so its
+    body can actually reach the MAX_RAW_SOURCE_BYTES check instead of being
+    rejected by the generic gate first (the bug this fix corrects - every
+    case here failed differently, or not at all, before it).
+
+    Every 413 case asserts the exact "error" message, not just the status
+    code: "request body too large" is the generic _read_body() gate,
+    "source exceeds the maximum submission size" is the source-specific
+    MAX_RAW_SOURCE_BYTES gate below it - the two layers this fix makes both
+    reachable and observably distinguishable."""
+
     def test_sibling_generic_endpoint_still_rejects_over_64kib(self):
         # /workspaces (_handle_workspace_create) never passes max_body_bytes
         # - proves the fix is route-specific, not a global loosening, on a
@@ -1057,10 +1084,9 @@ class JobSubmitBodySizeTests(_WorkspaceStorageTestCase):
         self.assertEqual(json.loads(data)["error"], "request body too large")
 
     def test_job_submit_body_just_under_job_budget_clears_the_body_gate(self):
-        # Deliberately unauthenticated: both size checks in
-        # _handle_job_submit() run BEFORE the auth check (verified by
-        # reading the function top to bottom), so a clean 401 here proves
-        # the request cleared BOTH size gates and reached the auth layer.
+        # Authenticated (pre-15K-B hardening, D-096: the session is checked
+        # before the body is read, so an unauthenticated caller never gets
+        # this far): a 200 proves the request cleared BOTH size gates.
         #
         # An unrelated, ignored field (not "source" itself) supplies the
         # padding - _handle_job_submit() only ever reads payload["mode"],
@@ -1080,9 +1106,10 @@ class JobSubmitBodySizeTests(_WorkspaceStorageTestCase):
         envelope["note"] = "x" * padding_len
         body = json.dumps(envelope).encode("utf-8")
         self.assertLess(len(body), http_app.JOB_SUBMIT_MAX_BODY_BYTES)
-        status, data = self._raw_post("/workspaces/does-not-matter/jobs", body)
-        self.assertEqual(status, 401)
-        self.assertEqual(json.loads(data)["error"], "authentication required")
+        cookie, workspace_id = self._workspace_with_pro_plan("body-gate@example.com")
+        status, data = self._raw_post("/workspaces/%s/jobs" % workspace_id, body, headers={"Cookie": cookie})
+        self.assertEqual(status, 200, data)
+        self.assertTrue(json.loads(data)["ok"])
 
     def test_job_submit_oversized_source_rejected_by_source_specific_check(self):
         source = "x" * (http_app.MAX_RAW_SOURCE_BYTES + 1)
@@ -1090,7 +1117,8 @@ class JobSubmitBodySizeTests(_WorkspaceStorageTestCase):
         # Confirms the body itself clears the generic gate, so the 413
         # below can only be coming from the source-specific check.
         self.assertLessEqual(len(body), http_app.JOB_SUBMIT_MAX_BODY_BYTES)
-        status, data = self._raw_post("/workspaces/does-not-matter/jobs", body)
+        cookie, workspace_id = self._workspace_with_pro_plan("oversized-source@example.com")
+        status, data = self._raw_post("/workspaces/%s/jobs" % workspace_id, body, headers={"Cookie": cookie})
         self.assertEqual(status, 413)
         self.assertEqual(json.loads(data)["error"], "source exceeds the maximum submission size")
 
@@ -1175,13 +1203,11 @@ def _representative_15k_source(target_bytes=1_360_000):
     return "".join(parts)
 
 
-class JobSubmitRawSourceLimitTests(JobSubmitBodySizeTests):
+class JobSubmitRawSourceLimitTests(_JobSubmitRequestTestCase):
     """Phase 15K-A (docs/decisiones.md D-096): MAX_RAW_SOURCE_BYTES is 2 MiB
     (was 512 KiB), JOB_SUBMIT_MAX_BODY_BYTES still derives from it by the
     same proven formula, the size is always counted in UTF-8 bytes, and the
-    body can only be sized by a valid Content-Length. Inherits the body-size
-    helpers (and, harmlessly, re-runs that class's tests against the new
-    limit)."""
+    body can only be sized by a valid Content-Length."""
 
     def test_limits_are_two_mib_and_the_body_bound_still_derives_from_them(self):
         self.assertEqual(http_app.MAX_RAW_SOURCE_BYTES, 2 * 1024 * 1024)
@@ -1197,7 +1223,8 @@ class JobSubmitRawSourceLimitTests(JobSubmitBodySizeTests):
 
     def test_source_one_byte_over_the_limit_is_rejected(self):
         source = "x" * (http_app.MAX_RAW_SOURCE_BYTES + 1)
-        status, data = self._raw_post("/workspaces/does-not-matter/jobs", json.dumps({"mode": "pro", "source": source}).encode("utf-8"))
+        cookie, workspace_id = self._workspace_with_pro_plan("raw-limit-over@example.com")
+        status, data = self._raw_post("/workspaces/%s/jobs" % workspace_id, json.dumps({"mode": "pro", "source": source}).encode("utf-8"), headers={"Cookie": cookie})
         self.assertEqual(status, 413)
         self.assertEqual(json.loads(data)["error"], "source exceeds the maximum submission size")
 
@@ -1218,7 +1245,8 @@ class JobSubmitRawSourceLimitTests(JobSubmitBodySizeTests):
         self.assertGreater(len(source.encode("utf-8")), http_app.MAX_RAW_SOURCE_BYTES)
         body = json.dumps({"mode": "pro", "source": source}).encode("utf-8")  # \\u20ac-escaped, still within the body bound
         self.assertLessEqual(len(body), http_app.JOB_SUBMIT_MAX_BODY_BYTES)
-        status, data = self._raw_post("/workspaces/does-not-matter/jobs", body)
+        cookie, workspace_id = self._workspace_with_pro_plan("raw-limit-multibyte@example.com")
+        status, data = self._raw_post("/workspaces/%s/jobs" % workspace_id, body, headers={"Cookie": cookie})
         self.assertEqual(status, 413)
         self.assertEqual(json.loads(data)["error"], "source exceeds the maximum submission size")
 
@@ -1228,21 +1256,6 @@ class JobSubmitRawSourceLimitTests(JobSubmitBodySizeTests):
         cookie, workspace_id = self._workspace_with_pro_plan("raw-limit-3@example.com")
         status, _, body = self.post_json("/workspaces/%s/jobs" % workspace_id, {"mode": "pro", "source": source}, headers={"Cookie": cookie})
         self.assertEqual(status, 200, body)
-
-    def _post_headers_then_bytes(self, path, headers, payload):
-        conn = self._conn()
-        hdrs = {"Content-Type": "application/json", "Host": self.host_header, "Origin": self.same_origin}
-        hdrs.update(headers)
-        conn.putrequest("POST", path, skip_host=True, skip_accept_encoding=True)
-        for key, value in hdrs.items():
-            conn.putheader(key, value)
-        conn.endheaders()
-        if payload:
-            conn.send(payload)
-        resp = conn.getresponse()
-        data = resp.read()
-        conn.close()
-        return resp.status, data
 
     def test_chunked_body_without_content_length_is_rejected(self):
         # A chunked body carries no Content-Length: _read_body() refuses it
@@ -1264,9 +1277,104 @@ class JobSubmitRawSourceLimitTests(JobSubmitBodySizeTests):
         # Only the declared number of bytes is ever read: the truncated JSON
         # is rejected; the undeclared remainder is never parsed as source.
         body = json.dumps({"mode": "pro", "source": "x" * (http_app.MAX_RAW_SOURCE_BYTES + 10)}).encode("utf-8")
-        status, data = self._post_headers_then_bytes("/workspaces/does-not-matter/jobs", {"Content-Length": "64"}, body[:4096])
+        cookie, workspace_id = self._workspace_with_pro_plan("raw-limit-understated@example.com")
+        status, data = self._post_headers_then_bytes("/workspaces/%s/jobs" % workspace_id, {"Content-Length": "64", "Cookie": cookie}, body[:4096])
         self.assertEqual(status, 400)
         self.assertEqual(json.loads(data)["error"], "request body is not valid UTF-8 JSON")
+
+
+class JobSubmitAuthBeforeBodyTests(_JobSubmitRequestTestCase):
+    """Pre-15K-B hardening (docs/decisiones.md D-096): _handle_job_submit()
+    validates the declared Content-Length, the session cookie and the
+    workspace role from the headers BEFORE reading the body, so an
+    unauthenticated or unauthorized caller can no longer make the server
+    read up to JOB_SUBMIT_MAX_BODY_BYTES. The "headers only" requests below
+    declare a large body but never send it: if the server tried to read it,
+    the client's 5-second socket timeout would fail the test."""
+
+    def test_unauthenticated_large_body_is_refused_without_reading_it(self):
+        status, data = self._post_declared_length("/workspaces/does-not-matter/jobs", http_app.JOB_SUBMIT_MAX_BODY_BYTES)
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(data)["error"], "authentication required")
+
+    def test_unauthenticated_request_gets_401_before_any_body_validation(self):
+        status, data = self._raw_post("/workspaces/does-not-matter/jobs", b"this is not json")
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(data)["error"], "authentication required")
+
+    def test_invalid_session_cookie_is_refused_without_reading_the_body(self):
+        status, data = self._post_declared_length("/workspaces/does-not-matter/jobs", 1024 * 1024, headers={"Cookie": "session=not-a-real-session"})
+        self.assertEqual(status, 401)
+
+    def test_authenticated_non_member_is_refused_without_reading_the_body(self):
+        owner_cookie, workspace_id = self._workspace_with_pro_plan("auth-owner@example.com")
+        outsider_cookie = self.request_and_confirm_login("auth-outsider@example.com")
+        status, data = self._post_declared_length("/workspaces/%s/jobs" % workspace_id, 1024 * 1024, headers={"Cookie": outsider_cookie})
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(data)["error"], "forbidden")
+        self.assertEqual(self._jobs_count(), (0, 0))
+
+    def test_header_checks_still_come_first_for_unauthenticated_callers(self):
+        # Content-Length problems are decided from the header alone, before
+        # the session lookup - same statuses and messages as before.
+        status, data = self._post_declared_length("/workspaces/does-not-matter/jobs", http_app.JOB_SUBMIT_MAX_BODY_BYTES + 1)
+        self.assertEqual((status, json.loads(data)["error"]), (413, "request body too large"))
+        status, data = self._post_headers_then_bytes("/workspaces/does-not-matter/jobs", {"Content-Length": "abc"}, b"")
+        self.assertEqual((status, json.loads(data)["error"]), (400, "a valid Content-Length header is required"))
+        status, data = self._post_headers_then_bytes("/workspaces/does-not-matter/jobs", {"Transfer-Encoding": "chunked"}, b"0\r\n\r\n")
+        self.assertEqual((status, json.loads(data)["error"]), (400, "a valid Content-Length header is required"))
+
+    def test_authenticated_valid_submission_still_creates_exactly_one_job(self):
+        cookie, workspace_id = self._workspace_with_pro_plan("auth-valid@example.com")
+        status, _, body = self.post_json("/workspaces/%s/jobs" % workspace_id, {"mode": "pro", "source": "contract A {}"}, headers={"Cookie": cookie})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["status"], "queued")
+        self.assertEqual(self._jobs_count(), (1, 1))
+
+    def test_authenticated_invalid_body_keeps_its_400_semantics(self):
+        cookie, workspace_id = self._workspace_with_pro_plan("auth-invalid@example.com")
+        status, data = self._raw_post("/workspaces/%s/jobs" % workspace_id, b"this is not json", headers={"Cookie": cookie})
+        self.assertEqual((status, json.loads(data)["error"]), (400, "request body is not valid UTF-8 JSON"))
+        status, _, body = self.post_json("/workspaces/%s/jobs" % workspace_id, {"mode": "bogus", "source": "x"}, headers={"Cookie": cookie})
+        self.assertEqual((status, json.loads(body)["error"]), (400, "mode must be one of quick/standard/pro"))
+        self.assertEqual(self._jobs_count(), (0, 0))
+
+
+class JobSubmitUnpairedSurrogateTests(_JobSubmitRequestTestCase):
+    """Pre-15K-B hardening (D-096): json.loads() accepts escapes such as
+    \\ud800 and yields an unpaired surrogate that has no UTF-8 encoding.
+    _handle_job_submit() used to crash on source.encode("utf-8") and close
+    the connection with no response; it now answers a controlled 400 and
+    creates nothing. Bodies are sent as raw bytes so the escapes reach the
+    server exactly as written."""
+
+    def _post_raw_json_text(self, workspace_id, cookie, text):
+        return self._raw_post("/workspaces/%s/jobs" % workspace_id, text.encode("ascii"), headers={"Cookie": cookie})
+
+    def test_unpaired_surrogates_in_source_get_a_controlled_400_and_no_job(self):
+        cookie, workspace_id = self._workspace_with_pro_plan("surrogate-source@example.com")
+        for escaped in ("\\ud800", "\\udc00", "\\udc00\\ud800", "contract A {} // ok \\ud83d", "\\ud800\\ud800"):
+            with self.subTest(source=escaped):
+                status, data = self._post_raw_json_text(workspace_id, cookie, '{"mode": "pro", "source": "%s"}' % escaped)
+                self.assertEqual(status, 400)
+                self.assertEqual(json.loads(data)["error"], "source must be valid Unicode text (unpaired surrogates are not allowed)")
+        self.assertEqual(self._jobs_count(), (0, 0))
+
+    def test_unpaired_surrogates_in_idempotency_key_and_filename_get_a_controlled_400(self):
+        cookie, workspace_id = self._workspace_with_pro_plan("surrogate-fields@example.com")
+        status, data = self._post_raw_json_text(workspace_id, cookie, '{"mode": "pro", "source": "contract A {}", "idempotency_key": "k\\ud800"}')
+        self.assertEqual((status, json.loads(data)["error"]), (400, "idempotency_key must be valid Unicode text (unpaired surrogates are not allowed)"))
+        status, data = self._post_raw_json_text(workspace_id, cookie, '{"mode": "pro", "source": "contract A {}", "filename": "A\\udfff.sol"}')
+        self.assertEqual((status, json.loads(data)["error"]), (400, "filename must be valid Unicode text (unpaired surrogates are not allowed)"))
+        self.assertEqual(self._jobs_count(), (0, 0))
+
+    def test_a_valid_escaped_surrogate_pair_is_still_accepted(self):
+        # "\\ud83d\\ude80" is one valid character (U+1F680) - valid Unicode
+        # handling is unchanged.
+        cookie, workspace_id = self._workspace_with_pro_plan("surrogate-pair@example.com")
+        status, data = self._post_raw_json_text(workspace_id, cookie, '{"mode": "pro", "source": "contract A {} // \\ud83d\\ude80 \\u00e9"}')
+        self.assertEqual(status, 200, data)
+        self.assertEqual(self._jobs_count(), (1, 1))
 
 
 class JobReadTests(_WorkspaceStorageTestCase):
