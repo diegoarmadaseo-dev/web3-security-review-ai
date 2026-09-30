@@ -92,6 +92,14 @@ DEFAULT_PIDS_LIMIT = "128"
 DEFAULT_TMPFS_SIZE = "64m"
 DEFAULT_WALL_CLOCK_TIMEOUT_SECONDS = 300
 DEFAULT_OUTPUT_SIZE_LIMIT_BYTES = 2 * 1024 * 1024  # 2 MiB - a rendered report is text, never expected to approach this.
+# Phase 15K-B (docs/decisiones.md D-097): the container's Step 6 gets the
+# wall clock minus this reserve as its own deadline (STEP6_DEADLINE_SECONDS),
+# so its attempts, passes and final pipeline always end before this
+# supervisor kills the container. Covers everything outside Step 6:
+# container start (measured 0.3-0.6 s), the stdin envelope, interpreter and
+# SDK imports, and writing the result line.
+WORKER_STEP6_STARTUP_RESERVE_SECONDS = 15
+DEFAULT_MAX_PASSES = 1  # multi-pass is opt-in (LLM_MAX_PASSES)
 
 _SCRATCH_DIR = "/scratch"
 _SOURCE_PATH = _SCRATCH_DIR + "/contract.sol"
@@ -128,6 +136,7 @@ class WorkerConfig:
         output_size_limit_bytes: int = DEFAULT_OUTPUT_SIZE_LIMIT_BYTES,
         max_output_tokens: int = 8000,
         per_attempt_timeout_seconds: int = 120,
+        max_passes: int = DEFAULT_MAX_PASSES,
     ) -> None:
         if not docker_image:
             raise WorkerSupervisorError("docker_image is required")
@@ -147,6 +156,13 @@ class WorkerConfig:
         self.output_size_limit_bytes = output_size_limit_bytes
         self.max_output_tokens = max_output_tokens
         self.per_attempt_timeout_seconds = per_attempt_timeout_seconds
+        self.max_passes = max_passes
+
+    @property
+    def step6_deadline_seconds(self) -> int:
+        """The container's own Step 6 deadline - see
+        WORKER_STEP6_STARTUP_RESERVE_SECONDS."""
+        return max(1, self.wall_clock_timeout_seconds - WORKER_STEP6_STARTUP_RESERVE_SECONDS)
 
 
 def build_docker_create_args(config: WorkerConfig, container_name: str) -> List[str]:
@@ -179,6 +195,8 @@ def build_docker_create_args(config: WorkerConfig, container_name: str) -> List[
         "-e", "LLM_PROVIDER=%s" % config.llm_provider,
         "-e", "LLM_MAX_OUTPUT_TOKENS=%d" % config.max_output_tokens,
         "-e", "LLM_PER_ATTEMPT_TIMEOUT_SECONDS=%d" % config.per_attempt_timeout_seconds,
+        "-e", "LLM_MAX_PASSES=%d" % config.max_passes,
+        "-e", "STEP6_DEADLINE_SECONDS=%d" % config.step6_deadline_seconds,
         config.docker_image,
     ]
 

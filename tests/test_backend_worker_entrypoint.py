@@ -98,6 +98,80 @@ class SelectProviderTests(unittest.TestCase):
         self.assertEqual(str(ctx.exception), "api_key is required")
 
 
+class Step6RunConfigTests(unittest.TestCase):
+    """Audit finding F1 (phase 15K-B, docs/decisiones.md D-097):
+    _step6_run_config() is the one place the worker decides max_passes,
+    the Step 6 deadline and the provider's SDK retries. Multi-pass with a
+    deadline -> sdk_max_retries 0 (retries are the application's);
+    single-pass -> None (the SDK's historical default, unchanged)."""
+
+    def test_multi_pass_with_deadline_disables_sdk_retries(self):
+        config = worker_entrypoint._step6_run_config({"LLM_MAX_PASSES": "4", "STEP6_DEADLINE_SECONDS": "285"}, llm_client)
+        self.assertEqual(config, (4, 285, 0))
+
+    def test_single_pass_keeps_historical_sdk_retries_and_no_deadline(self):
+        for env in ({}, {"LLM_MAX_PASSES": "1"}, {"LLM_MAX_PASSES": "1", "STEP6_DEADLINE_SECONDS": "285"}):
+            with self.subTest(env=env):
+                self.assertEqual(worker_entrypoint._step6_run_config(env, llm_client), (1, None, None))
+
+    def test_multi_pass_without_a_deadline_keeps_sdk_default(self):
+        # No deadline -> nothing for a hidden SDK retry to overrun.
+        self.assertEqual(worker_entrypoint._step6_run_config({"LLM_MAX_PASSES": "4"}, llm_client), (4, None, None))
+
+    def test_select_provider_forwards_sdk_max_retries_only_when_set(self):
+        fake_module = mock.MagicMock()
+        fake_module.LLMError = llm_client.LLMError
+        worker_entrypoint._select_provider(fake_module, "anthropic", "k", "m", sdk_max_retries=0)
+        worker_entrypoint._select_provider(fake_module, "deepseek", "k", "m", sdk_max_retries=0)
+        fake_module.AnthropicLLMProvider.assert_called_once_with(api_key="k", model="m", sdk_max_retries=0)
+        fake_module.DeepSeekLLMProvider.assert_called_once_with(api_key="k", model="m", sdk_max_retries=0)
+        fake_module = mock.MagicMock()
+        worker_entrypoint._select_provider(fake_module, "deepseek", "k", "m", sdk_max_retries=None)
+        fake_module.DeepSeekLLMProvider.assert_called_once_with(api_key="k", model="m")
+
+    def _run_main(self, env):
+        import io
+        import json
+        import tempfile
+        captured = {}
+
+        inner = mock.MagicMock()
+
+        def fake_select(module, provider_name, api_key, model, sdk_max_retries=None):
+            captured["sdk_max_retries"] = sdk_max_retries
+            return inner
+
+        def fake_run(paths, mode, provider, *args, **kwargs):
+            # Hard total per-call deadline only under the Step 6 deadline.
+            captured["isolated"] = isinstance(provider, llm_client.IsolatedCallProvider)
+            captured["same_inner"] = provider is inner or getattr(provider, "_provider", None) is inner
+            captured["max_passes"] = kwargs["max_passes"]
+            captured["deadline_seconds"] = kwargs["deadline_seconds"]
+            return {"rendered": "r", "renderFormat": "markdown", "scoredReport": {}}
+
+        envelope = json.dumps({"mode": "quick", "source": "contract C {}", "llm_api_key": "fake-key"}).encode("utf-8")
+        stdin = mock.MagicMock()
+        stdin.buffer = io.BytesIO(envelope)
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(worker_entrypoint, "SOURCE_PATH", os.path.join(tmp, "contract.sol")), \
+                mock.patch.object(worker_entrypoint, "REPO_ROOT", str(REPO_ROOT)), \
+                mock.patch.object(worker_entrypoint, "SKILL_SCRIPTS_DIR", str(REPO_ROOT / ".claude" / "skills" / "web3-auditor" / "scripts")), \
+                mock.patch.object(worker_entrypoint, "_select_provider", fake_select), \
+                mock.patch.object(llm_client, "run_step6_with_retries", fake_run), \
+                mock.patch.object(sys, "stdin", stdin), \
+                mock.patch.object(sys, "stdout", io.StringIO()):
+            self.assertEqual(worker_entrypoint.main(), 0)
+        return captured
+
+    def test_main_builds_the_provider_to_match_the_run_it_starts(self):
+        base = {"LLM_PROVIDER": "deepseek", "LLM_MODEL": "m"}
+        multi = self._run_main(dict(base, LLM_MAX_PASSES="4", STEP6_DEADLINE_SECONDS="285"))
+        self.assertEqual(multi, {"sdk_max_retries": 0, "isolated": True, "same_inner": True, "max_passes": 4, "deadline_seconds": 285})
+        single = self._run_main(dict(base, LLM_MAX_PASSES="1", STEP6_DEADLINE_SECONDS="285"))
+        self.assertEqual(single, {"sdk_max_retries": None, "isolated": False, "same_inner": True, "max_passes": 1, "deadline_seconds": None})
+
+
 class WorkerConfigProviderFieldTests(unittest.TestCase):
     """backend.worker_supervisor.WorkerConfig/build_docker_create_args -
     the host-side half of getting LLM_PROVIDER into the container's own
@@ -146,7 +220,9 @@ class WorkerConfigProviderFieldTests(unittest.TestCase):
         env_flags = {args[i + 1].split("=", 1)[0] for i, a in enumerate(args) if a == "-e"}
         self.assertEqual(
             env_flags,
-            {"HTTPS_PROXY", "SOURCE_PATH", "LLM_MODEL", "LLM_PROVIDER", "LLM_MAX_OUTPUT_TOKENS", "LLM_PER_ATTEMPT_TIMEOUT_SECONDS"},
+            {"HTTPS_PROXY", "SOURCE_PATH", "LLM_MODEL", "LLM_PROVIDER", "LLM_MAX_OUTPUT_TOKENS", "LLM_PER_ATTEMPT_TIMEOUT_SECONDS",
+             # Phase 15K-B (D-097): multi-pass setting and the Step 6 deadline.
+             "LLM_MAX_PASSES", "STEP6_DEADLINE_SECONDS"},
         )
 
     def test_llm_api_key_never_appears_in_docker_create_args(self):

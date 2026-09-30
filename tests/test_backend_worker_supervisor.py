@@ -89,6 +89,108 @@ def _container_exists(name: str) -> bool:
     return subprocess.run(["docker", "inspect", name], capture_output=True).returncode == 0
 
 
+# Runs INSIDE the worker image, under the exact production isolation flags
+# (build_docker_create_args with only the entrypoint swapped): the trickle
+# server of tests/test_backend_provider_call_deadline.py on the container's
+# loopback, and both real SDK providers built as the worker builds them
+# under a Step 6 deadline (sdk_max_retries 0 + provider_for_step6()).
+_HARD_DEADLINE_PROBE = r'''
+import json, os, select, subprocess, sys, time
+from unittest import mock
+sys.path.insert(0, "/app")
+import backend.llm_client as lc
+SERVER = %r
+os.environ["NO_PROXY"] = "127.0.0.1,localhost"
+server = subprocess.Popen([sys.executable, "-c", SERVER, "8", "0.5"], stdout=subprocess.PIPE)
+fd = server.stdout.fileno(); pending = [b""]
+def event(timeout):
+    end = time.monotonic() + timeout
+    while b"\n" not in pending[0]:
+        ready, _, _ = select.select([fd], [], [], max(0.0, end - time.monotonic()))
+        if not ready:
+            return None
+        pending[0] += os.read(fd, 65536)
+    line, pending[0] = pending[0].split(b"\n", 1)
+    return json.loads(line)
+base = "http://127.0.0.1:%%d" %% event(10)["port"]
+def conns():
+    out = {}
+    while True:
+        e = event(1.0)
+        if e is None:
+            return [out[k] for k in sorted(out)]
+        if e["event"] == "open":
+            out[e["id"]] = {"open": e["t"]}
+        elif e["event"] == "close":
+            out[e["id"]].update(close=e["t"], reason=e["reason"])
+report = {}
+with mock.patch.object(lc, "_DEEPSEEK_BASE_URL", base):
+    deepseek = lc.DeepSeekLLMProvider(api_key="fake-not-a-key", model="m", sdk_max_retries=lc.sdk_max_retries_for(285))
+os.environ["ANTHROPIC_BASE_URL"] = base
+anthropic_p = lc.AnthropicLLMProvider(api_key="fake-not-a-key", model="m", sdk_max_retries=lc.sdk_max_retries_for(285))
+for name, inner in (("deepseek", deepseek), ("anthropic", anthropic_p)):
+    wrapped = lc.provider_for_step6(inner, 285)
+    start = time.monotonic()
+    try:
+        wrapped.complete("p", 1, 3); outcome = "returned"
+    except lc.ProviderError as exc:
+        outcome = str(exc)
+    elapsed = time.monotonic() - start
+    pid = wrapped.last_child_pid
+    try:
+        os.waitpid(pid, os.WNOHANG); reaped = False
+    except ChildProcessError:
+        reaped = True
+    c = conns()
+    report[name] = {"sdk_max_retries": inner._client.max_retries, "elapsed": round(elapsed, 2), "outcome": outcome,
+                    "reaped": reaped and not os.path.exists("/proc/%%d" %% pid), "connections": len(c),
+                    "reasons": [x.get("reason") for x in c], "closed_after": [round(x["close"] - start, 2) for x in c if "close" in x]}
+start = time.monotonic()
+try:
+    deepseek.complete("p", 1, 3); outcome = "returned"
+except lc.ProviderError as exc:
+    outcome = str(exc)
+report["deepseek_without_isolation"] = {"elapsed": round(time.monotonic() - start, 2), "outcome": outcome, "reasons": [x.get("reason") for x in conns()]}
+server.kill(); server.wait()
+print(json.dumps(report))
+'''
+
+
+class WorkerImageHardCallDeadlineTests(unittest.TestCase):
+    def test_hard_total_call_deadline_inside_the_isolated_worker_container(self):
+        from tests.test_backend_provider_call_deadline import TRICKLE_SERVER
+        name = "worker-hard-deadline-%d" % os.getpid()
+        args = ws.build_docker_create_args(_config(wall_clock_timeout_seconds=120, max_passes=6), name)
+        for flag in ("--read-only", "--cap-drop", "no-new-privileges", "--memory", "--cpus", "--pids-limit", "--tmpfs"):
+            self.assertIn(flag, args)
+        self.assertFalse(any(a in ("-v", "--volume", "--mount", "--privileged") for a in args))
+        self.assertNotIn("docker.sock", " ".join(args))
+        self.assertIn("HTTPS_PROXY=http://127.0.0.1:1", args)
+        image = args.index(IMAGE_TAG)
+        args = args[:image] + ["--entrypoint", "python"] + args[image:] + ["-c", _HARD_DEADLINE_PROBE % TRICKLE_SERVER]
+        self.assertEqual(subprocess.run(args, capture_output=True, timeout=30).returncode, 0)
+        try:
+            run = subprocess.run(["docker", "start", "-a", name], capture_output=True, timeout=120)
+        finally:
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+        self.assertEqual(run.returncode, 0, run.stderr.decode(errors="replace")[-2000:])
+        report = json.loads(run.stdout.decode().strip().splitlines()[-1])
+        for provider in ("deepseek", "anthropic"):
+            with self.subTest(provider=provider):
+                r = report[provider]
+                self.assertEqual(r["sdk_max_retries"], 0)
+                self.assertIn("exceeded its total time limit of 3 s", r["outcome"])
+                self.assertGreaterEqual(r["elapsed"], 3.0)
+                self.assertLess(r["elapsed"], 3.5)
+                self.assertTrue(r["reaped"])
+                self.assertEqual(r["connections"], 1)  # no SDK retry
+                self.assertEqual(r["reasons"], ["peer_closed"])  # the request was aborted
+                self.assertLess(r["closed_after"][0], 3.6)
+        # The bug itself, same container: without isolation a 3 s SDK timeout lasts the whole 8 s trickle.
+        self.assertGreaterEqual(report["deepseek_without_isolation"]["elapsed"], 7.5)
+        self.assertEqual(report["deepseek_without_isolation"]["reasons"], ["finished"])
+
+
 class WorkerImageRuntimeDependencyTests(unittest.TestCase):
     """The worker image COPYs individual backend/ files (minimal image), so
     a new local import of backend/llm_client.py that is not also COPYed in
@@ -237,6 +339,25 @@ class RealContainerJobLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(result.get("status"), "succeeded", result)
         self.assertIn("CONTEXT_SELECTION_APPLIED", result.get("rendered", ""))
+
+    def test_multi_pass_job_runs_end_to_end_in_the_container(self):
+        # Phase 15K-B (D-097): with max_passes > 1 the same ~2 MiB pro
+        # submission is partitioned into several passes inside the real
+        # container (every pass answered by the same valid partial draft,
+        # which has no finding and so fits any pass's scope), merged, and
+        # scored/validated/rendered once. LLM_MAX_PASSES and the Step 6
+        # deadline reach the container through its curated env.
+        source = _large_bundle_source(2 * 1024 * 1024 - 1024)
+        draft = _valid_draft("pro")
+        draft["scope"] = {"completeness": "partial", "reasons": [{"code": "LOC_LIMIT_EXCEEDED", "detail": "scoped"}]}
+        draft["categoryCoverage"][0]["status"] = "NOT_ASSESSED"
+        result = ws.run_job_in_container(
+            _config(wall_clock_timeout_seconds=240, max_passes=8), "t-multi-pass", "pro", source,
+            mock_responses=[json.dumps(draft)] * 24,
+        )
+        self.assertEqual(result.get("status"), "succeeded", result)
+        self.assertIn("MULTI_PASS_ANALYSIS", result.get("rendered", ""))
+        self.assertNotIn("CONTEXT_SELECTION_APPLIED", result.get("rendered", ""))
 
     def test_scratch_remains_writable_end_to_end(self):
         # Implicit but real: a successful job requires writing

@@ -433,12 +433,14 @@ def _load_worker_config() -> Dict[str, Any]:
         "output_size_limit_bytes": _positive_int_env("WORKER_OUTPUT_SIZE_LIMIT_BYTES", worker_supervisor.DEFAULT_OUTPUT_SIZE_LIMIT_BYTES),
         "llm_max_output_tokens": _positive_int_env("LLM_MAX_OUTPUT_TOKENS", 8000),
         "llm_per_attempt_timeout_seconds": _positive_int_env("LLM_PER_ATTEMPT_TIMEOUT_SECONDS", 120),
+        "llm_max_passes": _positive_int_env("LLM_MAX_PASSES", worker_supervisor.DEFAULT_MAX_PASSES),
         "retention_days": _optional_positive_int_env("RETENTION_DAYS"),
         "retention_check_interval_seconds": _positive_int_env("RETENTION_CHECK_INTERVAL_SECONDS", 3600),
         "retention_dry_run": _bool_env("RETENTION_DRY_RUN", False),
     }
     cfg.update(_load_alert_config())
     _validate_wall_clock_timeout_under_lease(cfg["wall_clock_timeout_seconds"])
+    _validate_step6_time_budget(cfg["wall_clock_timeout_seconds"], cfg["llm_max_passes"])
     return cfg
 
 
@@ -465,6 +467,33 @@ def _validate_wall_clock_timeout_under_lease(wall_clock_timeout_seconds: int) ->
             "otherwise a worker still legitimately running a job can outlive its own lease, letting a "
             "concurrent reap reclaim the job while this worker is still processing it"
             % (wall_clock_timeout_seconds, repo.LEASE_DURATION_SECONDS)
+        )
+
+
+def _validate_step6_time_budget(wall_clock_timeout_seconds: int, max_passes: int) -> None:
+    """Phase 15K-B (docs/decisiones.md D-097): refuse to start with a
+    multi-pass (LLM_MAX_PASSES > 1) setting the container's Step 6 deadline
+    cannot honour - the
+    wall clock must leave, after the supervisor's startup reserve and the
+    final-pipeline reserve, room for at least one minimal attempt per pass.
+    Deliberately checks only this lower bound: how long a real attempt takes
+    with a given provider is not measured yet (docs/decisiones.md D-095),
+    so the deadline itself - not this check - is what keeps every attempt,
+    pass and the final pipeline inside the wall clock."""
+    import backend.llm_client as llm_client  # stdlib-only module; imported here to keep this host module's top-level imports unchanged
+
+    if not 1 <= max_passes <= llm_client.MAX_STEP6_PASSES:
+        raise ConfigError("LLM_MAX_PASSES (%d) must be between 1 and %d" % (max_passes, llm_client.MAX_STEP6_PASSES))
+    if max_passes == 1:
+        return  # single-pass keeps its historical timeouts (no Step 6 deadline is applied)
+    needed = (worker_supervisor.WORKER_STEP6_STARTUP_RESERVE_SECONDS + llm_client.STEP6_FINAL_PIPELINE_RESERVE_SECONDS
+              + max_passes * llm_client.STEP6_MIN_ATTEMPT_SECONDS)
+    if wall_clock_timeout_seconds < needed:
+        raise ConfigError(
+            "WORKER_WALL_CLOCK_TIMEOUT_SECONDS (%d) is too short for LLM_MAX_PASSES=%d: it must be at least %d seconds "
+            "(%d s container startup reserve + %d s final pipeline reserve + %d pass(es) x %d s minimum attempt)"
+            % (wall_clock_timeout_seconds, max_passes, needed, worker_supervisor.WORKER_STEP6_STARTUP_RESERVE_SECONDS,
+               llm_client.STEP6_FINAL_PIPELINE_RESERVE_SECONDS, max_passes, llm_client.STEP6_MIN_ATTEMPT_SECONDS)
         )
 
 
@@ -609,6 +638,7 @@ def run_worker() -> None:
         output_size_limit_bytes=cfg["output_size_limit_bytes"],
         max_output_tokens=cfg["llm_max_output_tokens"],
         per_attempt_timeout_seconds=cfg["llm_per_attempt_timeout_seconds"],
+        max_passes=cfg["llm_max_passes"],
     )
     sys.stderr.write("backend worker process %r starting (image=%s)\n" % (cfg["worker_id"], config.docker_image))
     if cfg["retention_days"] is not None:

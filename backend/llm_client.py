@@ -66,10 +66,14 @@ from __future__ import annotations
 
 import json
 import os
+import select
+import signal
+import time
 from typing import Any, Callable, Dict, List, Optional, Protocol
 
 import backend.context_encoding as context_encoding
 import backend.context_selection as context_selection
+import backend.multi_pass as multi_pass
 
 try:
     import anthropic
@@ -120,18 +124,54 @@ class MockLLMProvider:
         return next_response
 
 
+# SDK-level retries (phase 15K-B, docs/decisiones.md D-097, audit finding
+# F1). The anthropic and openai SDKs retry a failed/timed-out request
+# internally (their own default: 2 retries, plus backoff) unless the client
+# is built with max_retries - so ONE complete(timeout_seconds=T) call can
+# take about 3T. Both real providers take sdk_max_retries:
+#   * None (the default, single-pass): max_retries is not passed at all, so
+#     the client is built exactly as before and keeps the SDK's own
+#     historical retry behavior.
+#   * an integer: forwarded as the client's max_retries.
+# The only place that decides the value is sdk_max_retries_for() below:
+# with a Step 6 deadline (multi-pass) it returns MULTI_PASS_SDK_MAX_RETRIES
+# (0), because retrying is then the application's job alone
+# (run_step6_with_retries' own MAX_STEP6_ATTEMPTS per pass, each attempt
+# sized by the deadline) and a hidden SDK retry would spend time the
+# deadline never granted. Disabling SDK retries does NOT make the SDK
+# timeout a limit on the whole call - see IsolatedCallProvider below.
+MULTI_PASS_SDK_MAX_RETRIES = 0
+
+
+def sdk_max_retries_for(deadline_seconds: Optional[float]) -> Optional[int]:
+    """The SDK retry setting for a Step 6 run: MULTI_PASS_SDK_MAX_RETRIES
+    when it runs under a deadline (multi-pass), None (SDK default,
+    historical single-pass behavior) otherwise."""
+    return MULTI_PASS_SDK_MAX_RETRIES if deadline_seconds is not None else None
+
+
+def _sdk_retry_kwargs(sdk_max_retries: Optional[int]) -> Dict[str, Any]:
+    if sdk_max_retries is None:
+        return {}
+    if not isinstance(sdk_max_retries, int) or isinstance(sdk_max_retries, bool) or sdk_max_retries < 0:
+        raise LLMError("sdk_max_retries must be None or a non-negative integer")
+    return {"max_retries": sdk_max_retries}
+
+
 class AnthropicLLMProvider:
     """Real provider. Never constructed unless a caller has an actual
-    API key - see module docstring on credential boundary."""
+    API key - see module docstring on credential boundary.
+    sdk_max_retries: see sdk_max_retries_for() above."""
 
-    def __init__(self, api_key: str, model: str):
+    def __init__(self, api_key: str, model: str, sdk_max_retries: Optional[int] = None):
         if anthropic is None:
             raise LLMError('the "anthropic" package is not installed - only needed for a real, live provider; tests use MockLLMProvider.')
         if not api_key:
             raise LLMError("api_key is required")
         if not model:
             raise LLMError("model is required")
-        self._client = anthropic.Anthropic(api_key=api_key)
+        self.sdk_max_retries = sdk_max_retries
+        self._client = anthropic.Anthropic(api_key=api_key, **_sdk_retry_kwargs(sdk_max_retries))
         self._model = model
 
     def complete(self, prompt: str, max_output_tokens: int, timeout_seconds: int) -> str:
@@ -180,16 +220,19 @@ class DeepSeekLLMProvider:
     counts, provider, model) purely for benchmarking/observability - never
     read by run_step6_with_retries or any other production code path, and
     never includes reasoning_content's own text, only reasoning_tokens'
-    count."""
+    count.
 
-    def __init__(self, api_key: str, model: str, reasoning_effort: Optional[str] = "low"):
+    sdk_max_retries: see sdk_max_retries_for() above."""
+
+    def __init__(self, api_key: str, model: str, reasoning_effort: Optional[str] = "low", sdk_max_retries: Optional[int] = None):
         if openai is None:
             raise LLMError('the "openai" package is not installed - only needed for a real, live DeepSeek provider; tests use MockLLMProvider.')
         if not api_key:
             raise LLMError("api_key is required")
         if not model:
             raise LLMError("model is required")
-        self._client = openai.OpenAI(api_key=api_key, base_url=_DEEPSEEK_BASE_URL)
+        self.sdk_max_retries = sdk_max_retries
+        self._client = openai.OpenAI(api_key=api_key, base_url=_DEEPSEEK_BASE_URL, **_sdk_retry_kwargs(sdk_max_retries))
         self._model = model
         self._reasoning_effort = reasoning_effort
         self.calls: List[Dict[str, Any]] = []
@@ -246,9 +289,223 @@ class DeepSeekLLMProvider:
         return content or ""
 
 
+# Hard total provider-call deadline (phase 15K-B, docs/decisiones.md D-097,
+# the finding after F1). Three different time limits exist:
+#   * the SDK timeout (the timeout_seconds each provider passes to its SDK):
+#     the SDKs hand it to httpx, which applies it to EACH network operation
+#     (connect, every read, ...), not to the whole call - a server that keeps
+#     sending bytes (reported for DeepSeek: keep-alive blank lines on a
+#     non-streaming request while it waits) keeps one call alive
+#     indefinitely, and max_retries=0 does not change that;
+#   * the total provider-call deadline: IsolatedCallProvider below - the
+#     whole complete() call, measured from its start, never lasts longer
+#     than timeout_seconds;
+#   * the global Step 6 deadline (_Step6Deadline): decides each attempt's
+#     timeout_seconds from the time left; it holds only because every call
+#     honors that value as a total.
+# IsolatedCallProvider runs each call in a forked child process and SIGKILLs
+# it when the deadline expires. Alternatives measured against a local server
+# that trickles one byte per 0.5 s (docs/decisiones.md D-097): closing the
+# httpx client from a second thread did abort a plain-HTTP read, but it
+# relies on httpx/httpcore internals closing a socket another thread is
+# blocked on (not guaranteed during DNS resolution, TLS or the proxy CONNECT)
+# and shares the client with the next attempt; SIGALRM raising in the main
+# thread aborted it too, but raises at an arbitrary point inside the SDK
+# (and not at all inside a blocking C call such as getaddrinfo) and leaves
+# that SDK state to the next attempt. A killed child cannot continue in any
+# phase: the kernel closes its sockets, it is reaped before complete()
+# returns, and nothing of its SDK state reaches the next attempt.
+PROVIDER_CALL_RESULT_MAX_BYTES = 8 * 1024 * 1024  # one response is at most a few hundred KB of text (LLM_MAX_OUTPUT_TOKENS)
+
+
+class IsolatedCallProvider:
+    """Wraps a real LLMProvider so that every complete() runs in its own
+    forked child process with a hard total deadline of timeout_seconds
+    (monotonic, from the start of the call). Used only under a Step 6
+    deadline (provider_for_step6()); single-pass never uses it.
+
+    Per call: a pipe, os.fork(); the child points its stdin/stdout at
+    /dev/null (the worker's stdout is its one-line result protocol), calls
+    the wrapped provider (same SDK client, same credentials - inherited in
+    memory, never written anywhere; same environment, so the same egress
+    proxy) and writes one JSON result to the pipe. The parent reads that
+    result until the deadline; if the deadline expires first, it raises
+    ProviderError (the attempt is consumed like any provider failure).
+    Whatever happens - result, timeout, oversized or missing result, or an
+    exception in the parent itself - the parent SIGKILLs the child and reaps
+    it with waitpid() before complete() returns, so no call can continue in
+    the background, no zombie or orphan is left, and the next attempt can
+    only start after this one is gone. The worker is single-threaded, so
+    forking it is safe; a child that deadlocked anyway would only be killed
+    at the deadline like any slow call.
+
+    The wrapped provider's observability records (DeepSeekLLMProvider.
+    calls) made in the child are copied back into the wrapped provider."""
+
+    def __init__(self, provider: LLMProvider) -> None:
+        if not hasattr(os, "fork"):
+            raise LLMError("IsolatedCallProvider needs os.fork() (the Linux worker)")
+        self._provider = provider
+        self.last_child_pid: Optional[int] = None
+
+    def complete(self, prompt: str, max_output_tokens: int, timeout_seconds: int) -> str:
+        call_end = time.monotonic() + timeout_seconds
+        read_fd, write_fd = os.pipe()
+        try:
+            pid = os.fork()
+        except OSError as exc:
+            os.close(read_fd)
+            os.close(write_fd)
+            raise ProviderError("provider call failed: could not start the isolated call (%s)" % type(exc).__name__) from exc
+        if pid == 0:  # child: never returns - os._exit() even if something raises before its own guard
+            try:
+                _isolated_call_child(self._provider, prompt, max_output_tokens, timeout_seconds, write_fd, read_fd)
+            finally:
+                os._exit(1)
+        os.close(write_fd)
+        self.last_child_pid = pid
+        try:
+            data = _read_isolated_result(read_fd, call_end, timeout_seconds)
+        finally:
+            os.close(read_fd)
+            _kill_and_reap(pid)
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            payload = None
+        if not isinstance(payload, dict):
+            raise ProviderError("provider call failed: the isolated call returned no result")
+        records = payload.get("calls")
+        target = getattr(self._provider, "calls", None)
+        if isinstance(records, list) and isinstance(target, list):
+            target.extend(r for r in records if isinstance(r, dict))
+        if payload.get("status") == "ok" and isinstance(payload.get("text"), str):
+            return payload["text"]
+        if payload.get("status") == "provider_error":
+            raise ProviderError(str(payload.get("message")))
+        raise ProviderError("provider call failed: %s" % str(payload.get("type") or "isolated call error"))
+
+
+def _isolated_call_child(provider: LLMProvider, prompt: str, max_output_tokens: int, timeout_seconds: int, write_fd: int, read_fd: int) -> None:
+    status = 0
+    try:
+        os.close(read_fd)  # the parent's end: inside the guarded path, like every other child step
+        devnull = os.open(os.devnull, os.O_RDWR)
+        os.dup2(devnull, 0)
+        os.dup2(devnull, 1)
+        calls = getattr(provider, "calls", None)
+        before = len(calls) if isinstance(calls, list) else 0
+        try:
+            payload: Dict[str, Any] = {"status": "ok", "text": provider.complete(prompt, max_output_tokens=max_output_tokens, timeout_seconds=timeout_seconds)}
+        except ProviderError as exc:
+            payload = {"status": "provider_error", "message": str(exc)}
+        except BaseException as exc:  # only the type crosses back - same rule as the providers' own error messages
+            payload = {"status": "error", "type": type(exc).__name__}
+        if isinstance(calls, list):
+            payload["calls"] = calls[before:]
+        view = memoryview(json.dumps(payload).encode("utf-8"))
+        while view:
+            view = view[os.write(write_fd, view):]
+    except BaseException:
+        status = 1
+    finally:
+        os._exit(status)  # no atexit handlers, no stdio flush of the parent's buffers
+
+
+def _read_isolated_result(read_fd: int, call_end: float, timeout_seconds: int) -> bytes:
+    chunks: List[bytes] = []
+    size = 0
+    while True:
+        left = call_end - time.monotonic()
+        if left <= 0:
+            raise ProviderError("provider call failed: exceeded its total time limit of %d s (call aborted)" % timeout_seconds)
+        ready, _, _ = select.select([read_fd], [], [], left)
+        if not ready:
+            continue
+        chunk = os.read(read_fd, 65536)
+        if not chunk:
+            return b"".join(chunks)
+        size += len(chunk)
+        if size > PROVIDER_CALL_RESULT_MAX_BYTES:
+            raise ProviderError("provider call failed: isolated call result exceeds %d bytes" % PROVIDER_CALL_RESULT_MAX_BYTES)
+        chunks.append(chunk)
+
+
+def _kill_and_reap(pid: int) -> None:
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass
+
+
+def provider_for_step6(provider: LLMProvider, deadline_seconds: Optional[float]) -> LLMProvider:
+    """The provider a Step 6 run uses: under a deadline (multi-pass) every
+    call is isolated with a hard total deadline (IsolatedCallProvider);
+    without one (single-pass) the provider is returned unchanged."""
+    return IsolatedCallProvider(provider) if deadline_seconds is not None else provider
+
+
 MAX_STEP6_ATTEMPTS = 3  # matches analyze_pipeline.py's own SKILL.md-documented "3 attempts total" cap - never independently configurable, so the two can never drift apart.
 DEFAULT_MAX_OUTPUT_TOKENS = 8000
 DEFAULT_PER_ATTEMPT_TIMEOUT_SECONDS = 120
+
+# Step 6 time budget (phase 15K-B, docs/decisiones.md D-097). Applied only
+# when run_step6_with_retries() is given deadline_seconds (the worker
+# passes its supervisor wall clock minus the supervisor's startup reserve,
+# see backend/worker_supervisor.py). The deadline sizes each provider
+# call's timeout_seconds. That value bounds the call only because, under a
+# deadline, the worker builds the provider with
+# sdk_max_retries_for(deadline) == 0 (no hidden SDK retry; every retry is
+# one of this module's own, deadline-checked attempts) AND wraps it in
+# provider_for_step6() (IsolatedCallProvider: timeout_seconds is a hard
+# total for the whole call - the SDK timeout alone is per network
+# operation, see above). With both, no attempt, pass or the final pipeline
+# runs past the deadline:
+#   * STEP6_FINAL_PIPELINE_RESERVE_SECONDS is kept free for the one final
+#     run_analyze_pipeline() call, which preprocesses the submission again
+#     and scores/validates/renders once: preprocess measured 3.3 s (~15K
+#     effLOC real code), 4.1 s (~20K) and 7.1 s (~36K, the largest real
+#     bundle measured), so 20 s is ~2.8x the largest measurement.
+#   * STEP6_MIN_ATTEMPT_SECONDS: an attempt is not started with less time
+#     than this left - the only real measurement, a 1.52 MB prompt with 8
+#     output tokens (docs/decisiones.md D-095), took 10.08 s just to be
+#     processed, so a shorter window could never return a report.
+#   * MAX_STEP6_PASSES caps multi-pass. Offline measurement on real code
+#     (D-097): ~15K effLOC needs 6 passes with canonical JSON and 3 with
+#     compact-v2; ~20K needs 5 with compact-v2 and more than 8 with
+#     canonical JSON (44 of 302 files left unassigned at 8 -> partial).
+#     The cap bounds cost; the deadline, not the cap, bounds time.
+STEP6_FINAL_PIPELINE_RESERVE_SECONDS = 20
+STEP6_MIN_ATTEMPT_SECONDS = 15
+MAX_STEP6_PASSES = 8
+
+
+class _Step6Deadline:
+    """Monotonic time budget for one run_step6_with_retries() call. Every
+    provider call gets min(per-attempt timeout, time left before the final
+    pipeline reserve, time left in the current pass's share); an attempt
+    with less than STEP6_MIN_ATTEMPT_SECONDS available is not started."""
+
+    def __init__(self, seconds: float, clock: Callable[[], float]) -> None:
+        self._clock = clock
+        self._provider_end = clock() + seconds - STEP6_FINAL_PIPELINE_RESERVE_SECONDS
+
+    def pass_end(self, passes_left: int) -> float:
+        """End of the next pass's fair share of the provider time left
+        (unused time rolls over to later passes)."""
+        now = self._clock()
+        return now + max(0.0, self._provider_end - now) / max(1, passes_left)
+
+    def attempt_timeout(self, per_attempt_timeout_seconds: int, pass_end: Optional[float] = None) -> Optional[int]:
+        limit = self._provider_end if pass_end is None else min(self._provider_end, pass_end)
+        left = limit - self._clock()
+        if left < STEP6_MIN_ATTEMPT_SECONDS:
+            return None
+        return int(min(per_attempt_timeout_seconds, left))
 
 
 class Step6Failed(Exception):
@@ -309,6 +566,29 @@ def _serialized_artifact_bytes(preprocess_artifact: Any, context_format: str = c
     it in `context_format` (the same context_encoding call), without
     building the rest of the prompt."""
     return context_encoding.context_artifact_bytes(preprocess_artifact, context_format)
+
+
+def _selection_trigger(preprocess_artifact: Dict[str, Any], context_format: str) -> Optional[List[str]]:
+    """The selectionReasons that make _apply_completeness_gate() select
+    (see its docstring's two triggers), or None when the artifact is sent
+    whole. Shared with the multi-pass path so both decide identically."""
+    completeness = preprocess_artifact.get("completeness") or {}
+    blocking = []
+    if completeness.get("status") == "partial":
+        blocking = [r for r in (completeness.get("reasons") or []) if isinstance(r, dict) and r.get("code") in _BLOCKING_COMPLETENESS_CODES]
+    if blocking:
+        return [r.get("code") for r in blocking]
+    artifact_budget = context_selection.APPLICATION_CONTEXT_BUDGET_BYTES - STEP6_PROMPT_RESERVE_BYTES
+    if _serialized_artifact_bytes(preprocess_artifact, context_format) > artifact_budget:
+        # Prompt-budget trigger: no blocking completeness reason (status
+        # "complete", a non-blocking "partial", or no completeness at all),
+        # but the full artifact cannot fit the artifact budget, so no
+        # attempt's final prompt could be guaranteed within
+        # APPLICATION_CONTEXT_BUDGET_BYTES. Selection runs exactly as for a
+        # blocking reason; completeness is left exactly as preprocessing
+        # produced it.
+        return [PROMPT_BUDGET_SELECTION_REASON]
+    return None
 
 
 def _apply_completeness_gate(
@@ -400,18 +680,8 @@ def _apply_completeness_gate(
 
     prompt_budget = context_selection.APPLICATION_CONTEXT_BUDGET_BYTES
     artifact_budget = prompt_budget - STEP6_PROMPT_RESERVE_BYTES
-    if blocking:
-        reason_codes = [r.get("code") for r in blocking]
-    elif _serialized_artifact_bytes(preprocess_artifact, context_format) > artifact_budget:
-        # Prompt-budget trigger: no blocking completeness reason (status
-        # "complete", a non-blocking "partial", or no completeness at all),
-        # but the full artifact cannot fit the artifact budget, so no
-        # attempt's final prompt could be guaranteed within
-        # APPLICATION_CONTEXT_BUDGET_BYTES. Selection runs exactly as for a
-        # blocking reason; completeness is left exactly as preprocessing
-        # produced it.
-        reason_codes = [PROMPT_BUDGET_SELECTION_REASON]
-    else:
+    reason_codes = _selection_trigger(preprocess_artifact, context_format)
+    if reason_codes is None:
         return preprocess_artifact
     # The default format keeps the historical call shape exactly; any
     # other format hands the selector that format's own measure.
@@ -703,6 +973,7 @@ def _build_step6_prompt(
            context_encoding.encode_context_artifact(preprocess_artifact, context_format))
     )
     base += _context_selection_prompt_note(preprocess_artifact)
+    base += multi_pass.pass_prompt_note(preprocess_artifact)
     if previous_errors:
         base += (
             "\n\nYour previous draft was INVALID for these reasons - fix them and "
@@ -752,6 +1023,10 @@ def run_step6_with_retries(
     render_format: str = "markdown",
     preprocess_run: Optional[Callable[..., Dict[str, Any]]] = None,
     context_format: str = context_encoding.CONTEXT_FORMAT_V1,
+    max_passes: int = 1,
+    validate_pass_draft: Optional[Callable[[Dict[str, Any]], List[str]]] = None,
+    deadline_seconds: Optional[float] = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> Dict[str, Any]:
     """Orchestrates Step 6 (this module) around the existing mechanized
     Steps 3/7/8/9 (analyze_pipeline.run_analyze_pipeline, injected by the
@@ -779,13 +1054,46 @@ def run_step6_with_retries(
     canonical JSON keeps every call below exactly as before; compact-v2
     is used for BOTH selection and the prompt (never one without the
     other), and the final hard check below always measures the real
-    prompt text whatever the format."""
+    prompt text whatever the format.
+
+    max_passes (phase 15K-B, D-097) is opt-in: with the default 1 nothing
+    changes. With max_passes > 1, an artifact that single-pass selection
+    would cut down is instead partitioned by backend/multi_pass.py and run
+    as several passes (_run_multi_pass()); an artifact that fits one
+    prompt still takes the single-pass path below. validate_pass_draft
+    (required with max_passes > 1) validates one pass draft and returns
+    its errors - the worker passes validate_report(score_report(draft)),
+    the same checks run_analyze_pipeline() applies, with that per-pass
+    score discarded: the report's score comes only from the one final
+    pipeline run on the merged draft.
+
+    deadline_seconds (optional) bounds the whole call - see
+    _Step6Deadline; without it, attempts use per_attempt_timeout_seconds
+    exactly as before. The deadline holds only for a provider whose calls
+    last at most their timeout_seconds in total: a caller passing
+    deadline_seconds builds its real provider with sdk_max_retries=
+    sdk_max_retries_for(deadline_seconds) (0) and wraps it with
+    provider_for_step6(provider, deadline_seconds), as
+    backend/worker_entrypoint.py does."""
     context_encoding.check_context_format(context_format)
+    if not isinstance(max_passes, int) or isinstance(max_passes, bool) or not 1 <= max_passes <= MAX_STEP6_PASSES:
+        raise ValueError("max_passes must be an integer between 1 and %d" % MAX_STEP6_PASSES)
+    if max_passes > 1 and validate_pass_draft is None:
+        raise ValueError("validate_pass_draft is required when max_passes > 1")
+    deadline = _Step6Deadline(deadline_seconds, clock) if deadline_seconds is not None else None
     format_kwargs: Dict[str, Any] = {}
     if context_format != context_encoding.CONTEXT_FORMAT_V1:
         format_kwargs["context_format"] = context_format
     preprocess_run = preprocess_run or (lambda **kwargs: None)
     preprocess_artifact = preprocess_run(source_paths, mode=mode, max_loc=None, use_stdin=False, include_timestamp=False, modes_config=modes_config)
+    if max_passes > 1 and isinstance(preprocess_artifact, dict) and _selection_trigger(preprocess_artifact, context_format) is not None:
+        prompt_budget = context_selection.APPLICATION_CONTEXT_BUDGET_BYTES
+        plan = multi_pass.plan_passes(preprocess_artifact, context_format, max_passes, prompt_budget - STEP6_PROMPT_RESERVE_BYTES, prompt_budget)
+        if plan.pass_count > 1 or plan.unassigned:
+            return _run_multi_pass(
+                source_paths, mode, provider, run_analyze_pipeline, preprocess_artifact, plan, format_kwargs,
+                max_output_tokens, per_attempt_timeout_seconds, modes_config, render_format, validate_pass_draft, deadline,
+            )
     preprocess_artifact = _apply_completeness_gate(preprocess_artifact, **format_kwargs)
 
     previous_errors: Optional[List[str]] = None
@@ -810,8 +1118,16 @@ def run_step6_with_retries(
                    _serialized_artifact_bytes(preprocess_artifact, context_format),
                    len(_bounded_previous_errors(previous_errors).encode("utf-8")) if previous_errors else 0)
             )
+        timeout_seconds = per_attempt_timeout_seconds
+        if deadline is not None:
+            timeout_seconds = deadline.attempt_timeout(per_attempt_timeout_seconds)
+            if timeout_seconds is None:
+                raise Step6Failed(
+                    "Step 6 stopped before provider attempt %d: the Step 6 time budget leaves less than %d s "
+                    "(last failure: %s)" % (attempt, STEP6_MIN_ATTEMPT_SECONDS, last_failure)
+                )
         try:
-            raw_text = provider.complete(prompt, max_output_tokens=max_output_tokens, timeout_seconds=per_attempt_timeout_seconds)
+            raw_text = provider.complete(prompt, max_output_tokens=max_output_tokens, timeout_seconds=timeout_seconds)
             draft_report = _parse_draft_report(raw_text)
         except ProviderError as exc:
             last_failure = str(exc)
@@ -846,3 +1162,157 @@ def run_step6_with_retries(
         last_failure = "report invalid after attempt %d: %s" % (attempt, previous_errors)
 
     raise Step6Failed("Step 6 failed after %d attempt(s): %s" % (MAX_STEP6_ATTEMPTS, last_failure))
+
+
+# ---------------------------------------------------------------------------
+# Multi-pass execution (phase 15K-B, docs/decisiones.md D-097). Planning,
+# per-pass artifacts, scope rules and merge are deterministic and live in
+# backend/multi_pass.py; this part only runs the passes against the
+# provider and hands the merged draft to the pipeline ONCE.
+# ---------------------------------------------------------------------------
+
+_PASS_FAILURE_DETAIL_MAX_CHARS = 500
+
+
+def _bounded_failure(text: str) -> str:
+    return text if len(text) <= _PASS_FAILURE_DETAIL_MAX_CHARS else text[:_PASS_FAILURE_DETAIL_MAX_CHARS] + "..."
+
+
+def _run_one_pass(
+    mode: str,
+    provider: LLMProvider,
+    artifact: Dict[str, Any],
+    plan: "multi_pass.PassPlan",
+    pass_entry: Dict[str, Any],
+    format_kwargs: Dict[str, Any],
+    max_output_tokens: int,
+    per_attempt_timeout_seconds: int,
+    validate_pass_draft: Callable[[Dict[str, Any]], List[str]],
+    deadline: Optional[_Step6Deadline],
+    passes_left: int,
+) -> Dict[str, Any]:
+    """One pass with its OWN attempts, previous errors and hard check -
+    nothing is shared with another pass. Returns an outcome dict whose
+    status is multi_pass.PASS_SUCCESS (with the valid draft) or
+    multi_pass.PASS_FAILED (with a bounded failureReason). The pass
+    artifact and prompts are local, released when the pass ends."""
+    pass_artifact = multi_pass.build_pass_artifact(artifact, plan, pass_entry)
+    outcome: Dict[str, Any] = {
+        "passIndex": pass_entry["passIndex"], "passCount": pass_entry["passCount"],
+        "primaryFiles": list(pass_entry["primaryFiles"]), "contextFiles": list(pass_entry["contextFiles"]),
+        "selectedBytes": pass_artifact[multi_pass.PASS_FIELD]["estimatedContextBytes"], "promptBytes": 0,
+        "attempts": 0, "status": multi_pass.PASS_FAILED, "providerOutcome": "not_started",
+        "validationOutcome": "not_reached", "failureReason": "no attempt was made",
+    }
+    pass_end = deadline.pass_end(passes_left) if deadline is not None else None
+    previous_errors: Optional[List[str]] = None
+    for attempt in range(1, MAX_STEP6_ATTEMPTS + 1):
+        prompt = _build_step6_prompt(pass_artifact, previous_errors, mode, **format_kwargs)
+        prompt_bytes = len(prompt.encode("utf-8"))
+        outcome["promptBytes"] = max(outcome["promptBytes"], prompt_bytes)
+        prompt_budget = context_selection.APPLICATION_CONTEXT_BUDGET_BYTES
+        if prompt_bytes > prompt_budget:
+            # Same final invariant as the single-pass loop: never sent, and
+            # the whole job fails closed rather than report around it.
+            raise Step6Failed(
+                "Step 6 blocked before provider attempt %d of pass %d/%d: final prompt is %d bytes, exceeding "
+                "the application prompt budget of %d bytes. No provider call was made for this attempt."
+                % (attempt, pass_entry["passIndex"], pass_entry["passCount"], prompt_bytes, prompt_budget)
+            )
+        timeout_seconds = per_attempt_timeout_seconds
+        if deadline is not None:
+            timeout_seconds = deadline.attempt_timeout(per_attempt_timeout_seconds, pass_end)
+            if timeout_seconds is None:
+                # providerOutcome stays "not_started" when no attempt was made.
+                previous = "; previous failure: %s" % outcome["failureReason"] if attempt > 1 else ""
+                outcome["failureReason"] = _bounded_failure("time budget exhausted before attempt %d%s" % (attempt, previous))
+                return outcome
+        outcome["attempts"] = attempt
+        try:
+            raw_text = provider.complete(prompt, max_output_tokens=max_output_tokens, timeout_seconds=timeout_seconds)
+        except ProviderError as exc:
+            outcome["providerOutcome"] = "error"
+            outcome["failureReason"] = _bounded_failure("provider error on attempt %d: %s" % (attempt, exc))
+            previous_errors = [str(exc)]
+            continue
+        outcome["providerOutcome"] = "ok"
+        try:
+            draft = _parse_draft_report(raw_text)
+        except ProviderError as exc:
+            outcome["validationOutcome"] = "invalid_json"
+            outcome["failureReason"] = _bounded_failure("invalid JSON on attempt %d: %s" % (attempt, exc))
+            previous_errors = [str(exc)]
+            continue
+        scope_errors = multi_pass.pass_scope_errors(draft, pass_entry)
+        if scope_errors:
+            outcome["validationOutcome"] = "scope_violation"
+            outcome["failureReason"] = _bounded_failure("scope violation on attempt %d: %s" % (attempt, "; ".join(scope_errors)))
+            previous_errors = scope_errors
+            continue
+        try:
+            errors = list(validate_pass_draft(draft))
+        except Exception as exc:  # a draft too malformed to even validate is an invalid draft, never a crash
+            errors = ["draft could not be validated: %s: %s" % (type(exc).__name__, exc)]
+        if errors:
+            outcome["validationOutcome"] = "invalid"
+            outcome["failureReason"] = _bounded_failure("invalid report on attempt %d: %s" % (attempt, "; ".join(str(e) for e in errors)))
+            previous_errors = errors
+            continue
+        outcome.update({"status": multi_pass.PASS_SUCCESS, "validationOutcome": "valid", "failureReason": None, "draft": draft})
+        return outcome
+    return outcome
+
+
+def _run_multi_pass(
+    source_paths: List[str],
+    mode: str,
+    provider: LLMProvider,
+    run_analyze_pipeline: Callable[..., Dict[str, Any]],
+    artifact: Dict[str, Any],
+    plan: "multi_pass.PassPlan",
+    format_kwargs: Dict[str, Any],
+    max_output_tokens: int,
+    per_attempt_timeout_seconds: int,
+    modes_config: Optional[Dict[str, Any]],
+    render_format: str,
+    validate_pass_draft: Callable[[Dict[str, Any]], List[str]],
+    deadline: Optional[_Step6Deadline],
+) -> Dict[str, Any]:
+    """Runs every planned pass in order, merges the successful drafts
+    (multi_pass.merge_pass_drafts), re-checks every merged location against
+    the pass that produced it, then calls run_analyze_pipeline() ONCE on the
+    merged draft - the only scoring, validation and render of the report.
+    Fails closed (Step6Failed) when no pass succeeded, when the merged draft
+    breaks a location rule, or when the merged report does not validate."""
+    if plan.pass_count == 0:
+        raise Step6Failed(
+            "Step 6 blocked before any provider attempt: multi-pass planning could not assign any file to a pass "
+            "(every file's closure exceeds the artifact budget of %d bytes). No provider was called." % plan.artifact_budget
+        )
+    outcomes: List[Dict[str, Any]] = []
+    for pass_entry in plan.passes:
+        outcomes.append(_run_one_pass(
+            mode, provider, artifact, plan, pass_entry, format_kwargs, max_output_tokens,
+            per_attempt_timeout_seconds, validate_pass_draft, deadline, plan.pass_count - len(outcomes),
+        ))
+    if not any(o["status"] == multi_pass.PASS_SUCCESS for o in outcomes):
+        raise Step6Failed(
+            "Step 6 multi-pass failed: all %d pass(es) failed - %s"
+            % (plan.pass_count, "; ".join("pass %d: %s" % (o["passIndex"], o["failureReason"]) for o in outcomes))
+        )
+    merged, provenance = multi_pass.merge_pass_drafts(artifact, plan, outcomes, mode)
+    location_errors = multi_pass.merged_location_errors(provenance, merged, plan, outcomes)
+    if location_errors:
+        raise Step6Failed("Step 6 multi-pass merge produced out-of-scope locations: %s" % _bounded_failure("; ".join(location_errors)))
+    try:
+        result = run_analyze_pipeline(
+            source_paths, mode=mode, draft_report=merged, attempt=1,
+            use_stdin=False, render_format=render_format, modes_config=modes_config,
+        )
+    except Exception as exc:
+        raise Step6Failed("Step 6 multi-pass final pipeline failed: %s" % _bounded_failure(str(exc)))
+    if result.get("status") != "rendered":
+        raise Step6Failed("Step 6 multi-pass merged report failed global validation: %s" % _bounded_failure(str(result.get("errors"))))
+    result = dict(result)
+    result["multiPass"] = multi_pass.plan_summary(plan, outcomes)
+    return result

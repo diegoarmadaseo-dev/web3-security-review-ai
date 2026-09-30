@@ -70,7 +70,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from typing import Any, Dict
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 SOURCE_PATH = os.environ.get("SOURCE_PATH", "/scratch/contract.sol")
 SKILL_SCRIPTS_DIR = os.environ.get("SKILL_SCRIPTS_DIR", "/app/.claude/skills/web3-auditor/scripts")
@@ -90,7 +90,7 @@ def _write_result(status: str, **fields: Any) -> None:
     sys.stdout.flush()
 
 
-def _select_provider(llm_client_module: Any, provider_name: str, api_key: str, model: str) -> Any:
+def _select_provider(llm_client_module: Any, provider_name: str, api_key: str, model: str, sdk_max_retries: Optional[int] = None) -> Any:
     """Constructs the real LLMProvider named by provider_name - see module
     docstring's PROVIDER SELECTION section. A separate, directly-testable
     function (see tests/test_backend_worker_entrypoint.py) rather than
@@ -102,14 +102,43 @@ def _select_provider(llm_client_module: Any, provider_name: str, api_key: str, m
     Raises llm_client_module.LLMError for an unrecognized name (fail
     closed, never a silent default) or whichever of that error the
     underlying provider's own constructor raises (missing package,
-    missing credential)."""
+    missing credential).
+
+    sdk_max_retries (see _step6_run_config()) is forwarded only when set,
+    so a single-pass run constructs its provider exactly as before."""
+    kwargs: Dict[str, Any] = {"api_key": api_key, "model": model}
+    if sdk_max_retries is not None:
+        kwargs["sdk_max_retries"] = sdk_max_retries
     if provider_name == "anthropic":
-        return llm_client_module.AnthropicLLMProvider(api_key=api_key, model=model)
+        return llm_client_module.AnthropicLLMProvider(**kwargs)
     if provider_name == "deepseek":
-        return llm_client_module.DeepSeekLLMProvider(api_key=api_key, model=model)
+        return llm_client_module.DeepSeekLLMProvider(**kwargs)
     raise llm_client_module.LLMError(
         "unknown LLM_PROVIDER %r - must be 'anthropic' or 'deepseek'" % provider_name
     )
+
+
+def _step6_run_config(environ: Mapping[str, str], llm_client_module: Any) -> Tuple[int, Optional[int], Optional[int]]:
+    """(max_passes, deadline_seconds, sdk_max_retries) for this job - the
+    one place the worker decides them (phase 15K-B, docs/decisiones.md
+    D-097). Multi-pass is opt-in (LLM_MAX_PASSES, default 1 = the
+    single-pass path, unchanged). With multi-pass, the Step 6 deadline
+    from the supervisor (STEP6_DEADLINE_SECONDS: its wall clock minus its
+    startup reserve) bounds every attempt, pass and the final pipeline;
+    retrying is then the application's job alone (MAX_STEP6_ATTEMPTS per
+    pass, each attempt sized by the deadline), so the provider's SDK must
+    not retry internally - an SDK retry would run past the timeout the
+    deadline granted - and sdk_max_retries is 0. Disabling SDK retries is
+    not enough on its own: the SDK timeout applies to each network read,
+    not to the whole call, so main() also wraps the real provider with
+    llm_client.provider_for_step6() (a hard total deadline per call, in an
+    isolated child process). The single-pass path gets no deadline,
+    sdk_max_retries None and no wrapper: its historical per-attempt
+    timeouts and the SDK's own default retries, all unchanged."""
+    max_passes = int(environ.get("LLM_MAX_PASSES", "1"))
+    deadline_env = environ.get("STEP6_DEADLINE_SECONDS")
+    deadline_seconds = int(deadline_env) if (deadline_env and max_passes > 1) else None
+    return max_passes, deadline_seconds, llm_client_module.sdk_max_retries_for(deadline_seconds)
 
 
 class _EnvelopeError(Exception):
@@ -153,6 +182,8 @@ def main() -> int:
     import backend.llm_client as llm_client
     from analyze_pipeline import run_analyze_pipeline
     from preprocess import run as preprocess_run
+    from score import score_report
+    from validate_report import validate_report
 
     try:
         envelope = _read_stdin_envelope()
@@ -165,6 +196,7 @@ def main() -> int:
     mode = envelope["mode"]
     source = envelope["source"]
     mock_responses = envelope.get("mock_responses")
+    max_passes, deadline_seconds, sdk_max_retries = _step6_run_config(os.environ, llm_client)
 
     if mock_responses is not None:
         # Test-only path - see backend/llm_client.MockLLMProvider's own
@@ -178,7 +210,10 @@ def main() -> int:
         model = os.environ.get("LLM_MODEL", "")
         provider_name = os.environ.get("LLM_PROVIDER", "anthropic")
         try:
-            provider = _select_provider(llm_client, provider_name, api_key, model)
+            provider = _select_provider(llm_client, provider_name, api_key, model, sdk_max_retries=sdk_max_retries)
+            # Under the Step 6 deadline every real call gets a hard total
+            # deadline (see _step6_run_config()); single-pass: unchanged.
+            provider = llm_client.provider_for_step6(provider, deadline_seconds)
         except llm_client.LLMError as exc:
             _write_result("failed", error=str(exc))
             return 1
@@ -191,12 +226,21 @@ def main() -> int:
 
     max_output_tokens = int(os.environ.get("LLM_MAX_OUTPUT_TOKENS", str(llm_client.DEFAULT_MAX_OUTPUT_TOKENS)))
     per_attempt_timeout = int(os.environ.get("LLM_PER_ATTEMPT_TIMEOUT_SECONDS", str(llm_client.DEFAULT_PER_ATTEMPT_TIMEOUT_SECONDS)))
+    # max_passes/deadline_seconds come from _step6_run_config() above (the
+    # provider was built with the matching sdk_max_retries). A pass draft
+    # is validated with the same score + validate the pipeline applies;
+    # that score is discarded - the report is scored once, on the merged
+    # draft.
+
+    def validate_pass_draft(draft):
+        return validate_report(score_report(draft))
 
     try:
         result = llm_client.run_step6_with_retries(
             [SOURCE_PATH], mode, provider, run_analyze_pipeline,
             max_output_tokens=max_output_tokens, per_attempt_timeout_seconds=per_attempt_timeout,
-            preprocess_run=preprocess_run,
+            preprocess_run=preprocess_run, max_passes=max_passes, validate_pass_draft=validate_pass_draft,
+            deadline_seconds=deadline_seconds,
         )
     except llm_client.Step6Failed as exc:
         _write_result("failed", error=str(exc))

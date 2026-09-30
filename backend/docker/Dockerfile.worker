@@ -82,6 +82,7 @@ COPY backend/worker_entrypoint.py /app/backend/worker_entrypoint.py
 COPY backend/llm_client.py /app/backend/llm_client.py
 COPY backend/context_selection.py /app/backend/context_selection.py
 COPY backend/context_encoding.py /app/backend/context_encoding.py
+COPY backend/multi_pass.py /app/backend/multi_pass.py
 RUN touch /app/backend/__init__.py
 
 ENTRYPOINT ["python", "/app/backend/worker_entrypoint.py"]
