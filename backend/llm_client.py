@@ -267,10 +267,43 @@ class Step6Failed(Exception):
          (this case's message always starts with "Step 6 blocked before
          any provider attempt" - never "Step 6 failed after N
          attempt(s)"), so no second exception type was needed to keep the
-         two cases separately identifiable."""
+         two cases separately identifiable.
+      3. a final Step 6 prompt would exceed the application prompt budget
+         (see STEP6_PROMPT_RESERVE_BYTES) - raised before that attempt's
+         provider call, never retried; message starts with "Step 6
+         blocked before provider attempt"."""
 
 
 _BLOCKING_COMPLETENESS_CODES = frozenset({"LOC_LIMIT_EXCEEDED", "FILE_LIMIT_EXCEEDED"})
+
+# APPLICATION-level prompt budgeting (never a provider context-window
+# claim - see context_selection.py's own docstring). The FINAL Step 6
+# prompt of every attempt must fit context_selection.
+# APPLICATION_CONTEXT_BUDGET_BYTES (1.5 MiB, unchanged); run_step6_with_
+# retries() checks that byte length before each provider call and fails
+# closed otherwise. Selection therefore works against a smaller artifact
+# budget, APPLICATION_CONTEXT_BUDGET_BYTES - STEP6_PROMPT_RESERVE_BYTES.
+# The fixed 32 KiB reserve covers, measured: preamble + report contract +
+# mode restrictions (~7.1 KB for the longest mode), the fixed-size
+# context-selection note (<1 KB), the previous-errors header plus at most
+# STEP6_PREVIOUS_ERRORS_MAX_BYTES of error payload (16 KiB), and the
+# gate's own promptBudgetBytes metadata field (<40 bytes) - ~25 KB total,
+# with the remainder as fixed headroom. A fixed constant, never a
+# percentage of the current artifact.
+STEP6_PROMPT_RESERVE_BYTES = 32 * 1024
+STEP6_PREVIOUS_ERRORS_MAX_BYTES = 16 * 1024
+
+# contextSelection.selectionReasons entry for selection triggered by the
+# prompt budget alone (no blocking completeness reason). Not a
+# completeness reason: completeness.status/reasons are never touched - a
+# "complete" preprocessing result stays "complete".
+PROMPT_BUDGET_SELECTION_REASON = "PROMPT_BUDGET_EXCEEDED"
+
+
+def _serialized_artifact_bytes(preprocess_artifact: Any) -> int:
+    """Byte size of the artifact exactly as _build_step6_prompt() embeds
+    it (same json.dumps call), without building the rest of the prompt."""
+    return len(json.dumps(preprocess_artifact, ensure_ascii=False).encode("utf-8"))
 
 
 def _apply_completeness_gate(preprocess_artifact: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -298,13 +331,25 @@ def _apply_completeness_gate(preprocess_artifact: Optional[Dict[str, Any]]) -> O
     reason (missing import, unresolved base, truncated file, Vyper's
     limited coverage, low parse confidence, encoding error, etc.) is, per
     that same SKILL.md rule, meant to continue to Step 6 with the reason
-    carried into the report - unaffected by this gate, exactly as before;
-    selection is never invoked for those.
+    carried into the report - unaffected by this gate as a COMPLETENESS
+    matter (they never trigger selection by themselves).
 
-    When a blocking reason IS present, context_selection.select_context()
-    is invoked exactly once (never inside the retry loop - see
-    run_step6_with_retries()'s own call site) with
-    context_selection.APPLICATION_CONTEXT_BUDGET_BYTES:
+    Selection has exactly two triggers, both deterministic:
+      * a blocking completeness reason (selectionReasons = those codes);
+      * PROMPT BUDGET: no blocking reason, but the serialized artifact
+        exceeds the artifact budget (APPLICATION_CONTEXT_BUDGET_BYTES -
+        STEP6_PROMPT_RESERVE_BYTES), so no attempt's final prompt could be
+        guaranteed within APPLICATION_CONTEXT_BUDGET_BYTES
+        (selectionReasons = [PROMPT_BUDGET_SELECTION_REASON]). This
+        applies whatever completeness says ("complete" included): a
+        complete preprocessing result does not imply its prompt fits, and
+        completeness.status/reasons are NOT rewritten to force selection.
+    An artifact within the artifact budget and without a blocking reason
+    is returned unchanged (no selection, no contextSelection).
+
+    When selection runs, context_selection.select_context() is invoked
+    exactly once (never inside the retry loop - see
+    run_step6_with_retries()'s own call site) with the artifact budget:
       * selection status "not_needed" or "applied" -> the (possibly
         filtered) selected artifact is returned; the CALLER proceeds to
         Step 6 with it. The original completeness.reasons are NEVER
@@ -331,27 +376,54 @@ def _apply_completeness_gate(preprocess_artifact: Optional[Dict[str, Any]]) -> O
     that function's own try/except), rather than falling through to its
     generic except Exception clause, which would discard this message
     and report only the exception's type name instead."""
-    completeness = (preprocess_artifact or {}).get("completeness") or {}
-    if completeness.get("status") != "partial":
+    if not isinstance(preprocess_artifact, dict):
         return preprocess_artifact
-    blocking = [r for r in (completeness.get("reasons") or []) if isinstance(r, dict) and r.get("code") in _BLOCKING_COMPLETENESS_CODES]
-    if not blocking:
-        return preprocess_artifact
+    completeness = preprocess_artifact.get("completeness") or {}
+    blocking = []
+    if completeness.get("status") == "partial":
+        blocking = [r for r in (completeness.get("reasons") or []) if isinstance(r, dict) and r.get("code") in _BLOCKING_COMPLETENESS_CODES]
 
-    reason_codes = [r.get("code") for r in blocking]
+    prompt_budget = context_selection.APPLICATION_CONTEXT_BUDGET_BYTES
+    artifact_budget = prompt_budget - STEP6_PROMPT_RESERVE_BYTES
+    if blocking:
+        reason_codes = [r.get("code") for r in blocking]
+    elif _serialized_artifact_bytes(preprocess_artifact) > artifact_budget:
+        # Prompt-budget trigger: no blocking completeness reason (status
+        # "complete", a non-blocking "partial", or no completeness at all),
+        # but the full artifact cannot fit the artifact budget, so no
+        # attempt's final prompt could be guaranteed within
+        # APPLICATION_CONTEXT_BUDGET_BYTES. Selection runs exactly as for a
+        # blocking reason; completeness is left exactly as preprocessing
+        # produced it.
+        reason_codes = [PROMPT_BUDGET_SELECTION_REASON]
+    else:
+        return preprocess_artifact
     selected_artifact, selection_meta = context_selection.select_context(
-        preprocess_artifact, budget_bytes=context_selection.APPLICATION_CONTEXT_BUDGET_BYTES, selection_reasons=reason_codes,
+        preprocess_artifact, budget_bytes=artifact_budget, selection_reasons=reason_codes,
     )
     if selection_meta["status"] != "failed":
+        # contextSelection.budgetBytes is the ARTIFACT budget the selector
+        # applied; promptBudgetBytes records the separate FINAL-prompt
+        # budget. estimatedContextBytes is re-converged with the
+        # selector's own helper so it still measures the artifact exactly.
+        selection_meta["promptBudgetBytes"] = prompt_budget
+        context_selection._exact_total_bytes(selected_artifact, selection_meta)
         return selected_artifact
 
-    detail = "; ".join("%s: %s" % (r.get("code"), r.get("detail", "")) for r in blocking)
+    if blocking:
+        trigger = "preprocessing completeness is 'partial' due to %s" % "; ".join(
+            "%s: %s" % (r.get("code"), r.get("detail", "")) for r in blocking
+        )
+    else:
+        trigger = "%s: the full artifact (%d bytes) does not fit the artifact budget" % (
+            PROMPT_BUDGET_SELECTION_REASON, _serialized_artifact_bytes(preprocess_artifact),
+        )
     raise Step6Failed(
-        "Step 6 blocked before any provider attempt: preprocessing completeness is "
-        "'partial' due to %s, and deterministic context selection could not produce any "
-        "bounded context within the application context budget (%d bytes - see "
-        "backend/context_selection.py). No prompt was built and no provider was called."
-        % (detail, context_selection.APPLICATION_CONTEXT_BUDGET_BYTES)
+        "Step 6 blocked before any provider attempt: %s, and deterministic whole-file context "
+        "selection could not produce any bounded context within the artifact budget (%d bytes: application prompt budget %d "
+        "minus %d reserved for prompt overhead - see backend/context_selection.py and "
+        "STEP6_PROMPT_RESERVE_BYTES). No prompt was built and no provider was called."
+        % (trigger, artifact_budget, prompt_budget, STEP6_PROMPT_RESERVE_BYTES)
     )
 
 
@@ -398,6 +470,133 @@ _MODE_FEATURE_LABELS = (
     ("executiveSummary", "allowExecutiveSummary"),
     ('architectureNotes (array of {"title","description"} objects only, no other fields, never a single string)', "allowArchitectureChecks"),
 )
+
+
+CONTEXT_SELECTION_REASON_CODE = "CONTEXT_SELECTION_APPLIED"
+
+
+_CONTEXT_SELECTION_PROMPT_NOTE = (
+    "\n\nContext selection: this analysis is scoped. The artifact's contextSelection object is "
+    "authoritative: only files in contextSelection.includedFiles are part of your analysis "
+    "context; files in contextSelection.excludedFiles were NOT included and were never provided "
+    "to you. The report's scope.completeness MUST be \"partial\" (never \"complete\"), and "
+    "scope.reasons must carry over any artifact completeness.reasons. Do not place any finding or gas "
+    "suggestion location in an excluded file, and do not claim or imply that excluded code "
+    "was analyzed."
+)
+
+
+def _context_selection_prompt_note(preprocess_artifact: Dict[str, Any]) -> str:
+    """Fixed-size prompt paragraph, emitted ONLY when the artifact carries
+    contextSelection (i.e. _apply_completeness_gate() ran selection for a
+    blocking completeness reason) - an artifact without it produces a
+    byte-identical prompt to before. Deliberately never repeats the
+    file lists (they are already in contextSelection inside the artifact),
+    so its size is independent of how many files were excluded. The
+    structured parts of this instruction are enforced by
+    _context_selection_scope_errors(); the free-form part ("do not claim
+    or imply...") is instruction only, not machine-checked."""
+    if not isinstance(preprocess_artifact.get("contextSelection"), dict):
+        return ""
+    return _CONTEXT_SELECTION_PROMPT_NOTE
+
+
+def _context_selection_scope_errors(draft_report: Dict[str, Any], preprocess_artifact: Optional[Dict[str, Any]]) -> List[str]:
+    """Deterministic truthfulness check between a parsed draft_report and
+    the artifact Step 6 actually used, applied ONLY when that artifact
+    carries contextSelection (never for an ordinary artifact - behavior
+    there is unchanged). validate_report() never sees the artifact, so it
+    cannot catch either case itself:
+      * scope.completeness "complete" although preprocessing reported
+        "partial" (the gate never converts a partial result into a
+        complete-looking one; neither may the model);
+      * a STRUCTURED location - findings[].locations[].file or
+        gasSuggestions[].location.file - in a file contextSelection
+        excluded (code the model was never given), compared after
+        _normalize_location_path().
+    Free-form text (description, evidence, executiveSummary,
+    architectureNotes, limitations, ...) is NOT parsed or checked here: it
+    is constrained only by the prompt instruction, plus the
+    CONTEXT_SELECTION_APPLIED scope reason that always names the excluded
+    files. A non-empty result is handled exactly like a needs_revision result:
+    the attempt is consumed and these errors become the next attempt's
+    error context."""
+    selection = (preprocess_artifact or {}).get("contextSelection")
+    if not isinstance(selection, dict):
+        return []
+    errors: List[str] = []
+    scope = draft_report.get("scope")
+    if isinstance(scope, dict) and scope.get("completeness") == "complete":
+        errors.append(
+            "scope.completeness must not be 'complete': context selection was applied to this "
+            "analysis (see contextSelection) - use 'partial'"
+        )
+    excluded = {
+        _normalize_location_path(e.get("file")) for e in selection.get("excludedFiles") or []
+        if isinstance(e, dict) and isinstance(e.get("file"), str)
+    }
+    if not excluded:
+        return errors
+
+    def _check(loc: Any, path: str) -> None:
+        if isinstance(loc, dict) and isinstance(loc.get("file"), str) and _normalize_location_path(loc["file"]) in excluded:
+            errors.append(
+                "%s.file %r is in a file excluded from the analysis context (never provided) - "
+                "remove or relocate that entry" % (path, loc["file"])
+            )
+
+    findings = draft_report.get("findings")
+    for index, finding in enumerate(findings if isinstance(findings, list) else []):
+        locations = finding.get("locations") if isinstance(finding, dict) else None
+        for loc_index, loc in enumerate(locations if isinstance(locations, list) else []):
+            _check(loc, "findings[%d].locations[%d]" % (index, loc_index))
+    gas = draft_report.get("gasSuggestions")
+    for index, item in enumerate(gas if isinstance(gas, list) else []):
+        if isinstance(item, dict):
+            _check(item.get("location"), "gasSuggestions[%d].location" % index)
+    return errors
+
+
+def _normalize_location_path(path: str) -> str:
+    """Canonical form for comparing a report location against
+    contextSelection.excludedFiles: backslashes become slashes and any
+    leading "./" segments are removed. Nothing else (no case folding, no
+    resolution of ".." or absolute paths)."""
+    normalized = path.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
+def _record_context_selection_scope(draft_report: Dict[str, Any], preprocess_artifact: Optional[Dict[str, Any]]) -> None:
+    """When selection EXCLUDED files, deterministically appends one
+    scope.reasons entry naming them, so the rendered report's Scope
+    section always states what was not analyzed - never left to the
+    model's wording. Metadata only: no finding, severity or score input is
+    touched (scope is not a stableKey/score input). No-op without
+    exclusions, without contextSelection, or when scope is not an object
+    (validate_report() reports that itself)."""
+    selection = (preprocess_artifact or {}).get("contextSelection")
+    if not isinstance(selection, dict):
+        return
+    excluded = [e.get("file") for e in selection.get("excludedFiles") or [] if isinstance(e, dict)]
+    scope = draft_report.get("scope")
+    if not excluded or not isinstance(scope, dict):
+        return
+    reasons = scope.get("reasons")
+    if not isinstance(reasons, list):
+        reasons = []
+    reasons = [r for r in reasons if not (isinstance(r, dict) and r.get("code") == CONTEXT_SELECTION_REASON_CODE)]
+    included = selection.get("includedFiles") or []
+    reasons.append({
+        "code": CONTEXT_SELECTION_REASON_CODE,
+        "detail": "Only %d of %d source files were included in the AI analysis context "
+                  "(selection triggered by %s; application prompt budget %s bytes, artifact budget %s bytes); "
+                  "excluded from analysis: %s"
+                  % (len(included), len(included) + len(excluded), ", ".join(selection.get("selectionReasons") or []),
+                     selection.get("promptBudgetBytes"), selection.get("budgetBytes"), ", ".join(excluded)),
+    })
+    scope["reasons"] = reasons
 
 
 def _mode_restrictions_note(mode: str) -> str:
@@ -470,12 +669,33 @@ def _build_step6_prompt(preprocess_artifact: Dict[str, Any], previous_errors: Op
         "contract.\n\n%s\n\nPreprocessed artifact:\n%s"
         % (contract, json.dumps(preprocess_artifact, ensure_ascii=False))
     )
+    base += _context_selection_prompt_note(preprocess_artifact)
     if previous_errors:
         base += (
             "\n\nYour previous draft was INVALID for these reasons - fix them and "
-            "return a corrected JSON object, still ONLY the JSON:\n%s" % json.dumps(previous_errors, ensure_ascii=False)
+            "return a corrected JSON object, still ONLY the JSON:\n%s" % _bounded_previous_errors(previous_errors)
         )
     return base
+
+
+def _bounded_previous_errors(previous_errors: List[str], max_bytes: int = STEP6_PREVIOUS_ERRORS_MAX_BYTES) -> str:
+    """The JSON-serialized previous_errors, capped at max_bytes UTF-8
+    bytes (exact bound). When longer, keeps the beginning and the end and
+    replaces the middle with an explicit "... N bytes omitted ..." marker;
+    cuts never split a UTF-8 sequence (a partial sequence at a cut is
+    dropped and counted as omitted). Deterministic for the same input."""
+    data = json.dumps(previous_errors, ensure_ascii=False).encode("utf-8", errors="replace")
+    if len(data) <= max_bytes:
+        return data.decode("utf-8")
+    # Sized with the largest possible omitted count, so the real marker
+    # (same or fewer digits) can never make the result exceed max_bytes.
+    marker_budget = len(("\n... %d bytes omitted ...\n" % len(data)).encode("utf-8"))
+    available = max(max_bytes - marker_budget, 0)
+    head = data[:available // 2].decode("utf-8", errors="ignore")
+    tail_bytes = available - available // 2
+    tail = data[len(data) - tail_bytes:].decode("utf-8", errors="ignore") if tail_bytes else ""
+    omitted = len(data) - len(head.encode("utf-8")) - len(tail.encode("utf-8"))
+    return "%s\n... %d bytes omitted ...\n%s" % (head, omitted, tail)
 
 
 def _parse_draft_report(raw_text: str) -> Dict[str, Any]:
@@ -516,16 +736,36 @@ def run_step6_with_retries(
     report - a flaky provider is not exempt from the same total-attempts
     cap a stubborn validation error is. Raises Step6Failed if every
     attempt is exhausted, or immediately (before any attempt, consuming
-    none of them) if _enforce_completeness_gate() blocks - see that
-    function's own docstring."""
+    none of them) if _apply_completeness_gate() blocks - see that
+    function's own docstring. The artifact that gate RETURNS (possibly a
+    context-selected subset) replaces preprocess_artifact once, before
+    the loop, so every attempt's prompt is built from the same selection."""
     preprocess_run = preprocess_run or (lambda **kwargs: None)
     preprocess_artifact = preprocess_run(source_paths, mode=mode, max_loc=None, use_stdin=False, include_timestamp=False, modes_config=modes_config)
-    _enforce_completeness_gate(preprocess_artifact)
+    preprocess_artifact = _apply_completeness_gate(preprocess_artifact)
 
     previous_errors: Optional[List[str]] = None
     last_failure = "unknown failure"
     for attempt in range(1, MAX_STEP6_ATTEMPTS + 1):
         prompt = _build_step6_prompt(preprocess_artifact, previous_errors, mode)
+        prompt_bytes = len(prompt.encode("utf-8"))
+        prompt_budget = context_selection.APPLICATION_CONTEXT_BUDGET_BYTES
+        if prompt_bytes > prompt_budget:
+            # Final invariant. For an artifact that went through
+            # _apply_completeness_gate() this is expected not to trigger:
+            # any artifact above the artifact budget is selected down to
+            # it (or fails there), and STEP6_PROMPT_RESERVE_BYTES covers the
+            # measured prompt overhead. Kept as the last line of defense
+            # (e.g. unexpected config/overhead growth). Never a retry
+            # condition - the next attempt would carry the same artifact.
+            raise Step6Failed(
+                "Step 6 blocked before provider attempt %d: final prompt is %d bytes, exceeding the "
+                "application prompt budget of %d bytes (artifact %d bytes, previous-error context "
+                "%d bytes). No provider call was made for this attempt."
+                % (attempt, prompt_bytes, prompt_budget,
+                   len(json.dumps(preprocess_artifact, ensure_ascii=False).encode("utf-8")),
+                   len(_bounded_previous_errors(previous_errors).encode("utf-8")) if previous_errors else 0)
+            )
         try:
             raw_text = provider.complete(prompt, max_output_tokens=max_output_tokens, timeout_seconds=per_attempt_timeout_seconds)
             draft_report = _parse_draft_report(raw_text)
@@ -533,6 +773,12 @@ def run_step6_with_retries(
             last_failure = str(exc)
             previous_errors = [last_failure]
             continue
+        scope_errors = _context_selection_scope_errors(draft_report, preprocess_artifact)
+        if scope_errors:
+            previous_errors = scope_errors
+            last_failure = "report inconsistent with context selection after attempt %d: %s" % (attempt, scope_errors)
+            continue
+        _record_context_selection_scope(draft_report, preprocess_artifact)
         try:
             result = run_analyze_pipeline(
                 source_paths, mode=mode, draft_report=draft_report, attempt=attempt,

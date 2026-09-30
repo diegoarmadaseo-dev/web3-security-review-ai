@@ -1026,13 +1026,33 @@ class JobSubmitBodySizeTests(_WorkspaceStorageTestCase):
         conn.close()
         return resp.status, data
 
+    def _post_declared_length(self, path, declared_length, headers=None):
+        """Sends a real POST over the real HTTP server whose Content-Length
+        header declares declared_length bytes, but transmits NO body bytes.
+        _read_body() rejects an oversized request from Content-Length alone,
+        before consuming the body, and closes the connection - so writing a
+        multi-megabyte body the server will never read only races that
+        close (BrokenPipeError / connection reset, depending on socket
+        buffer sizes and platform). Sending headers only exercises exactly
+        the declared-size gate, deterministically, on any platform."""
+        conn = self._conn()
+        hdrs = {"Content-Type": "application/json", "Content-Length": str(declared_length), "Host": self.host_header, "Origin": self.same_origin}
+        _apply_header_overrides(hdrs, headers)
+        conn.putrequest("POST", path, skip_host=True, skip_accept_encoding=True)
+        for key, value in hdrs.items():
+            conn.putheader(key, value)
+        conn.endheaders()
+        resp = conn.getresponse()
+        data = resp.read()
+        conn.close()
+        return resp.status, data
+
     def test_sibling_generic_endpoint_still_rejects_over_64kib(self):
         # /workspaces (_handle_workspace_create) never passes max_body_bytes
         # - proves the fix is route-specific, not a global loosening, on a
         # SECOND generic endpoint besides the pre-existing /auth/request-link
         # coverage (RequestLinkTests.test_oversized_body_returns_413).
-        body = b"x" * (http_app.MAX_BODY_BYTES + 1)
-        status, data = self._raw_post("/workspaces", body)
+        status, data = self._post_declared_length("/workspaces", http_app.MAX_BODY_BYTES + 1)
         self.assertEqual(status, 413)
         self.assertEqual(json.loads(data)["error"], "request body too large")
 
@@ -1075,8 +1095,7 @@ class JobSubmitBodySizeTests(_WorkspaceStorageTestCase):
         self.assertEqual(json.loads(data)["error"], "source exceeds the maximum submission size")
 
     def test_job_submit_body_over_job_budget_rejected_by_generic_gate(self):
-        body = b"x" * (http_app.JOB_SUBMIT_MAX_BODY_BYTES + 1)
-        status, data = self._raw_post("/workspaces/does-not-matter/jobs", body)
+        status, data = self._post_declared_length("/workspaces/does-not-matter/jobs", http_app.JOB_SUBMIT_MAX_BODY_BYTES + 1)
         self.assertEqual(status, 413)
         self.assertEqual(json.loads(data)["error"], "request body too large")
 
