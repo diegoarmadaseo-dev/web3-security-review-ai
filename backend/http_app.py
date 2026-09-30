@@ -260,6 +260,52 @@ def get_in_flight_count(server: ThreadingHTTPServer) -> int:
 # before it ever reaches the queue.
 MAX_RAW_SOURCE_BYTES = 512 * 1024
 
+# _handle_job_submit()'s request body is not raw source alone - it is a
+# JSON envelope ({"mode","source","idempotency_key"}) around it, and JSON
+# string escaping can expand the encoded "source" field beyond its own
+# decoded UTF-8 byte length. This is a PROVEN bound, not a heuristic tuned
+# to normal Solidity - it must hold for any valid-UTF-8 "source" a client
+# sends, including adversarial content, and for any RFC-8259-conformant
+# encoder (this module's own tests build request bodies with
+# json.dumps(payload) - no ensure_ascii=False - so they use Python's
+# default ensure_ascii=True, which \uXXXX-escapes every non-ASCII
+# character; a prior version of this constant used 2x, which was verified
+# insufficient: a source made entirely of JSON control characters (e.g.
+# U+0001, which RFC 8259 requires every conformant encoder to escape as
+# `\u0001` - 6 bytes for 1 decoded byte - regardless of ensure_ascii)
+# expands to exactly 6x its own decoded UTF-8 byte length, confirmed by
+# direct construction at MAX_RAW_SOURCE_BYTES scale; no valid UTF-8
+# character can expand past 6x under any conformant JSON encoder, since
+# the worst per-decoded-byte case (a 1-byte control character needing
+# `\uXXXX`) is also the global worst case. 6x MAX_RAW_SOURCE_BYTES is
+# therefore the smallest bound that holds for ALL valid UTF-8 source, not
+# just realistic Solidity.
+#
+# +3072 covers the envelope's own JSON punctuation/keys plus
+# idempotency_key: that field is validated below to have length 1-200
+# (Python len(), i.e. Unicode code points, not bytes) but is otherwise
+# unconstrained content, so its own worst case is 200 astral characters,
+# each 1 code point but needing a UTF-16 surrogate PAIR (`\uXXXX\uXXXX`,
+# 12 bytes) under ensure_ascii=True - confirmed by direct construction
+# (mode="standard", the longest of the 3 allowed mode values, plus that
+# idempotency_key, plus JSON structure) to need exactly 2457 bytes of
+# overhead beyond the source field's own escaped content; 3072 (3 * 1024,
+# the next clean multiple of 1024 above that measured exact worst case)
+# leaves headroom without being an open-ended allowance for unrelated
+# fields - an oversized/garbage "mode" value is not specially budgeted for
+# here since mode is validated against exactly 3 known literal strings,
+# never treated as free-form content the way idempotency_key is.
+#
+# MAX_RAW_SOURCE_BYTES itself remains the sole authority on how much
+# actual source content is allowed; this constant only has to be large
+# enough for _read_body() to hand that check a body to inspect in the
+# first place - see that check, below, and _read_body()'s own docstring
+# on why the generic MAX_BODY_BYTES (64 KiB, sized for login/membership-
+# style payloads, shared by every OTHER POST endpoint in this module)
+# would otherwise reject any job submission whose body exceeds 64 KiB
+# before MAX_RAW_SOURCE_BYTES is ever reached.
+JOB_SUBMIT_MAX_BODY_BYTES = 6 * MAX_RAW_SOURCE_BYTES + 3072
+
 # Query parameter names (decoded, lower-cased) this module never lets
 # reach an access log - see module docstring and _redact_query_string().
 _SENSITIVE_QUERY_PARAM_NAMES = frozenset({"token"})
@@ -735,7 +781,13 @@ def make_handler(
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
-        def _read_body(self) -> Tuple[Optional[bytes], Optional[int], Optional[str]]:
+        def _read_body(self, max_body_bytes: int = MAX_BODY_BYTES) -> Tuple[Optional[bytes], Optional[int], Optional[str]]:
+            """max_body_bytes defaults to the generic MAX_BODY_BYTES (64 KiB) -
+            every caller except _handle_job_submit() relies on that default
+            and is unaffected by this parameter. _handle_job_submit() passes
+            JOB_SUBMIT_MAX_BODY_BYTES explicitly (see that constant's own
+            comment) so its body can actually reach MAX_RAW_SOURCE_BYTES's
+            source-specific check instead of being rejected here first."""
             length_header = self.headers.get("Content-Length")
             try:
                 content_length = int(length_header) if length_header is not None else -1
@@ -744,7 +796,7 @@ def make_handler(
             if content_length < 0:
                 self.close_connection = True
                 return None, 400, "a valid Content-Length header is required"
-            if content_length > MAX_BODY_BYTES:
+            if content_length > max_body_bytes:
                 self.close_connection = True
                 return None, 413, "request body too large"
             return self.rfile.read(content_length), None, None
@@ -1262,7 +1314,7 @@ def make_handler(
             if storage is None:
                 self._send_json(503, {"ok": False, "error": "job execution is not configured"})
                 return
-            raw, err_status, err_msg = self._read_body()
+            raw, err_status, err_msg = self._read_body(max_body_bytes=JOB_SUBMIT_MAX_BODY_BYTES)
             if err_status:
                 self._send_json(err_status, {"ok": False, "error": err_msg})
                 return

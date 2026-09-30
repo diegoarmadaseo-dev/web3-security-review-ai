@@ -15,6 +15,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -27,6 +28,8 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import preprocess  # noqa: E402
+import detectors.context as detectors_context  # noqa: E402
+import detectors.business_logic as detectors_business_logic  # noqa: E402
 
 
 def write(tmpdir: str, relpath: str, content: str) -> str:
@@ -78,6 +81,225 @@ class TextUtilsTests(unittest.TestCase):
         self.assertEqual(index.line_of(4), 2)  # start of "bbb"
         self.assertEqual(index.col_of(5), 1)   # second char of "bbb"
         self.assertEqual(index.line_of(len(text) - 1), 3)
+
+
+class StateWritePatternCacheTests(unittest.TestCase):
+    """detectors/context.py::_state_write_pattern / find_state_writes:
+    caching the compiled per-variable-name regex (perf optimization, see
+    docs/decisiones.md) must leave matching behavior byte-for-byte
+    unchanged and must actually reuse the compiled Pattern across repeated
+    requests for the same name."""
+
+    def _find(self, body: str, names):
+        index = preprocess.LineIndex(body)
+        return detectors_context.find_state_writes(body, 0, 0, names, index)
+
+    # --- A. matching behavior unchanged -------------------------------
+
+    def test_simple_identifier_write_is_detected(self):
+        writes, _ = self._find("balance = 10;", ["balance"])
+        self.assertEqual(writes, [1])
+
+    def test_underscore_prefixed_identifier_write_is_detected(self):
+        writes, _ = self._find("_owner = msg.sender;", ["_owner"])
+        self.assertEqual(writes, [1])
+
+    def test_array_indexed_write_is_detected(self):
+        writes, _ = self._find("balances[msg.sender] = 0;", ["balances"])
+        self.assertEqual(writes, [1])
+
+    def test_name_requiring_regex_escaping_is_detected(self):
+        # '$' is a valid character in a Solidity identifier but a regex
+        # metacharacter (end-of-string anchor). Uses the push/pop branch,
+        # which has no trailing \b after the name, so a correctly-escaped
+        # literal '$' is the only way this can match at all.
+        writes, _ = self._find("_reserve$.push(1);", ["_reserve$"])
+        self.assertEqual(writes, [1])
+
+    def test_unrelated_identifier_sharing_a_prefix_is_not_matched(self):
+        writes, _ = self._find("balanceOf = 10;", ["balance"])
+        self.assertEqual(writes, [])
+
+    def test_non_write_usage_is_not_matched(self):
+        writes, _ = self._find("return balance;", ["balance"])
+        self.assertEqual(writes, [])
+
+    def test_delete_statement_is_detected(self):
+        writes, _ = self._find("delete balance;", ["balance"])
+        self.assertEqual(writes, [1])
+
+    # --- B. cache reuse -------------------------------------------------
+
+    def test_repeated_calls_for_same_name_reuse_compiled_pattern(self):
+        detectors_context._state_write_pattern.cache_clear()
+        first = detectors_context._state_write_pattern("owner")
+        second = detectors_context._state_write_pattern("owner")
+        self.assertIs(first, second)
+        info = detectors_context._state_write_pattern.cache_info()
+        self.assertEqual(info.hits, 1)
+        self.assertEqual(info.misses, 1)
+
+    def test_different_names_produce_distinct_patterns(self):
+        detectors_context._state_write_pattern.cache_clear()
+        owner_pattern = detectors_context._state_write_pattern("owner")
+        balance_pattern = detectors_context._state_write_pattern("balance")
+        self.assertIsNot(owner_pattern, balance_pattern)
+
+    def test_find_state_writes_reuses_cache_across_separate_calls(self):
+        # Exercises find_state_writes itself, not the helper directly:
+        # calling it twice for the same variable name must not add a
+        # second cache miss.
+        detectors_context._state_write_pattern.cache_clear()
+        body = "balance = 1;"
+        index = preprocess.LineIndex(body)
+        detectors_context.find_state_writes(body, 0, 0, ["balance"], index)
+        misses_after_first = detectors_context._state_write_pattern.cache_info().misses
+        detectors_context.find_state_writes(body, 0, 0, ["balance"], index)
+        misses_after_second = detectors_context._state_write_pattern.cache_info().misses
+        self.assertEqual(misses_after_first, misses_after_second)
+
+
+class WriteOperatorAndExcludedLinesCacheTests(unittest.TestCase):
+    """detectors/business_logic.py::_compiled_pattern_for_name, and its two
+    callers _write_operator_kinds / _excluded_write_lines: caching the
+    compiled (template, name) regex must leave matching behavior
+    byte-for-byte unchanged and must actually reuse the compiled Pattern
+    across repeated requests for the same (template, name) pair."""
+
+    @staticmethod
+    def _fn(body: str, mutability: str = "nonpayable", body_start: int = 0) -> Dict[str, Any]:
+        return {"_body": body, "_bodyStart": body_start, "mutability": mutability}
+
+    # --- A. matching behavior unchanged: _excluded_write_lines ----------
+
+    def test_self_scoped_msg_sender_write_is_excluded(self):
+        lines = detectors_business_logic._excluded_write_lines(
+            self._fn("credits[msg.sender] -= amount;"), "credits", preprocess.LineIndex("credits[msg.sender] -= amount;")
+        )
+        self.assertEqual(lines, {1})
+
+    def test_payable_funded_write_is_excluded_only_when_payable(self):
+        body = "totalDeposits += msg.value;"
+        index = preprocess.LineIndex(body)
+        payable_lines = detectors_business_logic._excluded_write_lines(self._fn(body, mutability="payable"), "totalDeposits", index)
+        self.assertEqual(payable_lines, {1})
+        nonpayable_lines = detectors_business_logic._excluded_write_lines(self._fn(body, mutability="nonpayable"), "totalDeposits", index)
+        self.assertEqual(nonpayable_lines, set())
+
+    def test_write_indexed_by_arbitrary_parameter_is_not_excluded(self):
+        body = "balances[to] += amount;"
+        lines = detectors_business_logic._excluded_write_lines(self._fn(body), "balances", preprocess.LineIndex(body))
+        self.assertEqual(lines, set())
+
+    # --- A. matching behavior unchanged: _write_operator_kinds -----------
+
+    def test_relative_write_operator_kind(self):
+        kinds = detectors_business_logic._write_operator_kinds(self._fn("x += 1;"), "x")
+        self.assertEqual(kinds, {"relative": True, "absolute": False, "safeReset": False})
+
+    def test_disguised_relative_write_operator_kind(self):
+        # x = x + amount is a disguised increment, not an absolute overwrite -
+        # exercises the newly-cached bare r"\b{name}\b" self-reference check.
+        kinds = detectors_business_logic._write_operator_kinds(self._fn("x = x + amount;"), "x")
+        self.assertEqual(kinds, {"relative": True, "absolute": False, "safeReset": False})
+
+    def test_nonzero_absolute_overwrite_operator_kind(self):
+        kinds = detectors_business_logic._write_operator_kinds(self._fn("x = 5;"), "x")
+        self.assertEqual(kinds, {"relative": False, "absolute": True, "safeReset": False})
+
+    def test_zero_overwrite_with_closeout_signal_is_safe_reset(self):
+        kinds = detectors_business_logic._write_operator_kinds(self._fn("uint256 amt = x; x = 0;"), "x")
+        self.assertEqual(kinds, {"relative": False, "absolute": False, "safeReset": True})
+
+    def test_zero_overwrite_without_closeout_signal_is_absolute(self):
+        kinds = detectors_business_logic._write_operator_kinds(self._fn("x = 0;"), "x")
+        self.assertEqual(kinds, {"relative": False, "absolute": True, "safeReset": False})
+
+    # --- B/C. cache reuse and independence -------------------------------
+
+    def test_repeated_calls_for_same_template_and_name_reuse_compiled_pattern(self):
+        detectors_business_logic._compiled_pattern_for_name.cache_clear()
+        first = detectors_business_logic._compiled_pattern_for_name(detectors_business_logic.RELATIVE_WRITE_RE_TEMPLATE, "owner")
+        second = detectors_business_logic._compiled_pattern_for_name(detectors_business_logic.RELATIVE_WRITE_RE_TEMPLATE, "owner")
+        self.assertIs(first, second)
+        info = detectors_business_logic._compiled_pattern_for_name.cache_info()
+        self.assertEqual(info.hits, 1)
+        self.assertEqual(info.misses, 1)
+
+    def test_different_names_produce_distinct_patterns(self):
+        detectors_business_logic._compiled_pattern_for_name.cache_clear()
+        owner_pattern = detectors_business_logic._compiled_pattern_for_name(detectors_business_logic.ABSOLUTE_WRITE_RE_TEMPLATE, "owner")
+        balance_pattern = detectors_business_logic._compiled_pattern_for_name(detectors_business_logic.ABSOLUTE_WRITE_RE_TEMPLATE, "balance")
+        self.assertIsNot(owner_pattern, balance_pattern)
+
+    def test_different_templates_for_same_name_produce_distinct_patterns(self):
+        detectors_business_logic._compiled_pattern_for_name.cache_clear()
+        relative_pattern = detectors_business_logic._compiled_pattern_for_name(detectors_business_logic.RELATIVE_WRITE_RE_TEMPLATE, "x")
+        absolute_pattern = detectors_business_logic._compiled_pattern_for_name(detectors_business_logic.ABSOLUTE_WRITE_RE_TEMPLATE, "x")
+        self.assertIsNot(relative_pattern, absolute_pattern)
+
+    def test_write_operator_kinds_reuses_cache_across_separate_calls(self):
+        detectors_business_logic._compiled_pattern_for_name.cache_clear()
+        fn = self._fn("x += 1;")
+        detectors_business_logic._write_operator_kinds(fn, "x")
+        misses_after_first = detectors_business_logic._compiled_pattern_for_name.cache_info().misses
+        detectors_business_logic._write_operator_kinds(fn, "x")
+        misses_after_second = detectors_business_logic._compiled_pattern_for_name.cache_info().misses
+        self.assertEqual(misses_after_first, misses_after_second)
+
+
+class HasCloseoutSignalCacheTests(unittest.TestCase):
+    """detectors/business_logic.py::_has_closeout_signal: reusing the
+    existing _compiled_pattern_for_name cache (Optimization #2) for the
+    bare r"\\b{name}\\b" self-reference scan must leave its read-then-clear
+    detection byte-for-byte unchanged."""
+
+    def test_reference_outside_write_span_is_closeout_signal(self):
+        body = "uint256 amt = x; x = 0;"
+        match = re.search(r"x\s*=\s*0;", body)
+        self.assertTrue(detectors_business_logic._has_closeout_signal(body, "x", match))
+
+    def test_no_reference_outside_write_span_is_not_closeout_signal(self):
+        body = "x = 0;"
+        match = re.search(r"x\s*=\s*0;", body)
+        self.assertFalse(detectors_business_logic._has_closeout_signal(body, "x", match))
+
+    def test_name_requiring_regex_escaping_is_detected(self):
+        # '$' is a valid (mid-identifier) Solidity identifier character but
+        # a regex metacharacter (end-of-string anchor). Placed mid-name, not
+        # at the end, so the match still has a normal trailing \b - an
+        # unescaped '$' here would make everything after it in the pattern
+        # only matchable at true end-of-string, so this can only pass if
+        # re.escape actually ran.
+        body = "uint256 amt = re$erve; re$erve = 0;"
+        match = re.search(r"re\$erve\s*=\s*0;", body)
+        self.assertTrue(detectors_business_logic._has_closeout_signal(body, "re$erve", match))
+
+    def test_multiple_outside_occurrences_still_signal_closeout(self):
+        body = "uint256 a = x; uint256 b = x; x = 0;"
+        match = re.search(r"x\s*=\s*0;", body)
+        self.assertTrue(detectors_business_logic._has_closeout_signal(body, "x", match))
+
+    def test_unrelated_identifier_sharing_a_prefix_is_not_a_reference(self):
+        body = "xOffset = 5; x = 0;"
+        match = re.search(r"x\s*=\s*0;", body)
+        self.assertFalse(detectors_business_logic._has_closeout_signal(body, "x", match))
+
+    def test_reuses_existing_compiled_pattern_for_name_cache(self):
+        detectors_business_logic._compiled_pattern_for_name.cache_clear()
+        template = r"\b{name}\b"
+        body = "uint256 amt = balance; balance = 0;"
+        match = re.search(r"balance\s*=\s*0;", body)
+        detectors_business_logic._has_closeout_signal(body, "balance", match)
+        misses_after_first = detectors_business_logic._compiled_pattern_for_name.cache_info().misses
+        detectors_business_logic._has_closeout_signal(body, "balance", match)
+        misses_after_second = detectors_business_logic._compiled_pattern_for_name.cache_info().misses
+        self.assertEqual(misses_after_first, misses_after_second)
+        # Same (template, name) pair _write_operator_kinds itself would use -
+        # confirms this call site shares the ONE existing cache, not a second one.
+        direct = detectors_business_logic._compiled_pattern_for_name(template, "balance")
+        self.assertEqual(detectors_business_logic._compiled_pattern_for_name.cache_info().misses, misses_after_second)
+        self.assertTrue(direct.match("balance"))
 
 
 class BundleParsingTests(unittest.TestCase):
@@ -1629,6 +1851,106 @@ class MultiContractTests(unittest.TestCase):
             self.assertIn("MISSING_IMPORT", codes)
             self.assertIn("UNRESOLVED_BASE", codes)
             self.assertEqual(artifact["completeness"]["status"], "partial")
+
+
+class ImportClassificationDedupTests(unittest.TestCase):
+    """preprocess.py::build_artifact() (Optimization #4, docs/decisiones.md):
+    each import is classified exactly once and the result is reused for
+    both import_records and resolve_bases() - classify_import() itself is
+    unchanged."""
+
+    def test_classify_import_called_once_per_import_not_twice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "Base.sol", "pragma solidity 0.8.20;\ncontract Base {}\n")
+            write(tmp, "Child.sol", (
+                'pragma solidity 0.8.20;\n'
+                'import "./Base.sol";\n'
+                'import "./Missing.sol";\n'
+                'import "@openzeppelin/contracts/Ownable.sol";\n'
+                'contract Child is Base {}\n'
+            ))
+            with mock.patch("preprocess.classify_import", wraps=preprocess.classify_import) as spy:
+                run_paths([tmp])
+            self.assertEqual(spy.call_count, 3)  # 3 imports total, each classified exactly once
+
+    def test_relative_resolved_import_record_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "Base.sol", "pragma solidity 0.8.20;\ncontract Base {}\n")
+            write(tmp, "Child.sol", 'pragma solidity 0.8.20;\nimport "./Base.sol";\ncontract Child is Base {}\n')
+            artifact = run_paths([tmp])
+            records = [r for r in artifact["imports"] if r["file"] == "Child.sol"]
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["shape"], "relative")
+            self.assertTrue(records[0]["resolved"])
+            self.assertEqual(records[0]["resolvedTo"], "Base.sol")
+
+    def test_relative_unresolved_import_record_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "Child.sol", 'pragma solidity 0.8.20;\nimport "./Missing.sol";\ncontract Child {}\n')
+            artifact = run_paths([tmp])
+            records = artifact["imports"]
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["shape"], "relative")
+            self.assertFalse(records[0]["resolved"])
+            self.assertIsNone(records[0]["resolvedTo"])
+
+    def test_absolute_local_resolved_import_record_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "Base.sol", "pragma solidity 0.8.20;\ncontract Base {}\n")
+            write(tmp, "Child.sol", 'pragma solidity 0.8.20;\nimport "Base.sol";\ncontract Child is Base {}\n')
+            artifact = run_paths([tmp])
+            records = [r for r in artifact["imports"] if r["file"] == "Child.sol"]
+            self.assertEqual(records[0]["shape"], "absolute-local")
+            self.assertTrue(records[0]["resolved"])
+
+    def test_package_import_record_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "Child.sol", 'pragma solidity 0.8.20;\nimport "@openzeppelin/contracts/Ownable.sol";\ncontract Child {}\n')
+            artifact = run_paths([tmp])
+            records = artifact["imports"]
+            self.assertEqual(records[0]["shape"], "package")
+            self.assertFalse(records[0]["resolved"])
+
+    def test_multiple_imports_all_present_and_correctly_ordered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "Base.sol", "pragma solidity 0.8.20;\ncontract Base {}\n")
+            write(tmp, "Child.sol", (
+                'pragma solidity 0.8.20;\n'
+                'import "./Base.sol";\n'
+                'import "./Missing.sol";\n'
+                'import "@openzeppelin/contracts/Ownable.sol";\n'
+                'contract Child is Base {}\n'
+            ))
+            artifact = run_paths([tmp])
+            records = [r for r in artifact["imports"] if r["file"] == "Child.sol"]
+            self.assertEqual(len(records), 3)
+            self.assertEqual([r["path"] for r in records], ["./Base.sol", "./Missing.sol", "@openzeppelin/contracts/Ownable.sol"])
+            self.assertEqual([r["shape"] for r in records], ["relative", "relative", "package"])
+            self.assertEqual([r["resolved"] for r in records], [True, False, False])
+
+    def test_downstream_base_resolution_unchanged_with_mixed_imports(self):
+        # A base resolves from the bundle even when the same file also has
+        # an unresolved relative import and a package import alongside it -
+        # resolve_bases() must see the complete, correctly-classified list.
+        with tempfile.TemporaryDirectory() as tmp:
+            write(tmp, "Base.sol", "pragma solidity 0.8.20;\ncontract Base {}\n")
+            write(tmp, "Child.sol", (
+                'pragma solidity 0.8.20;\n'
+                'import "./Base.sol";\n'
+                'import "./Missing.sol";\n'
+                'import "@openzeppelin/contracts/Ownable.sol";\n'
+                'contract Child is Base {}\n'
+            ))
+            artifact = run_paths([tmp])
+            child = next(c for c in artifact["contracts"] if c["name"] == "Child")
+            self.assertEqual([b["name"] for b in child["basesResolved"]], ["Base"])
+            self.assertEqual(child["basesUnresolved"], [])
+
+    def test_empty_import_path_retains_unknown_shape(self):
+        # classify_import() itself is unchanged by this optimization; a
+        # falsy import_path must still classify as shape="unknown".
+        result = preprocess.classify_import(None, "Child.sol", {})
+        self.assertEqual(result, {"path": None, "shape": "unknown", "resolved": False, "resolvedTo": None})
 
 
 class SystemGraphTests(unittest.TestCase):

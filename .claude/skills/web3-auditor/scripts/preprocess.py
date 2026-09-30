@@ -1905,8 +1905,10 @@ def build_artifact(
             file_record["parseConfidence"] = confidence
             file_record["pragma"] = entry["structure"]["pragma"]
 
+            file_imports_classified = []
             for imp in entry["structure"]["imports"]:
                 classified = classify_import(imp["path"], path, known_paths)
+                file_imports_classified.append(classified)
                 record = {"file": path, "line": imp["line"], "shape": classified["shape"], "path": imp["path"], "resolved": classified["resolved"], "resolvedTo": classified["resolvedTo"], "symbols": imp.get("symbols", []), "alias": imp.get("alias")}
                 import_records.append(record)
 
@@ -1920,8 +1922,6 @@ def build_artifact(
             for call in calls:
                 call["file"] = path
             all_calls.extend(calls)
-
-            file_imports_classified = [classify_import(imp["path"], path, known_paths) for imp in entry["structure"]["imports"]]
             for contract in entry["structure"]["contracts"]:
                 bases_resolution = resolve_bases(contract, file_imports_classified, declared_types)
                 for item in bases_resolution["unresolved"]:

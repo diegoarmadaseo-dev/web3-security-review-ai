@@ -19,6 +19,7 @@ already established for initializers specifically.
 """
 from __future__ import annotations
 
+import functools
 import re
 from typing import Any, Dict, List
 
@@ -64,6 +65,23 @@ ABSOLUTE_WRITE_RE_TEMPLATE = r"\b{name}\b\s*(?:\[[^\]]*\])*(?:\.\w+)*\s*=(?!=)\s
 ZERO_LITERAL_RE = re.compile(r"^(0+|0x0+)$")
 
 
+@functools.lru_cache(maxsize=2048)
+def _compiled_pattern_for_name(template: str, name: str) -> "re.Pattern[str]":
+    """Compiled regex for one (template, variable-name) pair, cached.
+
+    `template` is one of this module's own {name}-parameterized write-shape
+    templates (SELF_SCOPED_WRITE_RE_TEMPLATE, PAYABLE_FUNDED_WRITE_RE_TEMPLATE,
+    RELATIVE_WRITE_RE_TEMPLATE, ABSOLUTE_WRITE_RE_TEMPLATE, or the bare
+    r"\\b{name}\\b" self-reference check) - a pure function of the pair, so
+    recompiling the same (template, name) combination for every function it
+    is checked against is pure waste, the same class of cost
+    find_state_writes (context.py) had before its own cache. maxsize=2048
+    mirrors that same bound: comfortably covers every distinct name in one
+    job (574 state variables in the fixture used to measure this) while
+    staying bounded in a long-lived process."""
+    return re.compile(template.format(name=re.escape(name)))
+
+
 def _excluded_write_lines(fn: Dict[str, Any], name: str, line_index: Any) -> set:
     """Lines where `fn` writes `name` in one of the two structural shapes
     D-047 excludes: indexed by msg.sender (the index IS the caller's own
@@ -80,10 +98,10 @@ def _excluded_write_lines(fn: Dict[str, Any], name: str, line_index: Any) -> set
     body = fn["_body"]
     base_offset = fn["_bodyStart"] + 1
     lines: set = set()
-    for match in re.finditer(SELF_SCOPED_WRITE_RE_TEMPLATE.format(name=re.escape(name)), body):
+    for match in _compiled_pattern_for_name(SELF_SCOPED_WRITE_RE_TEMPLATE, name).finditer(body):
         lines.add(line_index.line_of(base_offset + match.start()))
     if fn.get("mutability") == "payable":
-        for match in re.finditer(PAYABLE_FUNDED_WRITE_RE_TEMPLATE.format(name=re.escape(name)), body):
+        for match in _compiled_pattern_for_name(PAYABLE_FUNDED_WRITE_RE_TEMPLATE, name).finditer(body):
             lines.add(line_index.line_of(base_offset + match.start()))
     return lines
 
@@ -384,7 +402,7 @@ def _has_closeout_signal(body: str, name: str, match: Any) -> bool:
     positive count."""
     return any(
         not (match.start() <= m.start() < match.end())
-        for m in re.finditer(r"\b" + re.escape(name) + r"\b", body)
+        for m in _compiled_pattern_for_name(r"\b{name}\b", name).finditer(body)
     )
 
 
@@ -404,12 +422,12 @@ def _write_operator_kinds(fn: Dict[str, Any], name: str) -> Dict[str, bool]:
     unexpected operator change is never hidden just because it happens to
     assign zero."""
     body = fn["_body"]
-    has_relative = bool(re.search(RELATIVE_WRITE_RE_TEMPLATE.format(name=re.escape(name)), body))
+    has_relative = bool(_compiled_pattern_for_name(RELATIVE_WRITE_RE_TEMPLATE, name).search(body))
     has_absolute = False
     has_safe_reset = False
-    for match in re.finditer(ABSOLUTE_WRITE_RE_TEMPLATE.format(name=re.escape(name)), body):
+    for match in _compiled_pattern_for_name(ABSOLUTE_WRITE_RE_TEMPLATE, name).finditer(body):
         rhs = match.group(1).strip()
-        if re.search(r"\b" + re.escape(name) + r"\b", rhs):
+        if _compiled_pattern_for_name(r"\b{name}\b", name).search(rhs):
             has_relative = True
             continue
         if ZERO_LITERAL_RE.match(rhs) and _has_closeout_signal(body, name, match):

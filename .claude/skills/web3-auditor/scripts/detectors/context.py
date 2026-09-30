@@ -18,6 +18,7 @@ preprocess.py output diff that verified this.
 """
 from __future__ import annotations
 
+import functools
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -121,13 +122,30 @@ def is_reentrancy_guarded(fn: Dict[str, Any]) -> bool:
     return bool(re.search(r"_nonReentrantBefore|_status\s*=\s*_?ENTERED|locked\s*=\s*true|require\s*\(\s*!\s*locked|_reentrancyGuardEntered|ReentrancyGuard", body))
 
 
+@functools.lru_cache(maxsize=2048)
+def _state_write_pattern(name: str) -> "re.Pattern[str]":
+    """Compiled state-write regex for one variable name.
+
+    A pure function of `name` alone - callers across context.py,
+    business_logic.py and access_control.py re-derive the same pattern for
+    the same name repeatedly (once per function it is checked against, per
+    detector). Profiling a 7,548-effLOC/129-file fixture measured 34,613
+    re.compile calls (~3.27s, ~42% of total preprocessing time) with this
+    exact call site as the dominant source. maxsize=2048 comfortably covers
+    every distinct state-variable name in a single job (574 state variables
+    total, well under 2048 even before accounting for name reuse across
+    contracts) while keeping worst-case memory bounded in a long-lived
+    process, rather than caching unboundedly."""
+    return re.compile(r"\b" + re.escape(name) + r"\b(\s*\[[^\]]*\])*(\s*\.\w+)*\s*(=(?!=)|\+=|-=|\*=|/=|\|=|&=|\+\+|--)|\bdelete\s+" + re.escape(name) + r"\b|\b" + re.escape(name) + r"\s*\.\s*(push|pop)\s*\(")
+
+
 def find_state_writes(body: str, body_start: int, after_offset: int, state_names: List[str], line_index: LineIndex) -> Tuple[List[int], List[str]]:
     writes: List[int] = []
     internal_calls: List[str] = []
     rel = after_offset - body_start
     tail = body[rel:]
     for name in state_names:
-        pattern = re.compile(r"\b" + re.escape(name) + r"\b(\s*\[[^\]]*\])*(\s*\.\w+)*\s*(=(?!=)|\+=|-=|\*=|/=|\|=|&=|\+\+|--)|\bdelete\s+" + re.escape(name) + r"\b|\b" + re.escape(name) + r"\s*\.\s*(push|pop)\s*\(")
+        pattern = _state_write_pattern(name)
         for match in pattern.finditer(tail):
             writes.append(line_index.line_of(after_offset + match.start()))
     for match in INTERNAL_STATE_CALL_RE.finditer(tail):

@@ -993,6 +993,144 @@ class JobSubmitAuthorizationTests(_WorkspaceStorageTestCase):
         self.assertEqual(status, 403)
 
 
+class JobSubmitBodySizeTests(_WorkspaceStorageTestCase):
+    """The route-specific body-size fix: _read_body() now takes an optional
+    max_body_bytes (default MAX_BODY_BYTES, 64 KiB), and _handle_job_submit()
+    is the only caller passing the larger JOB_SUBMIT_MAX_BODY_BYTES so its
+    body can actually reach the MAX_RAW_SOURCE_BYTES check instead of being
+    rejected by the generic gate first (the bug this fix corrects - every
+    case here failed differently, or not at all, before it).
+
+    Every 413 case asserts the exact "error" message, not just the status
+    code: "request body too large" is the generic _read_body() gate,
+    "source exceeds the maximum submission size" is the source-specific
+    MAX_RAW_SOURCE_BYTES gate below it - the two layers this fix makes both
+    reachable and observably distinguishable."""
+
+    def _workspace_with_pro_plan(self, email):
+        cookie = self.request_and_confirm_login(email)
+        conn = repo.connect(self.db_path)
+        user_id = repo.get_user_by_email(conn, email)["id"]
+        workspace_id = repo.create_workspace(conn, "Body Size WS", user_id)
+        repo.create_entitlement(conn, workspace_id, "pro", "active")
+        conn.close()
+        return cookie, workspace_id
+
+    def _raw_post(self, path, body, headers=None):
+        conn = self._conn()
+        hdrs = {"Content-Type": "application/json", "Content-Length": str(len(body)), "Host": self.host_header, "Origin": self.same_origin}
+        _apply_header_overrides(hdrs, headers)
+        conn.request("POST", path, body=body, headers=hdrs)
+        resp = conn.getresponse()
+        data = resp.read()
+        conn.close()
+        return resp.status, data
+
+    def test_sibling_generic_endpoint_still_rejects_over_64kib(self):
+        # /workspaces (_handle_workspace_create) never passes max_body_bytes
+        # - proves the fix is route-specific, not a global loosening, on a
+        # SECOND generic endpoint besides the pre-existing /auth/request-link
+        # coverage (RequestLinkTests.test_oversized_body_returns_413).
+        body = b"x" * (http_app.MAX_BODY_BYTES + 1)
+        status, data = self._raw_post("/workspaces", body)
+        self.assertEqual(status, 413)
+        self.assertEqual(json.loads(data)["error"], "request body too large")
+
+    def test_job_submit_body_just_under_job_budget_clears_the_body_gate(self):
+        # Deliberately unauthenticated: both size checks in
+        # _handle_job_submit() run BEFORE the auth check (verified by
+        # reading the function top to bottom), so a clean 401 here proves
+        # the request cleared BOTH size gates and reached the auth layer.
+        #
+        # An unrelated, ignored field (not "source" itself) supplies the
+        # padding - _handle_job_submit() only ever reads payload["mode"],
+        # payload["source"] and payload["idempotency_key"], so any other
+        # key is inert. This isolates "did the BODY clear _read_body()'s
+        # gate" from "was source small enough", which unescaped padding
+        # INSIDE source cannot do: JOB_SUBMIT_MAX_BODY_BYTES is sized for
+        # worst-case JSON-escaping overhead (2x), so a body that size made
+        # entirely of unescaped source characters decodes to a source
+        # longer than MAX_RAW_SOURCE_BYTES and would (correctly) be
+        # rejected by the source-specific check instead - proving this
+        # test needs the two concerns kept separate, exactly as intended.
+        small_source = "contract A {}"
+        envelope = {"mode": "pro", "source": small_source, "note": ""}
+        overhead = len(json.dumps(envelope).encode("utf-8"))
+        padding_len = http_app.JOB_SUBMIT_MAX_BODY_BYTES - overhead - 16  # margin, stays under the budget
+        envelope["note"] = "x" * padding_len
+        body = json.dumps(envelope).encode("utf-8")
+        self.assertLess(len(body), http_app.JOB_SUBMIT_MAX_BODY_BYTES)
+        status, data = self._raw_post("/workspaces/does-not-matter/jobs", body)
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(data)["error"], "authentication required")
+
+    def test_job_submit_oversized_source_rejected_by_source_specific_check(self):
+        source = "x" * (http_app.MAX_RAW_SOURCE_BYTES + 1)
+        body = json.dumps({"mode": "pro", "source": source}).encode("utf-8")
+        # Confirms the body itself clears the generic gate, so the 413
+        # below can only be coming from the source-specific check.
+        self.assertLessEqual(len(body), http_app.JOB_SUBMIT_MAX_BODY_BYTES)
+        status, data = self._raw_post("/workspaces/does-not-matter/jobs", body)
+        self.assertEqual(status, 413)
+        self.assertEqual(json.loads(data)["error"], "source exceeds the maximum submission size")
+
+    def test_job_submit_body_over_job_budget_rejected_by_generic_gate(self):
+        body = b"x" * (http_app.JOB_SUBMIT_MAX_BODY_BYTES + 1)
+        status, data = self._raw_post("/workspaces/does-not-matter/jobs", body)
+        self.assertEqual(status, 413)
+        self.assertEqual(json.loads(data)["error"], "request body too large")
+
+    def test_job_submit_source_near_max_raw_source_bytes_succeeds_end_to_end(self):
+        # Comfortably above the OLD 64 KiB ceiling this fix removes for job
+        # submission, and comfortably under MAX_RAW_SOURCE_BYTES - a real
+        # authenticated, entitled submission that the pre-fix code could
+        # never have accepted (it would have died in _read_body() first).
+        cookie, workspace_id = self._workspace_with_pro_plan("body-size-1@example.com")
+        source = "x" * (http_app.MAX_RAW_SOURCE_BYTES - 64)
+        status, _, body = self.post_json(
+            "/workspaces/%s/jobs" % workspace_id, {"mode": "pro", "source": source}, headers={"Cookie": cookie}
+        )
+        self.assertEqual(status, 200, body)
+        self.assertTrue(json.loads(body)["ok"])
+
+    def test_job_submit_nonascii_source_near_max_raw_source_bytes_succeeds(self):
+        # Exercises the actual JSON-escaping edge case JOB_SUBMIT_MAX_BODY_BYTES
+        # is sized for: a source made of 2-byte UTF-8 characters (accented
+        # text, plausible in a non-English NatSpec comment - not a
+        # synthetic edge case), sent through the SAME json.dumps(payload)
+        # call post_json() always uses (no ensure_ascii=False - Python's
+        # default ensure_ascii=True applies, \uXXXX-escaping every such
+        # character to 3x its decoded size). The prior 2x budget rejected
+        # this at the generic body gate even though the decoded source
+        # itself is within MAX_RAW_SOURCE_BYTES; the 6x budget must accept it.
+        cookie, workspace_id = self._workspace_with_pro_plan("body-size-2@example.com")
+        source = "é" * ((http_app.MAX_RAW_SOURCE_BYTES // 2) - 32)  # e-acute, 2 UTF-8 bytes each
+        self.assertLess(len(source.encode("utf-8")), http_app.MAX_RAW_SOURCE_BYTES)
+        status, _, body = self.post_json(
+            "/workspaces/%s/jobs" % workspace_id, {"mode": "pro", "source": source}, headers={"Cookie": cookie}
+        )
+        self.assertEqual(status, 200, body)
+        self.assertTrue(json.loads(body)["ok"])
+
+    def test_job_submit_control_character_source_near_max_raw_source_bytes_succeeds(self):
+        # The proven worst case the 6x bound is sized for: a JSON control
+        # character (U+0001, no short escape) that RFC 8259 requires every
+        # conformant encoder to escape as `\u0001` (6 bytes for 1 decoded
+        # byte) regardless of ensure_ascii - the single character class
+        # that makes 2x (and even 3x) provably insufficient. The decoded
+        # source stays strictly under MAX_RAW_SOURCE_BYTES - this proves
+        # the BODY gate now has enough room for it, not that the
+        # source-size check was weakened or bypassed.
+        cookie, workspace_id = self._workspace_with_pro_plan("body-size-3@example.com")
+        source = "\u0001" * (http_app.MAX_RAW_SOURCE_BYTES - 32)
+        self.assertLess(len(source.encode("utf-8")), http_app.MAX_RAW_SOURCE_BYTES)
+        status, _, body = self.post_json(
+            "/workspaces/%s/jobs" % workspace_id, {"mode": "pro", "source": source}, headers={"Cookie": cookie}
+        )
+        self.assertEqual(status, 200, body)
+        self.assertTrue(json.loads(body)["ok"])
+
+
 class JobReadTests(_WorkspaceStorageTestCase):
     def _seed_workspace_with_job(self, email):
         cookie = self.request_and_confirm_login(email)
