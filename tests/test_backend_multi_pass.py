@@ -556,6 +556,69 @@ class DeadlineTests(unittest.TestCase):
         self.assertEqual(len(provider.calls), 1)
 
 
+def _draft_without_not_assessed(finding_files=()):
+    """A valid partial pass draft whose categories were all assessed within
+    its primary files (DETECTED / NOT_DETECTED only, no NOT_ASSESSED)."""
+    draft = _valid_draft(finding_files)
+    draft["categoryCoverage"][0]["status"] = "NOT_DETECTED"
+    assert "NOT_ASSESSED" not in [c["status"] for c in draft["categoryCoverage"]]
+    return draft
+
+
+class _AllAssessedProvider(ScriptedProvider):
+    def complete(self, prompt, max_output_tokens, timeout_seconds):
+        index = _pass_index(prompt)
+        self.calls.append({"pass": index, "prompt": prompt, "timeout_seconds": timeout_seconds})
+        queue = self.script.get(index)
+        response = queue.pop(0) if queue else _draft_without_not_assessed(_primary_files(prompt)[:1])
+        if isinstance(response, Exception):
+            raise response
+        return json.dumps(response)
+
+
+class _WorkerCounters(_Counters):
+    """The worker's per-pass validator (backend/worker_entrypoint.py):
+    score + validate without rule R-05 (docs/decisiones.md D-098)."""
+
+    def validator(self, draft):
+        self.validate_pass += 1
+        return validate_report(score_report(draft), enforce_partial_coverage_rule=False)
+
+
+class R05GlobalOnlyTests(unittest.TestCase):
+    """R-05 applies to the merged report the pipeline validates and renders,
+    not to each intermediate pass draft (docs/decisiones.md D-098)."""
+
+    def setUp(self):
+        self.art = _art()
+        self.budget = _budget_for(self.art, V1, 3)
+
+    def test_passes_without_not_assessed_succeed_and_a_complete_report_keeps_not_detected(self):
+        result, counters = _run(self.art, self.budget, _AllAssessedProvider(), counters=_WorkerCounters())
+        self.assertEqual([p["status"] for p in result["multiPass"]["passes"]], [mp.PASS_SUCCESS] * 3)
+        self.assertEqual((counters.pipeline, counters.render), (1, 1))
+        report = result["scoredReport"]
+        self.assertEqual(report["scope"]["completeness"], "complete")
+        statuses = {c["category"]: c["status"] for c in report["categoryCoverage"]}
+        self.assertNotIn("NOT_ASSESSED", statuses.values())  # every pass assessed every category
+        self.assertEqual(statuses["SC01"], "NOT_DETECTED")
+
+    def test_global_partial_report_still_satisfies_r05(self):
+        err = llm_client.ProviderError("provider call failed: Timeout")
+        result, counters = _run(self.art, self.budget, _AllAssessedProvider({2: [err, err, err]}), counters=_WorkerCounters())
+        report = result["scoredReport"]
+        self.assertEqual(report["scope"]["completeness"], "partial")
+        self.assertIn("NOT_ASSESSED", [c["status"] for c in report["categoryCoverage"]])
+        self.assertEqual(validate_report(report), [])  # R-05 enforced on the rendered report, and satisfied
+        self.assertEqual(counters.render, 1)
+
+    def test_with_r05_on_each_pass_the_same_drafts_fail(self):
+        # The previous per-pass behaviour, kept by validate_report's default.
+        with self.assertRaises(llm_client.Step6Failed) as ctx:
+            _run(self.art, self.budget, _AllAssessedProvider(), counters=_Counters())
+        self.assertIn("R-05", str(ctx.exception))
+
+
 class _FakeSdkTimeout(Exception):
     pass
 

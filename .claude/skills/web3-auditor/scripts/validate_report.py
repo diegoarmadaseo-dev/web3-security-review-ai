@@ -289,7 +289,17 @@ def _validate_architecture_notes(notes: Any, errors: ErrorCollector) -> None:
         errors.require(not unknown, "%s has unknown fields: %s" % (path, sorted(unknown)))
 
 
-def validate_report(report: Any) -> List[str]:
+def validate_report(report: Any, *, enforce_partial_coverage_rule: bool = True) -> List[str]:
+    """Validates a report and returns every error found.
+
+    enforce_partial_coverage_rule (default True) applies rule R-05, which
+    protects the final, rendered report: a "partial" or "failed" analysis
+    must carry at least one NOT_ASSESSED category. Every normal caller
+    keeps the default. The only caller that passes False validates an
+    intermediate multi-pass draft, whose "partial" means "this pass covers
+    only part of the submission", not "a category could not be assessed";
+    R-05 is applied later to the merged report that is actually rendered.
+    No other rule is affected by this flag."""
     if not isinstance(report, dict):
         raise ReportValidationError("report must be a JSON object")
 
@@ -347,7 +357,7 @@ def validate_report(report: Any) -> List[str]:
                 "(rule R-04: it must be 'DETECTED')" % (category, status)
             )
 
-    if completeness in ("partial", "failed"):
+    if enforce_partial_coverage_rule and completeness in ("partial", "failed"):
         if coverage_by_category and "NOT_ASSESSED" not in coverage_by_category.values():
             errors.add(
                 "scope.completeness is %r but no categoryCoverage entry is 'NOT_ASSESSED' "

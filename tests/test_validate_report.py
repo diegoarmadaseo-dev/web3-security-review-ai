@@ -187,6 +187,82 @@ class BusinessRuleTests(unittest.TestCase):
         self.assertTrue(any("R-09" in e for e in errors))
 
 
+class PartialCoverageRuleFlagTests(unittest.TestCase):
+    """enforce_partial_coverage_rule (docs/decisiones.md D-098): False skips
+    ONLY rule R-05 - used for intermediate multi-pass drafts; the default
+    keeps every existing caller (single-pass, global report, CLI) exactly as
+    before."""
+
+    def setUp(self):
+        self.report = make_valid_report()
+
+    def _partial_without_not_assessed(self):
+        report = copy.deepcopy(self.report)
+        report["scope"]["completeness"] = "partial"
+        return report
+
+    def test_default_still_rejects_partial_without_not_assessed(self):
+        report = self._partial_without_not_assessed()
+        for errors in (validate_report.validate_report(report),
+                       validate_report.validate_report(report, enforce_partial_coverage_rule=True)):
+            self.assertEqual(len(errors), 1)
+            self.assertIn("R-05", errors[0])
+
+    def test_flag_off_accepts_partial_or_failed_without_not_assessed(self):
+        for completeness in ("partial", "failed"):
+            with self.subTest(completeness=completeness):
+                report = copy.deepcopy(self.report)
+                report["scope"]["completeness"] = completeness
+                self.assertEqual(validate_report.validate_report(report, enforce_partial_coverage_rule=False), [])
+
+    def test_complete_with_not_detected_is_unchanged(self):
+        self.assertIn("NOT_DETECTED", [c["status"] for c in self.report["categoryCoverage"]])
+        self.assertEqual(validate_report.validate_report(self.report), [])
+        self.assertEqual(validate_report.validate_report(self.report, enforce_partial_coverage_rule=False), [])
+
+    def test_flag_off_removes_only_r05_from_any_error_list(self):
+        broken = []
+        r04 = self._partial_without_not_assessed()
+        r04["categoryCoverage"][0]["status"] = "NOT_DETECTED"             # R-04
+        broken.append(r04)
+        missing = self._partial_without_not_assessed()
+        del missing["limitations"]                                        # required field
+        broken.append(missing)
+        bad_location = self._partial_without_not_assessed()
+        bad_location["findings"][0]["locations"] = [{"file": ""}]         # location shape
+        broken.append(bad_location)
+        bad_enum = copy.deepcopy(self.report)
+        bad_enum["findings"][0]["severity"] = "high"                      # enum casing, complete scope
+        broken.append(bad_enum)
+        bad_scope = copy.deepcopy(self.report)
+        bad_scope["scope"]["completeness"] = "almost"                     # scope enum
+        broken.append(bad_scope)
+        for index, report in enumerate(broken):
+            with self.subTest(case=index):
+                default = validate_report.validate_report(report)
+                relaxed = validate_report.validate_report(report, enforce_partial_coverage_rule=False)
+                self.assertTrue([e for e in default if "R-05" not in e])  # a real error besides R-05
+                self.assertEqual(relaxed, [e for e in default if "R-05" not in e])
+
+    def test_default_equals_explicit_true_for_every_case(self):
+        cases = [self.report, self._partial_without_not_assessed(), make_valid_report(with_finding=False)]
+        ok = self._partial_without_not_assessed()
+        ok["categoryCoverage"][5]["status"] = "NOT_ASSESSED"
+        cases.append(ok)
+        for report in cases:
+            self.assertEqual(validate_report.validate_report(report),
+                             validate_report.validate_report(report, enforce_partial_coverage_rule=True))
+
+    def test_cli_keeps_enforcing_r05(self):
+        report = self._partial_without_not_assessed()
+        with mock.patch.object(validate_report, "_read_input", return_value=report), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            validate_report.main(["report.json"])
+        payload = json.loads(out.getvalue())
+        self.assertEqual(payload["reportStatus"], "invalid")
+        self.assertTrue(any("R-05" in e for e in payload["errors"]))
+
+
 class ShapeAndEnumTests(unittest.TestCase):
     def test_missing_top_level_field_is_rejected(self):
         bad = make_valid_report()

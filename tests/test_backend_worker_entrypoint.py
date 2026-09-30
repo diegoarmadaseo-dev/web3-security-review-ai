@@ -142,6 +142,7 @@ class Step6RunConfigTests(unittest.TestCase):
             return inner
 
         def fake_run(paths, mode, provider, *args, **kwargs):
+            self._validate_pass_draft = kwargs["validate_pass_draft"]  # the real per-pass validator main() builds
             # Hard total per-call deadline only under the Step 6 deadline.
             captured["isolated"] = isinstance(provider, llm_client.IsolatedCallProvider)
             captured["same_inner"] = provider is inner or getattr(provider, "_provider", None) is inner
@@ -170,6 +171,42 @@ class Step6RunConfigTests(unittest.TestCase):
         self.assertEqual(multi, {"sdk_max_retries": 0, "isolated": True, "same_inner": True, "max_passes": 4, "deadline_seconds": 285})
         single = self._run_main(dict(base, LLM_MAX_PASSES="1", STEP6_DEADLINE_SECONDS="285"))
         self.assertEqual(single, {"sdk_max_retries": None, "isolated": False, "same_inner": True, "max_passes": 1, "deadline_seconds": None})
+
+
+class PassDraftValidationTests(unittest.TestCase):
+    """The per-pass validator main() hands to run_step6_with_retries
+    (docs/decisiones.md D-098): the pipeline's score + validate, minus rule
+    R-05 only - a pass is "partial" because it covers part of the
+    submission; R-05 stays on the merged report the pipeline renders."""
+
+    def setUp(self):
+        from tests.test_validate_report import make_valid_report
+        Step6RunConfigTests._run_main(self, {"LLM_PROVIDER": "deepseek", "LLM_MODEL": "m", "LLM_MAX_PASSES": "4", "STEP6_DEADLINE_SECONDS": "285"})
+        self.validate = self._validate_pass_draft
+        self.draft = make_valid_report(mode="quick")
+        self.draft["scope"] = {"completeness": "partial", "reasons": [{"code": "LOC_LIMIT_EXCEEDED", "detail": "d"}]}
+        self.assertNotIn("NOT_ASSESSED", [c["status"] for c in self.draft["categoryCoverage"]])
+
+    def test_partial_pass_without_not_assessed_is_valid(self):
+        self.assertEqual(self.validate(self.draft), [])
+
+    def test_other_rules_still_fail_a_pass(self):
+        import copy
+        r04 = copy.deepcopy(self.draft)
+        r04["categoryCoverage"][0]["status"] = "NOT_DETECTED"
+        missing = copy.deepcopy(self.draft)
+        del missing["limitations"]
+        for bad, rule in ((r04, "R-04"), (missing, "limitations")):
+            with self.subTest(rule=rule):
+                errors = self.validate(bad)
+                self.assertTrue(any(rule in e for e in errors), errors)
+                self.assertFalse(any("R-05" in e for e in errors))
+
+    def test_the_global_validation_still_enforces_r05(self):
+        import validate_report
+        from score import score_report
+        errors = validate_report.validate_report(score_report(self.draft))
+        self.assertTrue(any("R-05" in e for e in errors))
 
 
 class WorkerConfigProviderFieldTests(unittest.TestCase):

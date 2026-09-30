@@ -230,10 +230,13 @@ def main() -> int:
     # provider was built with the matching sdk_max_retries). A pass draft
     # is validated with the same score + validate the pipeline applies;
     # that score is discarded - the report is scored once, on the merged
-    # draft.
+    # draft. Rule R-05 is the one exception: a pass is "partial" because it
+    # covers only part of the submission, not because a category could not
+    # be assessed, so R-05 is left to the merged report the pipeline
+    # validates and renders (docs/decisiones.md D-098).
 
     def validate_pass_draft(draft):
-        return validate_report(score_report(draft))
+        return validate_report(score_report(draft), enforce_partial_coverage_rule=False)
 
     try:
         result = llm_client.run_step6_with_retries(
