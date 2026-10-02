@@ -690,6 +690,136 @@ class SinglePassCompatibilityTests(unittest.TestCase):  # 26
             llm_client.run_step6_with_retries(["/x"], "quick", None, None, max_passes=2)  # no validate_pass_draft
 
 
+REAL_20K_WEIGHTS = [10649, 4206, 2455, 2131, 1310]  # primary effective LOC of the real 20K plan's five passes
+
+
+class PassTimeAllocationTests(unittest.TestCase):
+    """docs/decisiones.md D-104 (H-7): under a multi-pass deadline each
+    pending pass is guaranteed STEP6_MIN_PASS_SECONDS and the rest of the
+    provider window is split by the pending passes' primary effective LOC.
+    Simulated clock only - no provider."""
+
+    WINDOW = 285  # STEP6_DEADLINE_SECONDS of the real runs: provider window 265 s
+
+    def _deadline(self, weights=REAL_20K_WEIGHTS, start_offset=3.0):
+        clock = _FakeClock()
+        deadline = llm_client._Step6Deadline(self.WINDOW, clock)
+        if weights is not None:
+            deadline.use_pass_weights(weights)
+        clock.now += start_offset
+        return deadline, clock
+
+    def _worst_case_shares(self, weights=REAL_20K_WEIGHTS):
+        deadline, clock = self._deadline(weights)
+        shares = []
+        for passes_left in range(len(REAL_20K_WEIGHTS), 0, -1):
+            end = deadline.pass_end(passes_left)
+            shares.append(end - clock.now)
+            clock.now = end  # the pass uses its whole share
+        return shares, deadline
+
+    def test_a_every_pending_pass_is_guaranteed_the_minimum(self):  # A
+        shares, _ = self._worst_case_shares()
+        self.assertEqual(llm_client.STEP6_MIN_PASS_SECONDS, 2 * llm_client.STEP6_MIN_ATTEMPT_SECONDS)
+        for share in shares:
+            self.assertGreaterEqual(share, llm_client.STEP6_MIN_PASS_SECONDS)
+
+    def test_b_largest_pass_gets_substantially_more_and_small_passes_keep_the_minimum(self):  # B
+        shares, _ = self._worst_case_shares()
+        old, _ = self._worst_case_shares(weights=None)
+        self.assertAlmostEqual(old[0], (self.WINDOW - llm_client.STEP6_FINAL_PIPELINE_RESERVE_SECONDS - 3.0) / 5)  # previous even split
+        self.assertGreater(shares[0], old[0] * 1.5)
+        self.assertAlmostEqual(shares[0], 30 + (262.0 - 150) * 10649 / 20751, places=6)
+        self.assertEqual(shares, sorted(shares, reverse=True))  # follows the weights
+        self.assertGreaterEqual(min(shares), llm_client.STEP6_MIN_PASS_SECONDS)
+
+    def test_c_shares_never_exceed_the_provider_window(self):  # C
+        shares, deadline = self._worst_case_shares()
+        self.assertLessEqual(sum(shares), self.WINDOW - llm_client.STEP6_FINAL_PIPELINE_RESERVE_SECONDS - 3.0 + 1e-9)
+        for offset in (0.0, 100.0, 200.0, 240.0, 260.0, 264.9, 300.0):
+            for passes_left in range(1, 6):
+                with self.subTest(offset=offset, passes_left=passes_left):
+                    d, clock = self._deadline(start_offset=offset)
+                    # Past the window pass_end() is "now" (nothing left), as before; attempt_timeout() then refuses.
+                    self.assertLessEqual(d.pass_end(passes_left), max(d._provider_end, clock.now) + 1e-9)
+                    self.assertGreaterEqual(d.pass_end(passes_left), clock.now)
+                    if clock.now >= d._provider_end:
+                        self.assertIsNone(d.attempt_timeout(120, d.pass_end(passes_left)))
+
+    def test_d_unused_time_rolls_over_to_the_next_passes(self):  # D
+        worst, _ = self._worst_case_shares()
+        deadline, clock = self._deadline()
+        deadline.pass_end(5)
+        clock.now += 10.0  # pass 1 finishes early
+        self.assertGreater(deadline.pass_end(4) - clock.now, worst[1])
+
+    def test_e_h7_regression_slow_first_attempt_still_leaves_a_retry(self):  # E - regression of H-7 (4th real 20K run)
+        deadline, clock = self._deadline()
+        end = deadline.pass_end(5)
+        clock.now += 39.5  # pass 1 attempt 1 took 39.5 s in the real run
+        timeout = deadline.attempt_timeout(120, end)
+        self.assertIsNotNone(timeout)
+        self.assertGreaterEqual(timeout, llm_client.STEP6_MIN_ATTEMPT_SECONDS)
+        self.assertLessEqual(clock.now + timeout, deadline._provider_end)
+        old, old_clock = self._deadline(weights=None)
+        old_end = old.pass_end(5)
+        old_clock.now += 39.5
+        self.assertIsNone(old.attempt_timeout(120, old_end))  # the previous even split left no retry
+
+    def test_f_attempt_timeout_never_exceeds_the_per_attempt_cap(self):  # F
+        clock = _FakeClock()
+        big = llm_client._Step6Deadline(1000, clock)
+        big.use_pass_weights(REAL_20K_WEIGHTS)
+        end = big.pass_end(5)
+        self.assertGreater(end - clock.now, 120)
+        self.assertEqual(big.attempt_timeout(120, end), 120)
+
+    def test_g_no_attempt_below_the_minimum_attempt_time(self):  # G
+        deadline, clock = self._deadline()
+        end = deadline.pass_end(5)
+        clock.now = end - (llm_client.STEP6_MIN_ATTEMPT_SECONDS - 1)
+        self.assertIsNone(deadline.attempt_timeout(120, end))
+        clock.now = end - llm_client.STEP6_MIN_ATTEMPT_SECONDS
+        self.assertEqual(deadline.attempt_timeout(120, end), llm_client.STEP6_MIN_ATTEMPT_SECONDS)
+
+    def test_h_same_plan_same_clock_same_shares(self):  # H
+        self.assertEqual(self._worst_case_shares()[0], self._worst_case_shares()[0])
+
+    def test_i_without_weights_the_split_is_unchanged(self):  # I
+        for offset in (0.0, 50.0, 200.0):
+            for passes_left in range(1, 6):
+                with self.subTest(offset=offset, passes_left=passes_left):
+                    d, clock = self._deadline(weights=None, start_offset=offset)
+                    self.assertAlmostEqual(d.pass_end(passes_left), clock.now + max(0.0, d._provider_end - clock.now) / passes_left)
+
+    def test_too_little_time_for_the_minimums_falls_back_to_an_even_split(self):
+        deadline, clock = self._deadline(start_offset=self.WINDOW - llm_client.STEP6_FINAL_PIPELINE_RESERVE_SECONDS - 100.0)  # 100 s left for 5 passes (< 5 x 30 s)
+        self.assertAlmostEqual(deadline.pass_end(5) - clock.now, 20.0)
+
+    def test_zero_weights_split_the_extra_evenly(self):
+        deadline, clock = self._deadline(weights=[0, 0, 0, 0, 0])
+        self.assertAlmostEqual(deadline.pass_end(5) - clock.now, 262.0 / 5)
+
+    def test_multi_pass_run_sets_the_plan_weights_and_single_pass_never_does(self):  # I
+        art = _art()
+        budget = _budget_for(art, V1, 3)
+        plan = _plan(art, V1, budget)
+        effective = {e["file"]: e["effectiveLoc"] for e in art["priorityRanking"]}
+        expected = [sum(effective[f] for f in p["primaryFiles"]) for p in plan.passes]
+        seen = []
+        real = llm_client._Step6Deadline.use_pass_weights
+
+        def spy(self, weights):
+            seen.append(list(weights))
+            return real(self, weights)
+        with mock.patch.object(llm_client._Step6Deadline, "use_pass_weights", spy):
+            _run(art, budget, ScriptedProvider(), deadline_seconds=285)                     # multi-pass with a deadline
+            _run(art, budget, ScriptedProvider())                                           # multi-pass without a deadline
+            llm_client.run_step6_with_retries(["/x.sol"], "quick", ScriptedProvider(), _Counters().pipeline_fn,
+                                              preprocess_run=lambda paths, **kw: FAKE_ARTIFACT, deadline_seconds=285)  # single-pass
+        self.assertEqual(seen, [expected])
+
+
 class DeadlineTests(unittest.TestCase):
     def test_attempt_timeouts_respect_reserve_minimum_and_pass_share(self):
         clock = _FakeClock()

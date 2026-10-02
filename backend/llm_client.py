@@ -481,6 +481,9 @@ DEFAULT_PER_ATTEMPT_TIMEOUT_SECONDS = 120
 #     The cap bounds cost; the deadline, not the cap, bounds time.
 STEP6_FINAL_PIPELINE_RESERVE_SECONDS = 20
 STEP6_MIN_ATTEMPT_SECONDS = 15
+# Guaranteed share per pending pass under a multi-pass deadline (D-104): room
+# for two minimum-length attempts, so no pass is starved by a larger one.
+STEP6_MIN_PASS_SECONDS = 2 * STEP6_MIN_ATTEMPT_SECONDS
 MAX_STEP6_PASSES = 8
 
 
@@ -493,12 +496,32 @@ class _Step6Deadline:
     def __init__(self, seconds: float, clock: Callable[[], float]) -> None:
         self._clock = clock
         self._provider_end = clock() + seconds - STEP6_FINAL_PIPELINE_RESERVE_SECONDS
+        self._pass_weights: Optional[List[int]] = None
+
+    def use_pass_weights(self, weights: List[int]) -> None:
+        """Per-pass weights in plan order (each pass's primary effective
+        LOC, docs/decisiones.md D-104); set once by the multi-pass run
+        before its first pass. Without them pass_end() keeps the even split."""
+        self._pass_weights = [max(0, int(w)) for w in weights]
 
     def pass_end(self, passes_left: int) -> float:
-        """End of the next pass's fair share of the provider time left
-        (unused time rolls over to later passes)."""
+        """End of the next pass's share of the provider time left; unused
+        time rolls over to later passes. With pass weights (D-104): every
+        pending pass is guaranteed STEP6_MIN_PASS_SECONDS (or an even split
+        when there is not enough left for that) and the rest is split in
+        proportion to the pending passes' weights. Never past _provider_end."""
         now = self._clock()
-        return now + max(0.0, self._provider_end - now) / max(1, passes_left)
+        remaining = max(0.0, self._provider_end - now)
+        passes_left = max(1, passes_left)
+        weights = self._pass_weights
+        if not weights or passes_left > len(weights):
+            return now + remaining / passes_left
+        pending = weights[len(weights) - passes_left:]
+        base = min(float(STEP6_MIN_PASS_SECONDS), remaining / passes_left)
+        extra = remaining - base * passes_left
+        total = sum(pending)
+        share = base + (extra * pending[0] / total if total else extra / passes_left)
+        return now + min(remaining, share)
 
     def attempt_timeout(self, per_attempt_timeout_seconds: int, pass_end: Optional[float] = None) -> Optional[int]:
         limit = self._provider_end if pass_end is None else min(self._provider_end, pass_end)
@@ -1314,6 +1337,10 @@ def _run_multi_pass(
             "Step 6 blocked before any provider attempt: multi-pass planning could not assign any file to a pass "
             "(every file's closure exceeds the artifact budget of %d bytes). No provider was called." % plan.artifact_budget
         )
+    if deadline is not None:
+        # Each pass's weight is its primary effective LOC from the plan (D-104).
+        effective_loc = {e.get("file"): e.get("effectiveLoc") or 0 for e in artifact.get("priorityRanking") or [] if isinstance(e, dict)}
+        deadline.use_pass_weights([sum(effective_loc.get(f, 0) for f in p["primaryFiles"]) for p in plan.passes])
     outcomes: List[Dict[str, Any]] = []
     for pass_entry in plan.passes:
         outcomes.append(_run_one_pass(
