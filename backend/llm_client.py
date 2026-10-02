@@ -64,12 +64,13 @@ see CREDENTIAL BOUNDARY above, which this does not touch or weaken).
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import select
 import signal
 import time
-from typing import Any, Callable, Dict, List, Optional, Protocol
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 import backend.context_encoding as context_encoding
 import backend.context_selection as context_selection
@@ -1062,6 +1063,7 @@ def run_step6_with_retries(
     validate_pass_draft: Optional[Callable[[Dict[str, Any]], List[str]]] = None,
     deadline_seconds: Optional[float] = None,
     clock: Callable[[], float] = time.monotonic,
+    targeted_review: Optional[Callable[..., Any]] = None,
 ) -> Dict[str, Any]:
     """Orchestrates Step 6 (this module) around the existing mechanized
     Steps 3/7/8/9 (analyze_pipeline.run_analyze_pipeline, injected by the
@@ -1109,7 +1111,13 @@ def run_step6_with_retries(
     deadline_seconds builds its real provider with sdk_max_retries=
     sdk_max_retries_for(deadline_seconds) (0) and wraps it with
     provider_for_step6(provider, deadline_seconds), as
-    backend/worker_entrypoint.py does."""
+    backend/worker_entrypoint.py does.
+
+    targeted_review (optional, docs/decisiones.md D-105): the Layer 2
+    runner (backend.targeted_review.make_runner()). Only a multi-pass run
+    uses it, once, after the final pipeline has rendered the report; its
+    advisory section is added under "targetedCodeReview" and nothing else in
+    the result changes. None (the default) leaves every path unchanged."""
     context_encoding.check_context_format(context_format)
     if not isinstance(max_passes, int) or isinstance(max_passes, bool) or not 1 <= max_passes <= MAX_STEP6_PASSES:
         raise ValueError("max_passes must be an integer between 1 and %d" % MAX_STEP6_PASSES)
@@ -1128,6 +1136,7 @@ def run_step6_with_retries(
             return _run_multi_pass(
                 source_paths, mode, provider, run_analyze_pipeline, preprocess_artifact, plan, format_kwargs,
                 max_output_tokens, per_attempt_timeout_seconds, modes_config, render_format, validate_pass_draft, deadline,
+                targeted_review=targeted_review,
             )
     preprocess_artifact = _apply_completeness_gate(preprocess_artifact, **format_kwargs)
 
@@ -1325,6 +1334,7 @@ def _run_multi_pass(
     render_format: str,
     validate_pass_draft: Callable[[Dict[str, Any]], List[str]],
     deadline: Optional[_Step6Deadline],
+    targeted_review: Optional[Callable[..., Any]] = None,
 ) -> Dict[str, Any]:
     """Runs every planned pass in order, merges the successful drafts
     (multi_pass.merge_pass_drafts), re-checks every merged location against
@@ -1372,4 +1382,44 @@ def _run_multi_pass(
         raise Step6Failed("Step 6 multi-pass merged report failed global validation: %s" % _bounded_failure(str(result.get("errors"))))
     result = dict(result)
     result["multiPass"] = multi_pass.plan_summary(plan, outcomes)
+    if targeted_review is not None:
+        # Layer 2 (D-105): advisory only, after findings/score/coverage/render
+        # are final; it only adds keys, and never fails the job.
+        section, raw = _targeted_review_section(
+            targeted_review, source_paths, artifact, plan, outcomes, result, provider, deadline, per_attempt_timeout_seconds,
+        )
+        result["targetedCodeReview"] = section
+        result["targetedCodeReviewRaw"] = raw
     return result
+
+
+def _targeted_review_section(
+    runner: Callable[..., Any],
+    source_paths: List[str],
+    artifact: Dict[str, Any],
+    plan: "multi_pass.PassPlan",
+    outcomes: List[Dict[str, Any]],
+    result: Dict[str, Any],
+    provider: LLMProvider,
+    deadline: Optional[_Step6Deadline],
+    per_attempt_timeout_seconds: int,
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Runs the Layer 2 runner on deep copies (it can never alter the Layer 1
+    result) with the EXISTING Step 6 deadline: its timeout comes from
+    deadline.attempt_timeout(per_attempt_timeout_seconds) - the provider
+    window, never pass_end() and never a second clock. Any unexpected error
+    becomes a failed advisory section."""
+    timeout_fn = (lambda: deadline.attempt_timeout(per_attempt_timeout_seconds)) if deadline is not None else None
+    analyzed = {f for o in outcomes if o["status"] == multi_pass.PASS_SUCCESS for f in o["primaryFiles"]}
+    try:
+        section, raw = runner(
+            source_paths=list(source_paths), artifact=copy.deepcopy(artifact), owner=plan.primary_owner(), analyzed_files=analyzed,
+            scored_report=copy.deepcopy(result.get("scoredReport") or {}), provider=provider, timeout_fn=timeout_fn,
+        )
+        if not isinstance(section, dict):
+            raise TypeError("targeted review runner returned no section")
+        return section, raw if isinstance(raw, str) else None
+    except Exception as exc:  # Layer 2 must never turn a rendered Layer 1 report into a failure
+        return {"version": "1.0", "status": "failed", "advisoryOnly": True,
+                "reasons": [{"code": "TARGETED_REVIEW_INTERNAL_ERROR", "detail": type(exc).__name__}],
+                "summary": {}, "targets": [], "metadata": {}}, None

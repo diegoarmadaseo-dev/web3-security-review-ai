@@ -155,6 +155,52 @@ def verify_finding_evidence(
     }
 
 
+MIN_QUOTE_CHARS = 12  # a shorter quote (e.g. "require(") matches almost anywhere and proves nothing.
+_IDENTIFIER_RE = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]{2,}")
+_LINE_NUMBER_PREFIX_RE = re.compile(r"^\s*\d+\s*\|")
+
+
+def verify_quote_in_ranges(
+    citation: Any, allowed_ranges: List[Any], sent_lines_by_file: Dict[str, List[str]], min_chars: int = MIN_QUOTE_CHARS
+) -> Dict[str, Any]:
+    """Exact-range check for ONE citation {file, lineStart, lineEnd, text} against the
+    text that was actually shown (sent_lines_by_file: file -> its lines as sent, already
+    redacted/neutralized, index 0 = line 1) and the only ranges the citation may come from
+    (allowed_ranges: [(file, lineStart, lineEnd), ...] - a reviewed unit and its included
+    modifiers/callees). Tolerance is 0. Pure; never raises.
+
+    - "unverifiable": malformed citation, a line-number prefix copied into the text, or a
+      trivial quote (shorter than min_chars after whitespace normalization, or without an
+      identifier of 3+ characters);
+    - "fabricated": the quote appears in none of the allowed ranges;
+    - "location_mismatch": the quote is in an allowed range, but not inside the cited
+      lines, or the cited lines are not inside one allowed range of the cited file;
+    - "verified": the cited lines lie inside one allowed range of that file and contain the quote.
+    A quote containing a [REDACTED-...] placeholder verifies normally, because it is checked
+    against the redacted text that was sent, never against the original source."""
+    if not isinstance(citation, dict):
+        return {"status": "unverifiable", "reason": "citation is not an object"}
+    text, file_path = citation.get("text"), citation.get("file")
+    line_start, line_end = citation.get("lineStart"), citation.get("lineEnd")
+    if not isinstance(text, str) or not isinstance(file_path, str):
+        return {"status": "unverifiable", "reason": "citation file/text missing"}
+    if _LINE_NUMBER_PREFIX_RE.match(text):
+        return {"status": "unverifiable", "reason": "citation text carries a line-number prefix"}
+    quote = _normalize(text)
+    if len(quote) < min_chars or not _IDENTIFIER_RE.search(quote):
+        return {"status": "unverifiable", "reason": "citation is too short or trivial to verify"}
+    ranges = [r for r in allowed_ranges if isinstance(r, (list, tuple)) and len(r) == 3 and r[0] in sent_lines_by_file]
+    window = lambda path, a, b: _normalize("\n".join(sent_lines_by_file[path][max(1, a) - 1:b]))
+    if not any(quote in window(path, a, b) for path, a, b in ranges):
+        return {"status": "fabricated", "reason": "quote does not appear in the reviewed unit"}
+    valid_lines = (isinstance(line_start, int) and isinstance(line_end, int) and not isinstance(line_start, bool)
+                   and not isinstance(line_end, bool) and 1 <= line_start <= line_end)
+    if valid_lines and any(path == file_path and a <= line_start and line_end <= b for path, a, b in ranges) \
+            and file_path in sent_lines_by_file and quote in window(file_path, line_start, line_end):
+        return {"status": "verified", "reason": None}
+    return {"status": "location_mismatch", "reason": "quote exists in the reviewed unit but not inside the cited lines"}
+
+
 def verify_report_evidence(
     findings: Any, source_files: Any, tolerance_lines: int = DEFAULT_TOLERANCE_LINES
 ) -> List[Dict[str, Any]]:

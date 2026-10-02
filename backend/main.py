@@ -434,6 +434,8 @@ def _load_worker_config() -> Dict[str, Any]:
         "llm_max_output_tokens": _positive_int_env("LLM_MAX_OUTPUT_TOKENS", 8000),
         "llm_per_attempt_timeout_seconds": _positive_int_env("LLM_PER_ATTEMPT_TIMEOUT_SECONDS", 120),
         "llm_max_passes": _positive_int_env("LLM_MAX_PASSES", worker_supervisor.DEFAULT_MAX_PASSES),
+        # Layer 2 targeted code review (docs/decisiones.md D-105): off unless explicitly enabled.
+        "targeted_review_enabled": _bool_env("TARGETED_REVIEW_ENABLED", False),
         "retention_days": _optional_positive_int_env("RETENTION_DAYS"),
         "retention_check_interval_seconds": _positive_int_env("RETENTION_CHECK_INTERVAL_SECONDS", 3600),
         "retention_dry_run": _bool_env("RETENTION_DRY_RUN", False),
@@ -639,6 +641,7 @@ def run_worker() -> None:
         max_output_tokens=cfg["llm_max_output_tokens"],
         per_attempt_timeout_seconds=cfg["llm_per_attempt_timeout_seconds"],
         max_passes=cfg["llm_max_passes"],
+        targeted_review_enabled=cfg["targeted_review_enabled"],
     )
     sys.stderr.write("backend worker process %r starting (image=%s)\n" % (cfg["worker_id"], config.docker_image))
     if cfg["retention_days"] is not None:

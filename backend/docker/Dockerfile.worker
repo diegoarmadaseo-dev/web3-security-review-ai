@@ -83,6 +83,9 @@ COPY backend/llm_client.py /app/backend/llm_client.py
 COPY backend/context_selection.py /app/backend/context_selection.py
 COPY backend/context_encoding.py /app/backend/context_encoding.py
 COPY backend/multi_pass.py /app/backend/multi_pass.py
+# Layer 2 targeted code review (docs/decisiones.md D-105): imported by
+# worker_entrypoint.py only when TARGETED_REVIEW_ENABLED is on; stdlib-only.
+COPY backend/targeted_review.py /app/backend/targeted_review.py
 RUN touch /app/backend/__init__.py
 
 ENTRYPOINT ["python", "/app/backend/worker_entrypoint.py"]

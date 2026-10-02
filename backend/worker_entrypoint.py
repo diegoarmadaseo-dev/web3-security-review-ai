@@ -49,7 +49,8 @@ LLM_API_KEY_FILE, JOB_INPUT_PATH, JOB_OUTPUT_PATH and
 LLM_MOCK_RESPONSES_PATH from the pre-D-079 design are GONE - that data now
 arrives via the stdin envelope instead, never an env var or a file path:
   SOURCE_PATH, SKILL_SCRIPTS_DIR, REPO_ROOT,
-  LLM_MODEL, LLM_PROVIDER, LLM_MAX_OUTPUT_TOKENS, LLM_PER_ATTEMPT_TIMEOUT_SECONDS.
+  LLM_MODEL, LLM_PROVIDER, LLM_MAX_OUTPUT_TOKENS, LLM_PER_ATTEMPT_TIMEOUT_SECONDS,
+  TARGETED_REVIEW_ENABLED (Layer 2, D-105; off by default).
 
 PROVIDER SELECTION (docs/decisiones.md, the phase that wired the already-
 validated DeepSeekLLMProvider into this real worker path): LLM_PROVIDER
@@ -238,12 +239,24 @@ def main() -> int:
     def validate_pass_draft(draft):
         return validate_report(score_report(draft), enforce_partial_coverage_rule=False)
 
+    # Layer 2 targeted code review (docs/decisiones.md D-105): opt-in, off by
+    # default; when off the Step 6 call and the result line are unchanged.
+    step6_extra: Dict[str, Any] = {}
+    if _targeted_review_enabled(os.environ):
+        try:
+            import backend.targeted_review as targeted_review
+            import evidence_locality
+            import preprocess as preprocess_module
+            step6_extra["targeted_review"] = targeted_review.make_runner(preprocess_module, evidence_locality)
+        except ImportError as exc:  # Layer 2 can never prevent the Layer 1 report
+            sys.stderr.write("worker_entrypoint: targeted review unavailable: %s\n" % type(exc).__name__)
+
     try:
         result = llm_client.run_step6_with_retries(
             [SOURCE_PATH], mode, provider, run_analyze_pipeline,
             max_output_tokens=max_output_tokens, per_attempt_timeout_seconds=per_attempt_timeout,
             preprocess_run=preprocess_run, max_passes=max_passes, validate_pass_draft=validate_pass_draft,
-            deadline_seconds=deadline_seconds,
+            deadline_seconds=deadline_seconds, **step6_extra,
         )
     except llm_client.Step6Failed as exc:
         _write_result("failed", error=str(exc))
@@ -253,13 +266,23 @@ def main() -> int:
         sys.stderr.write("worker_entrypoint: unexpected error: %s\n" % type(exc).__name__)
         return 1
 
+    extra: Dict[str, Any] = {}
+    if "targetedCodeReview" in result:
+        import backend.targeted_review as targeted_review
+        extra["targeted_review"] = targeted_review.bound_output(result["targetedCodeReview"], result.get("targetedCodeReviewRaw"))
     _write_result(
         "succeeded",
         rendered=result["rendered"],
         render_format=result["renderFormat"],
         risk_indicator=(result.get("scoredReport") or {}).get("riskIndicator"),
+        **extra,
     )
     return 0
+
+
+def _targeted_review_enabled(environ: Mapping[str, str]) -> bool:
+    """TARGETED_REVIEW_ENABLED - off unless explicitly "1"/"true"/"yes" (D-105)."""
+    return str(environ.get("TARGETED_REVIEW_ENABLED", "")).strip().lower() in ("1", "true", "yes")
 
 
 if __name__ == "__main__":

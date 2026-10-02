@@ -96,6 +96,16 @@ def purge_expired_contracts(
     return {"dry_run": False, "purged": purged, "contract_ids": contract_ids}
 
 
+def _delete_report_companions(storage: object_storage.ObjectStorage, report_storage_ref: str) -> None:
+    """Objects stored next to a report with ids derived from it (Layer 2
+    targeted code review, docs/decisiones.md D-105) follow the report's own
+    retention. delete_object() is idempotent for a key that was never written."""
+    import backend.targeted_review as targeted_review  # stdlib-only module
+
+    for key in targeted_review.companion_keys(report_storage_ref):
+        storage.delete_object(key)
+
+
 def purge_expired_reports(
     conn: Any, storage: object_storage.ObjectStorage, retention_days: int, dry_run: bool = True, now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
@@ -110,6 +120,7 @@ def purge_expired_reports(
     purged = 0
     for report in expired:
         storage.delete_object(report["storage_ref"])
+        _delete_report_companions(storage, report["storage_ref"])
         if repo.mark_report_purged(conn, report["id"]):
             purged += 1
     return {"dry_run": False, "purged": purged, "report_ids": report_ids}
@@ -154,6 +165,7 @@ def delete_workspace_data(
     purged_reports = 0
     for report in all_reports:
         storage.delete_object(report["storage_ref"])
+        _delete_report_companions(storage, report["storage_ref"])
         if repo.mark_report_purged(conn, report["id"]):
             purged_reports += 1
 

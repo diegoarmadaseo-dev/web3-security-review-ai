@@ -137,6 +137,7 @@ class WorkerConfig:
         max_output_tokens: int = 8000,
         per_attempt_timeout_seconds: int = 120,
         max_passes: int = DEFAULT_MAX_PASSES,
+        targeted_review_enabled: bool = False,
     ) -> None:
         if not docker_image:
             raise WorkerSupervisorError("docker_image is required")
@@ -157,6 +158,8 @@ class WorkerConfig:
         self.max_output_tokens = max_output_tokens
         self.per_attempt_timeout_seconds = per_attempt_timeout_seconds
         self.max_passes = max_passes
+        # Layer 2 targeted code review (docs/decisiones.md D-105): opt-in, off by default.
+        self.targeted_review_enabled = bool(targeted_review_enabled)
 
     @property
     def step6_deadline_seconds(self) -> int:
@@ -197,6 +200,7 @@ def build_docker_create_args(config: WorkerConfig, container_name: str) -> List[
         "-e", "LLM_PER_ATTEMPT_TIMEOUT_SECONDS=%d" % config.per_attempt_timeout_seconds,
         "-e", "LLM_MAX_PASSES=%d" % config.max_passes,
         "-e", "STEP6_DEADLINE_SECONDS=%d" % config.step6_deadline_seconds,
+    ] + (["-e", "TARGETED_REVIEW_ENABLED=1"] if config.targeted_review_enabled else []) + [
         config.docker_image,
     ]
 
@@ -411,7 +415,7 @@ def claim_and_run_one_job(
             )
             return job_id
         risk_indicator = result.get("risk_indicator") or {}
-        repo.finalize_job_attempt(
+        finalized = repo.finalize_job_attempt(
             conn, job_id, workspace_id, attempt_count, claimed_by,
             from_status="running", to_status="succeeded",
             budget_units=units, budget_action="consume",
@@ -419,6 +423,8 @@ def claim_and_run_one_job(
             report_score_status="computed" if risk_indicator.get("score") is not None else "not_computed",
             report_score=risk_indicator.get("score"), report_risk_band=risk_indicator.get("band"),
         )
+        if isinstance(result.get("targeted_review"), dict) and isinstance(finalized, dict) and finalized.get("applied"):
+            _persist_targeted_review(conn, storage, workspace_id, job_id, result["targeted_review"], alert_sender)
     else:
         alerting.emit_safe(alert_sender, alerting.EVENT_WORKER_JOB_FAILED, "warning", {"job_id": job_id, "workspace_id": workspace_id, "error": str(result.get("error", ""))[:200]})
         repo.finalize_job_attempt(
@@ -428,6 +434,39 @@ def claim_and_run_one_job(
             budget_units=units, budget_action="release",
         )
     return job_id
+
+
+def _persist_targeted_review(
+    conn: Any,
+    storage: object_storage.ObjectStorage,
+    workspace_id: str,
+    job_id: str,
+    payload: Dict[str, Any],
+    alert_sender: Optional[alerting.AlertSender],
+) -> None:
+    """Layer 2 (docs/decisiones.md D-105), best effort and only after the job
+    is already 'succeeded': the advisory section and the raw provider text as
+    two objects next to the report (ids derived from it, so report retention
+    deletes them too - see targeted_review.companion_keys()), plus one
+    summary audit event (no source, no quotes, no raw text). Any failure only
+    alerts; the job's terminal state never changes."""
+    import backend.targeted_review as targeted_review  # stdlib-only module
+
+    section = payload.get("section")
+    raw = payload.get("raw")
+    if not isinstance(section, dict):
+        return
+    try:
+        section_id, raw_id = targeted_review.object_ids(job_id)
+        storage.put_object(object_storage.workspace_key(workspace_id, "reports", section_id),
+                           json.dumps(section, ensure_ascii=False, sort_keys=True).encode("utf-8"), content_type="application/json")
+        if isinstance(raw, str):
+            storage.put_object(object_storage.workspace_key(workspace_id, "reports", raw_id), raw.encode("utf-8"), content_type="text/plain")
+        repo.append_audit_event(conn, workspace_id, None, targeted_review.AUDIT_EVENT_TYPE,
+                                json.dumps(dict(targeted_review.audit_metadata(section), jobId=job_id), sort_keys=True))
+    except Exception as exc:
+        alerting.emit_safe(alert_sender, alerting.EVENT_STORAGE_FAILURE, "warning",
+                           {"job_id": job_id, "phase": "store_targeted_review", "error_type": type(exc).__name__})
 
 
 def run_worker_supervisor_loop(
