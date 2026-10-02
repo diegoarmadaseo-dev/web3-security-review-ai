@@ -78,7 +78,7 @@ NOT_REVIEWED = "NOT_REVIEWED"
 MAX_EVIDENCE = 3
 MAX_QUOTE_CHARS = 160
 MAX_EXPLANATION_CHARS = 400
-DEFAULT_TARGET_CAP = 100
+DEFAULT_TARGET_CAP = 10   # production batch size (D-106: real-provider runs gave 0/12, 3/12 and 9/12 valid responses at 100, 25 and 10)
 UNIT_MAX_BYTES = 8 * 1024
 CALLEE_MAX = 3
 CALLEE_MAX_BYTES = 4 * 1024
@@ -599,9 +599,14 @@ Every SUPPORTED or CONTRADICTED verdict needs 1 to %(max_ev)d evidence citations
 _OUTPUT = """OUTPUT CONTRACT
 Respond with ONLY one JSON object of exactly this shape and nothing else:
 {"verdicts": [{"targetId": "...", "verdict": "SUPPORTED|CONTRADICTED|INSUFFICIENT_CONTEXT", "evidence": [{"file": "...", "lineStart": 1, "lineEnd": 1, "text": "..."}], "explanation": "..."}]}
-Exactly one entry per target (%(count)d entries), each targetId exactly once, no other targetIds, no other fields anywhere, no markdown code fences, no prose before or after it."""
+Exactly one entry per target (%(count)d entries), each targetId exactly once, no other targetIds, no other fields anywhere, no markdown code fences, no prose before or after it.
+Target IDs: return exactly the %(count)d targetIds listed in TARGETS. Each targetId must appear exactly once. Do not invent targetIds, do not omit any targetId, do not repeat any targetId.
+Citations: every evidence "text" must be at most %(max_q)d characters: a short verbatim quote of the provided code, with no explanation, no prefix such as "Citation:" and no unnecessary joining of several lines. If the relevant code is longer, quote only the shortest verbatim part that shows it.
+JSON: the response must be only one valid JSON object - no markdown, no code fences, no comments, no text before or after it, no fields other than the ones shown above."""
 
-_FINAL = "\n\nFINAL FORMAT CHECK: respond with ONLY one valid JSON object {\"verdicts\": [...]} with exactly %d entries - no markdown code fences, no prose before or after it, no unknown fields."
+_FINAL = ("\n\nFINAL FORMAT CHECK: respond with ONLY one valid JSON object {\"verdicts\": [...]} with exactly %(count)d entries - no markdown code fences, no prose before or after it, no unknown fields.\n"
+          "Before answering, check: 1. exact target count: %(count)d entries; 2. unique targetIds; 3. no unknown targetIds; 4. no missing targetIds; "
+          "5. every evidence text <= %(max_q)d characters; 6. valid JSON only. A response that fails any check is rejected as a whole.")
 
 
 def _target_metadata(target: Dict[str, Any], findings_by_key: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
@@ -651,10 +656,10 @@ def build_prompt(targets: List[Dict[str, Any]], sent: Dict[str, SentFile], findi
     prompt = "\n\n".join([
         _RULES % {"nonce": nonce},
         _TASK % {"max_ev": MAX_EVIDENCE, "max_q": MAX_QUOTE_CHARS, "max_x": MAX_EXPLANATION_CHARS},
-        _OUTPUT % {"count": len(targets)},
+        _OUTPUT % {"count": len(targets), "max_q": MAX_QUOTE_CHARS},
         "TARGETS (code-free metadata, JSON):\n" + metadata,
         "BEGIN UNTRUSTED DATA %s\n%s\nEND UNTRUSTED DATA %s" % (nonce, data, nonce),
-    ]) + _FINAL % len(targets)
+    ]) + _FINAL % {"count": len(targets), "max_q": MAX_QUOTE_CHARS}
     return prompt, nonce, regenerations, data
 
 

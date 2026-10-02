@@ -536,6 +536,114 @@ class ParserTests(unittest.TestCase):
         p = self._ok(); p["verdicts"][0]["evidence"] = "x"; self._bad(p)
 
 
+class OutputContractHardeningTests(unittest.TestCase):
+    """D-106: the prompt states the output contract explicitly, but the parser keeps every
+    integrity rejection - a contract violation still invalidates the whole response."""
+    IDS = ["tgt:%02d" % i for i in range(10)]
+
+    def _payload(self, ids=None, text="x = y + z;"):
+        return {"verdicts": [{"targetId": i, "verdict": "SUPPORTED", "evidence": [{"file": "f.sol", "lineStart": 1, "lineEnd": 1, "text": text}], "explanation": "e"}
+                             for i in (self.IDS if ids is None else ids)]}
+
+    def _parse(self, payload):
+        return tr.parse_verdicts(payload if isinstance(payload, str) else json.dumps(payload), self.IDS)
+
+    def _bad(self, payload):
+        with self.assertRaises(tr.VerdictParseError):
+            self._parse(payload)
+
+    def test_citation_length_boundary(self):
+        self.assertEqual(tr.MAX_QUOTE_CHARS, 160)
+        for n in (159, 160):
+            out = self._parse(self._payload(text="a" * n))
+            self.assertEqual(len(out), 10)
+            self.assertEqual(len(out["tgt:00"]["evidence"][0]["text"]), n)
+        self._bad(self._payload(text="a" * 161))
+        p = self._payload(); p["verdicts"][9]["evidence"][0]["text"] = "a" * 161   # one long citation rejects all ten
+        self._bad(p)
+
+    def test_target_uniqueness(self):
+        self.assertEqual(len(self._parse(self._payload())), 10)
+        self._bad(self._payload(ids=self.IDS[:9] + [self.IDS[0]]))     # 10 entries, one duplicate
+        self._bad(self._payload(ids=self.IDS + [self.IDS[3]]))          # 11 entries, one duplicate
+
+    def test_target_completeness(self):
+        self.assertEqual(sorted(self._parse(self._payload())), self.IDS)
+        self._bad(self._payload(ids=self.IDS[:9]))                      # 9/10
+        self._bad(self._payload(ids=self.IDS + ["tgt:99"]))             # 11/10
+        self._bad(self._payload(ids=self.IDS[:9] + ["tgt:99"]))         # unknown id in place of a known one
+
+    def test_strict_json(self):
+        body = json.dumps(self._payload())
+        self.assertEqual(len(self._parse(body)), 10)
+        self._bad("```json\n" + body + "\n```")
+        self._bad("```\n" + body + "\n```")
+        self._bad(body + "\nAll targets reviewed.")
+        self._bad("Here is the JSON:\n" + body)
+        self._bad(body + " // done")
+        p = self._payload(); p["verdicts"][0]["citation"] = "x"; self._bad(p)
+        p = self._payload(); p["notes"] = "x"; self._bad(p)
+        p = self._payload(); p["verdicts"][0]["evidence"][0]["note"] = "x"; self._bad(p)
+
+    def test_production_batch_size_is_ten(self):
+        import inspect
+        self.assertEqual(tr.DEFAULT_TARGET_CAP, 10)
+        self.assertEqual(inspect.signature(tr.make_runner).parameters["target_cap"].default, 10)
+        self.assertEqual(inspect.signature(tr.run_targeted_review).parameters["target_cap"].default, 10)
+        with mock.patch.object(tr, "run_targeted_review", return_value=({}, None)) as run:
+            tr.make_runner(pp, el)(source_paths=[])
+        self.assertEqual(run.call_args.kwargs["target_cap"], 10)
+        self.assertEqual(tr.MAX_OUTPUT_TOKENS, 16000)
+        src = (REPO_ROOT / "backend" / "worker_entrypoint.py").read_text(encoding="utf-8")
+        self.assertIn("targeted_review.make_runner(preprocess_module, evidence_locality)", src)   # production uses the default
+
+    def test_prompt_states_the_contract_outside_the_data_block(self):
+        fx = _Fixture()
+        v = "src/Vault.sol"
+        sigs = [_signal(v, line_of(v, "msg.sender.call"), "external-call", "Vault"), _signal(v, line_of(v, "_payout(to, amount);"), "reentrancy-pattern", "Vault")]
+        section, provider = _run(fx, sigs)
+        prompt = provider.calls[0]["prompt"]
+        nonce = re.search(r"BEGIN UNTRUSTED DATA ([0-9a-f]{32})", prompt).group(1)
+        before, rest = prompt.split("\nBEGIN UNTRUSTED DATA %s\n" % nonce, 1)
+        data, after = rest.split("\nEND UNTRUSTED DATA %s" % nonce, 1)
+        outside = before + after
+        n = section["metadata"]["targetsInPrompt"]
+        for phrase in ("return exactly the %d targetIds listed in TARGETS" % n, "Each targetId must appear exactly once",
+                       "Do not invent targetIds", "do not omit any targetId", "do not repeat any targetId",
+                       'every evidence "text" must be at most 160 characters', "short verbatim quote", "no explanation",
+                       'no prefix such as "Citation:"', "no unnecessary joining of several lines",
+                       "only one valid JSON object", "no markdown", "no comments", "no fields other than the ones shown"):
+            self.assertIn(phrase, before)
+        for phrase in ("1. exact target count: %d entries" % n, "2. unique targetIds", "3. no unknown targetIds",
+                       "4. no missing targetIds", "5. every evidence text <= 160 characters", "6. valid JSON only"):
+            self.assertIn(phrase, after)
+        self.assertNotIn("Before answering, check", data)
+        self.assertNotIn("Target IDs:", data)
+        self.assertTrue(prompt.rstrip().endswith("rejected as a whole."))
+        self.assertEqual(prompt.count(nonce), 5)            # hardening adds no nonce occurrence
+        self.assertNotIn("src/Vault.sol", outside)          # still no user data outside the block
+        self.assertEqual(section["status"], tr.STATUS_COMPLETED)
+        self.assertTrue(all(ev["status"] == "verified" for t in section["targets"] for ev in t.get("evidence", [])))
+
+    def test_contract_violations_from_the_provider_still_fail_the_whole_call(self):
+        fx = _Fixture()
+        v = "src/Vault.sol"
+        sigs = [_signal(v, line_of(v, "msg.sender.call"), "external-call", "Vault"), _signal(v, line_of(v, "_payout(to, amount);"), "reentrancy-pattern", "Vault")]
+
+        def long_citation(p):
+            p["verdicts"][0]["evidence"] = [dict(p["verdicts"][0]["evidence"][0], text="a" * 161)]
+            return p
+        mutations = {"long citation": long_citation,
+                     "duplicate": lambda p: dict(p, verdicts=[p["verdicts"][0], dict(p["verdicts"][0])]),
+                     "missing": lambda p: dict(p, verdicts=p["verdicts"][:1]),
+                     "unknown": lambda p: dict(p, verdicts=[p["verdicts"][0], dict(p["verdicts"][1], targetId="tgt:" + "0" * 32)])}
+        for name, mutate in mutations.items():
+            section, _ = _run(fx, sigs, provider=FakeProvider(mutate=mutate))
+            self.assertEqual(section["status"], tr.STATUS_FAILED, name)
+            self.assertEqual([r["code"] for r in section["reasons"]], [tr.REASON_INVALID_RESPONSE], name)
+            self.assertTrue(all(t["reviewStatus"] == tr.NOT_REVIEWED and "verdict" not in t for t in section["targets"]), name)
+
+
 # ---------------------------------------------------------------------------
 # Evidence verification (evidence_locality.verify_quote_in_ranges)
 # ---------------------------------------------------------------------------
