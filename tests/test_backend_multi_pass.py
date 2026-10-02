@@ -288,6 +288,97 @@ class PassPromptRulesTests(unittest.TestCase):
         self.assertLessEqual(len(worst.encode("utf-8")) - artifact_bytes, RESERVE)
 
 
+class PassFinalFormatCheckTests(unittest.TestCase):
+    """docs/decisiones.md D-103 (H-5, measure C): every pass prompt ends with
+    a short format-only reminder, after the artifact, the pass note and any
+    retry note. Single-pass prompts are byte-identical; nothing else moves."""
+
+    CHECK = mp._PASS_FINAL_FORMAT_CHECK
+
+    def setUp(self):
+        self.art = _art()
+        self.budget = _budget_for(self.art, V1, 3)
+        self.plan = _plan(self.art, V1, self.budget)
+        self.pass_artifact = mp.build_pass_artifact(self.art, self.plan, self.plan.passes[1])
+
+    def test_check_is_short_and_format_only(self):
+        self.assertTrue(self.CHECK.startswith("\n\nFINAL FORMAT CHECK: "))
+        self.assertLess(len(self.CHECK.encode("utf-8")), 200)
+        for phrase in ("ONLY one valid JSON object", "no markdown code fences", "no prose before or after it", "Do not omit any required field"):
+            self.assertIn(phrase, self.CHECK)
+
+    def test_a_every_pass_prompt_ends_with_the_check(self):  # A
+        for fmt in (V1, V2):
+            for mode in ("quick", "standard", "pro"):
+                with self.subTest(fmt=fmt, mode=mode):
+                    prompt = llm_client._build_step6_prompt(self.pass_artifact, None, mode, context_format=fmt)
+                    self.assertTrue(prompt.endswith(self.CHECK))
+                    self.assertEqual(prompt.count("FINAL FORMAT CHECK"), 1)
+
+    def test_b_check_comes_after_the_artifact_and_the_pass_note(self):  # B
+        for fmt in (V1, V2):
+            with self.subTest(fmt=fmt):
+                prompt = llm_client._build_step6_prompt(self.pass_artifact, None, "pro", context_format=fmt)
+                encoded = ce.encode_context_artifact(self.pass_artifact, fmt)
+                check_at = prompt.rindex(self.CHECK)
+                self.assertLess(prompt.index(encoded) + len(encoded), check_at)
+                self.assertLess(prompt.index(mp.pass_prompt_note(self.pass_artifact)), check_at)
+
+    def test_c_single_pass_prompts_are_byte_identical(self):  # C
+        selected = dict(_artifact([("src/A.sol", 5, 100)]), contextSelection={"status": "applied", "selectedFiles": [], "excludedFiles": []})
+        self.assertEqual(mp.pass_final_format_check(FAKE_ARTIFACT), "")
+        self.assertEqual(mp.pass_final_format_check(selected), "")
+        for artifact in (FAKE_ARTIFACT, selected):
+            for fmt in (V1, V2):
+                for previous in (None, ["previous error"]):
+                    with self.subTest(selection="contextSelection" in artifact, fmt=fmt, retry=bool(previous)):
+                        prompt = llm_client._build_step6_prompt(artifact, previous, "pro", context_format=fmt)
+                        with mock.patch.object(mp, "_PASS_FINAL_FORMAT_CHECK", "SHOULD NEVER APPEAR"):
+                            self.assertEqual(llm_client._build_step6_prompt(artifact, previous, "pro", context_format=fmt), prompt)
+                        self.assertNotIn("FINAL FORMAT CHECK", prompt)
+
+    def test_d_every_pass_prompt_and_worst_retry_stay_within_budget(self):  # D
+        for entry in self.plan.passes:
+            pass_artifact = mp.build_pass_artifact(self.art, self.plan, entry)
+            for fmt in (V1, V2):
+                with self.subTest(pass_index=entry["passIndex"], fmt=fmt):
+                    worst = llm_client._build_step6_prompt(pass_artifact, ["x" * 40000], "pro", context_format=fmt)
+                    artifact_bytes = len(ce.encode_context_artifact(pass_artifact, fmt).encode("utf-8"))
+                    self.assertLessEqual(len(worst.encode("utf-8")) - artifact_bytes, RESERVE)  # check included in the reserve
+                    self.assertTrue(worst.endswith(self.CHECK))
+
+    def test_e_same_pass_same_prompt(self):  # E
+        again = mp.build_pass_artifact(self.art, self.plan, self.plan.passes[1])
+        for previous in (None, ["e"]):
+            self.assertEqual(llm_client._build_step6_prompt(self.pass_artifact, previous, "pro"),
+                             llm_client._build_step6_prompt(again, previous, "pro"))
+
+    def test_f_retry_note_is_kept_and_the_check_stays_last(self):  # F
+        prompt = llm_client._build_step6_prompt(self.pass_artifact, ["findings[0] missing required field 'status'"], "pro")
+        retry_at = prompt.index("Your previous draft was INVALID")
+        self.assertIn("findings[0] missing required field 'status'", prompt[retry_at:])
+        self.assertLess(retry_at, prompt.rindex(self.CHECK))
+        self.assertTrue(prompt.endswith(self.CHECK))
+
+    def test_g_run_outcome_is_unchanged_except_prompt_bytes(self):  # G
+        def run():
+            provider = ScriptedProvider({2: ["not json", llm_client.ProviderError("provider call failed: Timeout")]})
+            result, counters = _run(self.art, self.budget, provider)
+            return result, provider
+        with mock.patch.object(mp, "_PASS_FINAL_FORMAT_CHECK", ""):
+            before, before_provider = run()
+        after, after_provider = run()
+        extra = len(self.CHECK.encode("utf-8"))
+        strip = lambda passes: [{k: v for k, v in p.items() if k != "promptBytes"} for p in passes]
+        self.assertEqual(strip(after["multiPass"]["passes"]), strip(before["multiPass"]["passes"]))  # files, attempts, statuses
+        self.assertEqual([p["promptBytes"] - q["promptBytes"] for p, q in zip(after["multiPass"]["passes"], before["multiPass"]["passes"])], [extra] * 3)
+        self.assertEqual(after["scoredReport"]["categoryCoverage"], before["scoredReport"]["categoryCoverage"])
+        self.assertEqual(after["scoredReport"]["findings"], before["scoredReport"]["findings"])
+        self.assertEqual(after["scoredReport"]["scope"], before["scoredReport"]["scope"])
+        self.assertEqual([(c["pass"], c["timeout_seconds"]) for c in after_provider.calls], [(c["pass"], c["timeout_seconds"]) for c in before_provider.calls])
+        self.assertTrue(all(c["prompt"].endswith(self.CHECK) for c in after_provider.calls))
+
+
 class PassScopeTests(unittest.TestCase):
     ENTRY = {"passIndex": 2, "passCount": 3, "primaryFiles": ["src/A.sol"], "contextFiles": ["src/B.sol"]}
 

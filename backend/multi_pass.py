@@ -262,6 +262,22 @@ def pass_prompt_note(pass_artifact: Dict[str, Any]) -> str:
     return _PASS_PROMPT_NOTE % (metadata.get("passIndex"), metadata.get("passCount"))
 
 
+# A pass prompt is ~1.5 MB and the contract's own format rule sits before the
+# artifact, so a short restatement closes every pass prompt (docs/decisiones.md
+# D-103, H-5). Format only - it adds no content rule.
+_PASS_FINAL_FORMAT_CHECK = (
+    "\n\nFINAL FORMAT CHECK: respond with ONLY one valid JSON object - no markdown code fences, no prose before "
+    "or after it. Do not omit any required field."
+)
+
+
+def pass_final_format_check(pass_artifact: Dict[str, Any]) -> str:
+    """The fixed closing format reminder for an artifact carrying
+    contextPass; "" otherwise, so every other prompt is byte-identical."""
+    metadata = pass_artifact.get(PASS_FIELD) if isinstance(pass_artifact, dict) else None
+    return _PASS_FINAL_FORMAT_CHECK if isinstance(metadata, dict) else ""
+
+
 def _normalize(path: str) -> str:
     normalized = path.replace("\\", "/")
     while normalized.startswith("./"):

@@ -990,6 +990,7 @@ def _build_step6_prompt(
             "\n\nYour previous draft was INVALID for these reasons - fix them and "
             "return a corrected JSON object, still ONLY the JSON:\n%s" % _bounded_previous_errors(previous_errors)
         )
+    base += multi_pass.pass_final_format_check(preprocess_artifact)  # last in every pass prompt (D-103); "" single-pass
     return base
 
 
