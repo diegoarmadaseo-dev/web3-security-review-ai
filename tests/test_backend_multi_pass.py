@@ -547,12 +547,17 @@ class MergeTests(unittest.TestCase):
     def test_coverage_merge_is_conservative(self):
         drafts = [_valid_draft(), _valid_draft(), _valid_draft()]
         drafts[1]["categoryCoverage"][2]["status"] = "DETECTED"
+        drafts[1]["findings"] = [_finding("src/X.sol", category="SC03")]  # real non-informational backing (D-102)
         art, plan, outcomes = self._plan_and_outcomes(drafts)
         merged, _ = mp.merge_pass_drafts(art, plan, outcomes, "pro")
         coverage = {c["category"]: c["status"] for c in merged["categoryCoverage"]}
         self.assertEqual(coverage["SC03"], "DETECTED")
         self.assertEqual(coverage["SC01"], "NOT_ASSESSED")  # some pass did not assess it
         self.assertEqual(coverage["SC02"], "NOT_DETECTED")
+        drafts[1]["findings"] = []  # the same DETECTED without backing never survives the merge
+        art, plan, outcomes = self._plan_and_outcomes(drafts)
+        merged, _ = mp.merge_pass_drafts(art, plan, outcomes, "pro")
+        self.assertEqual({c["category"]: c["status"] for c in merged["categoryCoverage"]}["SC03"], "NOT_ASSESSED")
 
     def test_notes_suggestions_and_limitations_deduplicated_in_pass_order(self):
         drafts = [_valid_draft(), _valid_draft(), _valid_draft()]
@@ -761,6 +766,95 @@ class ForcedDetectedPartialGlobalTests(unittest.TestCase):
         self.assertEqual(report["scope"]["completeness"], "complete")
         self.assertEqual([c["status"] for c in report["categoryCoverage"]], ["DETECTED"] * 10)
         self.assertEqual(validate_report(report), [])
+
+
+def _informational(path, category):
+    finding = _finding(path, category=category, severity="INFORMATIONAL", function="info_%s" % category.lower())
+    finding["status"] = "informational"
+    return finding
+
+
+class DetectedRequiresEvidenceTests(unittest.TestCase):
+    """docs/decisiones.md D-102 - the second real 20K run's H-4: a pass's
+    DETECTED survives the merge only when a merged non-informational finding
+    backs it; otherwise it becomes NOT_ASSESSED (never NOT_DETECTED).
+    Through the real run: pass validation, discard, merge, one pipeline."""
+
+    def setUp(self):
+        self.art = _art()
+        self.budget = _budget_for(self.art, V1, 3)
+        self.own = [p["primaryFiles"] for p in _plan(self.art, V1, self.budget).passes]
+
+    def _draft(self, findings, detected=()):
+        draft = _valid_draft()
+        draft["findings"] = findings
+        for entry in draft["categoryCoverage"]:
+            entry["status"] = "DETECTED" if entry["category"] in detected else "NOT_DETECTED"
+        return draft
+
+    def _run(self, drafts):
+        result, counters = _run(self.art, self.budget, ScriptedProvider({i + 1: [d] for i, d in enumerate(drafts)}), counters=_WorkerCounters())
+        self.assertEqual([p["status"] for p in result["multiPass"]["passes"]], [mp.PASS_SUCCESS] * 3)
+        return result, result["scoredReport"], {c["category"]: c["status"] for c in result["scoredReport"]["categoryCoverage"]}
+
+    def test_a_detected_without_any_finding_becomes_not_assessed(self):  # A
+        result, report, coverage = self._run([
+            self._draft([], detected=["SC06"]),                                    # pass 1: DETECTED, no SC06 finding
+            self._draft([_finding(self.own[1][0], category="SC08")], ["SC08"]),
+            self._draft([_finding(self.own[2][0], category="SC05")], ["SC05"]),
+        ])
+        self.assertEqual(report["scope"]["completeness"], "complete")
+        self.assertEqual(coverage["SC06"], "NOT_ASSESSED")                          # never NOT_DETECTED
+        self.assertEqual((coverage["SC08"], coverage["SC05"]), ("DETECTED", "DETECTED"))
+        self.assertEqual({k for k, v in coverage.items() if v == "NOT_DETECTED"}, set(mp._SC_CATEGORIES) - {"SC05", "SC06", "SC08"})
+        self.assertEqual(sorted(f["category"] for f in report["findings"]), ["SC05", "SC08"])  # nothing lost or invented
+        self.assertEqual(validate_report(report), [])
+
+    def test_b_and_g_informational_only_category_becomes_not_assessed(self):  # B, G (the SC09 case)
+        result, report, coverage = self._run([
+            self._draft([_informational(self.own[0][0], "SC09"), _finding(self.own[0][0], category="SC01")], ["SC09", "SC01"]),
+            self._draft([_finding(self.own[1][0], category="SC08")], ["SC08"]),
+            self._draft([], []),
+        ])
+        self.assertEqual(coverage["SC09"], "NOT_ASSESSED")
+        self.assertEqual((coverage["SC01"], coverage["SC08"]), ("DETECTED", "DETECTED"))
+        self.assertIn(("SC09", "informational"), [(f["category"], f["status"]) for f in report["findings"]])  # the informational finding stays
+        self.assertEqual(len(report["findings"]), 3)
+        self.assertEqual(validate_report(report), [])
+
+    def test_c_detected_backed_by_another_pass_finding_stays_detected(self):  # C
+        result, report, coverage = self._run([
+            self._draft([], detected=["SC06"]),                                    # no evidence in this pass
+            self._draft([_finding(self.own[1][0], category="SC06")], ["SC06"]),    # real evidence in another pass
+            self._draft([], []),
+        ])
+        self.assertEqual(coverage["SC06"], "DETECTED")
+        self.assertEqual([f["category"] for f in report["findings"]], ["SC06"])
+        self.assertEqual(validate_report(report), [])
+
+    def test_d_discarded_evidence_never_backs_detected(self):  # D (the real SC06 case)
+        out_of_scope = _finding(self.own[1][0], category="SC06", function="g")     # pass 1 locates it in pass 2's file
+        result, report, coverage = self._run([
+            self._draft([out_of_scope], detected=["SC06"]),                         # all its SC06 evidence is discarded
+            self._draft([], detected=["SC06"]),                                     # another pass: DETECTED, no evidence
+            self._draft([_finding(self.own[2][0], category="SC08")], ["SC08"]),
+        ])
+        passes = result["multiPass"]["passes"]
+        self.assertEqual((passes[0]["discardedFindings"], passes[0]["coverageAdjusted"]), (1, ["SC06"]))
+        self.assertEqual(report["scope"]["completeness"], "partial")                # any discard forbids "complete" (D-100)
+        self.assertEqual(coverage["SC06"], "NOT_ASSESSED")
+        self.assertNotIn("SC06", [f["category"] for f in report["findings"]])
+        self.assertEqual(validate_report(report), [])
+
+    def test_e_h1_forced_case_still_renders_with_ten_backed_detected(self):  # E (D-101 unchanged)
+        result, counters = _run(self.art, self.budget, _SplitCategoriesProvider(ForcedDetectedPartialGlobalTests.SPLIT, failing=[2]), counters=_WorkerCounters())
+        report = result["scoredReport"]
+        self.assertEqual(report["scope"]["completeness"], "partial")
+        self.assertEqual([c["status"] for c in report["categoryCoverage"]], ["DETECTED"] * 10)  # no artificial NOT_ASSESSED
+        self.assertEqual(len(report["findings"]), 10)
+        self.assertEqual(counters.render, 1)
+        self.assertEqual(validate_report(report, allow_forced_detected_partial=True), [])
+        self.assertTrue(any("R-05" in e for e in validate_report(report)))  # default R-05 unchanged
 
 
 class DiscardOutOfScopeTests(unittest.TestCase):

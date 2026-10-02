@@ -48,9 +48,10 @@ _order_findings still puts a finding whose first location is primary in
 its pass ahead of any other if that ever changed); gas suggestions,
 architecture notes and limitations concatenated with exact duplicates
 removed; categoryCoverage combined conservatively (DETECTED if any pass
-detected it, NOT_ASSESSED if any pass did not assess it or if any file was
-not analyzed); scope built from the plan and the pass outcomes only, never
-from the model: "complete" only when every ranked file was analyzed as
+detected it and a merged non-informational finding backs it - otherwise
+NOT_ASSESSED, D-102 - NOT_ASSESSED if any pass did not assess it or if any
+file was not analyzed); scope built from the plan and the pass outcomes
+only, never from the model: "complete" only when every ranked file was analyzed as
 primary by a successful pass, no pass failed, no finding or gas suggestion
 was discarded, and preprocessing reported no completeness reason other than
 the mode size limits multi-pass exists to cover (LOC_LIMIT_EXCEEDED /
@@ -478,7 +479,11 @@ def _discard_label(discard: Dict[str, Any]) -> str:
 _SC_CATEGORIES = ["SC%02d" % n for n in range(1, 11)]
 
 
-def _merge_coverage(drafts: List[Dict[str, Any]], complete: bool) -> List[Dict[str, str]]:
+def _merge_coverage(drafts: List[Dict[str, Any]], complete: bool, backed_categories: Set[str]) -> List[Dict[str, str]]:
+    """backed_categories: categories with at least one non-informational
+    finding in the merged report (docs/decisiones.md D-102). A pass's
+    DETECTED survives only for those; otherwise it becomes NOT_ASSESSED -
+    never NOT_DETECTED: a pass reported a detection, so absence is not shown."""
     merged = []
     for category in _SC_CATEGORIES:
         statuses = []
@@ -486,8 +491,10 @@ def _merge_coverage(drafts: List[Dict[str, Any]], complete: bool) -> List[Dict[s
             for entry in draft.get("categoryCoverage") or []:
                 if isinstance(entry, dict) and entry.get("category") == category:
                     statuses.append(entry.get("status"))
-        if "DETECTED" in statuses:
+        if "DETECTED" in statuses and category in backed_categories:
             status = "DETECTED"
+        elif "DETECTED" in statuses:
+            status = "NOT_ASSESSED"
         elif not complete or "NOT_ASSESSED" in statuses or not statuses:
             status = "NOT_ASSESSED"
         else:
@@ -523,8 +530,12 @@ def merge_pass_drafts(artifact: Dict[str, Any], plan: PassPlan, outcomes: List[D
     if languages:
         merged["language"] = languages[0]
     merged["scope"] = scope
-    merged["categoryCoverage"] = _merge_coverage(drafts, scope["completeness"] == "complete")
-    merged["findings"] = [finding for _, _, finding in ordered]
+    findings = [finding for _, _, finding in ordered]
+    # Evidence visible in the report: the merged (already scope-filtered)
+    # findings, non-informational only (D-102).
+    backed_categories = {f.get("category") for f in findings if isinstance(f, dict) and f.get("status") != "informational"}
+    merged["categoryCoverage"] = _merge_coverage(drafts, scope["completeness"] == "complete", backed_categories)
+    merged["findings"] = findings
     fixed = [MULTI_PASS_LIMITATION] + ([MULTI_PASS_DISCARD_LIMITATION] if any(o.get("discardedFindings") or o.get("discardedGasSuggestions") for o in successes) else [])
     merged["limitations"] = _dedupe([item for d in drafts for item in (d.get("limitations") or [])] + fixed)
     gas = [item for d in drafts for item in (d.get("gasSuggestions") or [])]
