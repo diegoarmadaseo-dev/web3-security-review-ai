@@ -122,7 +122,10 @@ never gets silently rendered the same way as one that was actually checked and c
 `validate_report.py` checks, in addition to shape and enums:
 
 - Every category referenced by a non-informational finding has `categoryCoverage` status `DETECTED`.
-- `scope.completeness` other than `complete` implies at least one `NOT_ASSESSED` category.
+- `scope.completeness` other than `complete` implies at least one `NOT_ASSESSED` category. Single
+  exception, for the merged multi-pass report only: a `partial` report whose ten categories are all
+  `DETECTED`, each backed by a non-informational finding, is accepted - the rule above forbids any
+  `NOT_ASSESSED` there, and `scope` and `limitations` still state that the analysis is partial.
 - Per-mode feature gating - which modes allow `patch`, `gasSuggestions`, an HTML report,
   `architectureNotes`, or `executiveSummary` - lives in `config/modes.json`, not here (rules R-06/R-09);
   this file only owns the score formula and deduplication rules above.

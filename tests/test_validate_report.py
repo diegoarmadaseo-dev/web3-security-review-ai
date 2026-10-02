@@ -263,6 +263,127 @@ class PartialCoverageRuleFlagTests(unittest.TestCase):
         self.assertTrue(any("R-05" in e for e in payload["errors"]))
 
 
+def make_all_detected_report(completeness: str = "partial", informational=()) -> dict:
+    """A scored report whose ten categories are all DETECTED, each backed by
+    one finding (informational for the categories listed in `informational`,
+    non-informational otherwise)."""
+    draft = make_valid_report()
+    findings = []
+    for index, category in enumerate(SC_CATEGORIES):
+        finding = _base_finding()
+        finding["category"] = category
+        finding["signature"] = "sig-%s" % category.lower()
+        finding["locations"] = [{"file": "A.sol", "lineStart": 10 + index, "lineEnd": 10 + index, "contract": "A", "function": "f%d" % index}]
+        if category in informational:
+            finding["severity"] = "INFORMATIONAL"
+            finding["status"] = "informational"
+        findings.append(finding)
+    draft["findings"] = findings
+    draft["categoryCoverage"] = [{"category": c, "status": "DETECTED"} for c in SC_CATEGORIES]
+    draft["scope"] = {"completeness": completeness, "reasons": [{"code": "MULTI_PASS_FAILED_PASSES", "detail": "pass 1 of 2 failed"}]}
+    return score.score_report(draft)
+
+
+class ForcedDetectedPartialTests(unittest.TestCase):
+    """allow_forced_detected_partial (docs/decisiones.md D-101): with it, R-05
+    is satisfied ONLY for a "partial" report whose ten categories are all
+    DETECTED, each backed by a valid non-informational finding (R-04 then
+    forbids every NOT_ASSESSED). Off by default; no other rule changes."""
+
+    @staticmethod
+    def _r05(errors):
+        return [e for e in errors if "R-05" in e]
+
+    def test_forced_case_fails_by_default_and_passes_with_the_flag(self):
+        report = make_all_detected_report()
+        self.assertEqual(len(report["findings"]), 10)
+        default = validate_report.validate_report(report)
+        self.assertEqual(len(default), 1)
+        self.assertIn("R-05", default[0])
+        self.assertEqual(validate_report.validate_report(report, allow_forced_detected_partial=True), [])
+
+    def test_a_detected_category_without_non_informational_support_still_fails(self):
+        for informational in (("SC04",), ("SC01", "SC10")):
+            with self.subTest(informational=informational):
+                report = make_all_detected_report(informational=informational)
+                errors = validate_report.validate_report(report, allow_forced_detected_partial=True)
+                self.assertEqual(len(self._r05(errors)), 1)
+        dropped = make_all_detected_report()
+        dropped["findings"] = [f for f in dropped["findings"] if f["category"] != "SC07"]  # SC07 DETECTED, no finding
+        self.assertEqual(len(self._r05(validate_report.validate_report(dropped, allow_forced_detected_partial=True))), 1)
+
+    def test_failed_scope_still_fails(self):
+        report = make_all_detected_report(completeness="failed")
+        errors = validate_report.validate_report(report, allow_forced_detected_partial=True)
+        self.assertEqual(len(self._r05(errors)), 1)
+
+    def test_not_detected_without_not_assessed_still_fails(self):
+        report = make_all_detected_report()
+        report["findings"] = [f for f in report["findings"] if f["category"] != "SC03"]
+        report["categoryCoverage"][2]["status"] = "NOT_DETECTED"
+        errors = validate_report.validate_report(report, allow_forced_detected_partial=True)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("R-05", errors[0])
+
+    def test_r04_is_identical_with_and_without_the_flag(self):
+        cases = []
+        r04 = make_all_detected_report()
+        r04["categoryCoverage"][4]["status"] = "NOT_ASSESSED"             # finding references SC05 -> R-04
+        cases.append(r04)
+        r04_not_detected = make_all_detected_report()
+        r04_not_detected["categoryCoverage"][4]["status"] = "NOT_DETECTED"
+        cases.append(r04_not_detected)
+        single = copy.deepcopy(make_valid_report())
+        single["categoryCoverage"][0]["status"] = "NOT_DETECTED"
+        cases.append(single)
+        for index, report in enumerate(cases):
+            with self.subTest(case=index):
+                default = [e for e in validate_report.validate_report(report) if "R-04" in e]
+                flagged = [e for e in validate_report.validate_report(report, allow_forced_detected_partial=True) if "R-04" in e]
+                self.assertTrue(default)
+                self.assertEqual(flagged, default)
+
+    def test_the_flag_only_ever_removes_the_forced_r05_error(self):
+        cases = [make_valid_report(), make_valid_report(with_finding=False), make_all_detected_report(),
+                 make_all_detected_report(completeness="failed"), make_all_detected_report(informational=("SC02",))]
+        partial = make_valid_report()
+        partial["scope"]["completeness"] = "partial"
+        cases.append(partial)
+        broken = make_all_detected_report()
+        del broken["limitations"]
+        cases.append(broken)
+        for index, report in enumerate(cases):
+            with self.subTest(case=index):
+                default = validate_report.validate_report(report)
+                flagged = validate_report.validate_report(report, allow_forced_detected_partial=True)
+                self.assertEqual([e for e in default if "R-05" not in e], [e for e in flagged if "R-05" not in e])
+                self.assertLessEqual(len(self._r05(flagged)), len(self._r05(default)))
+        missing = validate_report.validate_report(broken, allow_forced_detected_partial=True)
+        self.assertTrue(any("limitations" in e for e in missing))  # other rules still fail the forced case
+
+    def test_complete_report_is_unchanged(self):
+        for report in (make_valid_report(), make_all_detected_report(completeness="complete")):
+            with self.subTest(completeness=report["scope"]["completeness"]):
+                self.assertEqual(validate_report.validate_report(report), [])
+                self.assertEqual(validate_report.validate_report(report, allow_forced_detected_partial=True), [])
+
+    def test_default_equals_explicit_false(self):
+        for report in (make_valid_report(), make_all_detected_report(), make_all_detected_report(completeness="failed")):
+            self.assertEqual(validate_report.validate_report(report),
+                             validate_report.validate_report(report, allow_forced_detected_partial=False))
+
+    def test_cli_does_not_expose_the_flag_and_keeps_r05(self):
+        report = make_all_detected_report()
+        with mock.patch.object(validate_report, "_read_input", return_value=report), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            validate_report.main(["report.json"])
+        payload = json.loads(out.getvalue())
+        self.assertEqual(payload["reportStatus"], "invalid")
+        self.assertTrue(any("R-05" in e for e in payload["errors"]))
+        options = {o for action in validate_report.build_arg_parser()._actions for o in action.option_strings}
+        self.assertFalse([o for o in options if "forced" in o or "detected" in o])
+
+
 class ShapeAndEnumTests(unittest.TestCase):
     def test_missing_top_level_field_is_rejected(self):
         bad = make_valid_report()

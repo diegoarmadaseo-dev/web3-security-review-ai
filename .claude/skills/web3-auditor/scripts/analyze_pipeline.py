@@ -84,6 +84,7 @@ def run_analyze_pipeline(
     use_stdin: bool = False,
     render_format: str = "markdown",
     modes_config: Optional[Dict[str, Any]] = None,
+    allow_forced_detected_partial: bool = False,
 ) -> Dict[str, Any]:
     """Runs Step 3 (preprocess) once, then Step 7 (score) + Step 8
     (validate) on draft_report; if valid, runs Step 9 (render) and returns a
@@ -94,7 +95,11 @@ def run_analyze_pipeline(
     plainly... never present an unvalidated report as if it were normal."
 
     attempt must be 1, 2, or 3; any other value raises immediately, before
-    Step 3 even runs - SKILL.md's cap is never silently exceeded."""
+    Step 3 even runs - SKILL.md's cap is never silently exceeded.
+
+    allow_forced_detected_partial (default False) is internal and only
+    forwarded to validate_report(); only the merged multi-pass report sets
+    it (docs/decisiones.md D-101). The CLI never exposes it."""
     _require(isinstance(attempt, int) and not isinstance(attempt, bool), "attempt must be an integer, not %r" % (attempt,))
     _require(1 <= attempt <= _MAX_ATTEMPTS, "attempt must be between 1 and %d (SKILL.md Step 8: at most 2 retries) - got %r" % (_MAX_ATTEMPTS, attempt))
     _require(render_format in ("markdown", "html"), "render_format must be 'markdown' or 'html', not %r" % (render_format,))
@@ -109,7 +114,7 @@ def run_analyze_pipeline(
     )
 
     scored = score_report(draft_report)
-    errors = validate_report(scored)
+    errors = validate_report(scored, allow_forced_detected_partial=allow_forced_detected_partial)
 
     if errors:
         if attempt >= _MAX_ATTEMPTS:

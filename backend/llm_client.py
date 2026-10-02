@@ -1328,10 +1328,15 @@ def _run_multi_pass(
     location_errors = multi_pass.merged_location_errors(provenance, merged, plan, outcomes)
     if location_errors:
         raise Step6Failed("Step 6 multi-pass merge produced out-of-scope locations: %s" % _bounded_failure("; ".join(location_errors)))
+    # allow_forced_detected_partial (docs/decisiones.md D-101): a partial
+    # merged report whose ten categories are all DETECTED, each backed by a
+    # non-informational finding, cannot satisfy R-05 without breaking R-04;
+    # its incompleteness is carried by scope/limitations. Only this call sets it.
     try:
         result = run_analyze_pipeline(
             source_paths, mode=mode, draft_report=merged, attempt=1,
             use_stdin=False, render_format=render_format, modes_config=modes_config,
+            allow_forced_detected_partial=True,
         )
     except Exception as exc:
         raise Step6Failed("Step 6 multi-pass final pipeline failed: %s" % _bounded_failure(str(exc)))

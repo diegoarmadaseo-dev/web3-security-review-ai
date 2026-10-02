@@ -126,16 +126,18 @@ class _Counters:
         self.render = 0
         self.validate_pass = 0
         self.pipeline_drafts = []
+        self.pipeline_forced_flags = []
 
     def validator(self, draft):
         self.validate_pass += 1
         return validate_report(score_report(draft))
 
-    def pipeline_fn(self, paths, *, mode, draft_report, attempt, use_stdin, render_format, modes_config):
+    def pipeline_fn(self, paths, *, mode, draft_report, attempt, use_stdin, render_format, modes_config, allow_forced_detected_partial=False):
         self.pipeline += 1
         self.pipeline_drafts.append(copy.deepcopy(draft_report))
+        self.pipeline_forced_flags.append(allow_forced_detected_partial)
         scored = score_report(draft_report)
-        errors = validate_report(scored)
+        errors = validate_report(scored, allow_forced_detected_partial=allow_forced_detected_partial)
         if errors:
             return {"status": "needs_revision", "errors": errors}
         self.render += 1
@@ -677,6 +679,88 @@ class R05GlobalOnlyTests(unittest.TestCase):
         with self.assertRaises(llm_client.Step6Failed) as ctx:
             _run(self.art, self.budget, _AllAssessedProvider(), counters=_Counters())
         self.assertIn("R-05", str(ctx.exception))
+
+
+class _SplitCategoriesProvider(ScriptedProvider):
+    """Pass i answers with one non-informational finding per category in
+    categories[i] (all in its first primary file), those categories
+    DETECTED and the rest NOT_DETECTED - no NOT_ASSESSED; passes listed in
+    `failing` raise a provider error on every attempt."""
+
+    def __init__(self, categories, failing=()):
+        super().__init__()
+        self.categories = categories
+        self.failing = set(failing)
+
+    def complete(self, prompt, max_output_tokens, timeout_seconds):
+        index = _pass_index(prompt)
+        self.calls.append({"pass": index, "prompt": prompt, "timeout_seconds": timeout_seconds})
+        if index in self.failing:
+            raise llm_client.ProviderError("provider call failed: Timeout")
+        cats = self.categories.get(index, [])
+        primary = _primary_files(prompt)[0]
+        draft = _valid_draft()
+        draft["findings"] = [_finding(primary, category=c, function="f_%s" % c.lower()) for c in cats]
+        for entry in draft["categoryCoverage"]:
+            entry["status"] = "DETECTED" if entry["category"] in cats else "NOT_DETECTED"
+        return json.dumps(draft)
+
+
+class ForcedDetectedPartialGlobalTests(unittest.TestCase):
+    """docs/decisiones.md D-101 - the real 20K run's H-1: a failed pass makes
+    the merged report "partial", the other passes' findings cover all ten
+    categories, so R-04 forbids every NOT_ASSESSED that R-05 asked for. The
+    merged report must render, still "partial", nothing converted or lost."""
+
+    SPLIT = {1: ["SC01", "SC02", "SC03", "SC04", "SC05"], 3: ["SC06", "SC07", "SC08", "SC09", "SC10"]}
+
+    def setUp(self):
+        self.art = _art()
+        self.budget = _budget_for(self.art, V1, 3)
+
+    def test_failed_pass_with_all_categories_detected_renders_as_partial(self):
+        result, counters = _run(self.art, self.budget, _SplitCategoriesProvider(self.SPLIT, failing=[2]), counters=_WorkerCounters())
+        self.assertEqual([p["status"] for p in result["multiPass"]["passes"]], [mp.PASS_SUCCESS, mp.PASS_FAILED, mp.PASS_SUCCESS])
+        self.assertEqual((counters.pipeline, counters.render), (1, 1))
+        self.assertEqual(counters.pipeline_forced_flags, [True])  # only the merged report's validation sets it
+        report = result["scoredReport"]
+        self.assertEqual(report["scope"]["completeness"], "partial")
+        codes = [r["code"] for r in report["scope"]["reasons"]]
+        self.assertIn(mp.FAILED_PASSES_REASON_CODE, codes)
+        self.assertIn(mp.MULTI_PASS_LIMITATION, report["limitations"])
+        self.assertEqual([c["status"] for c in report["categoryCoverage"]], ["DETECTED"] * 10)  # nothing converted
+        self.assertNotIn("NOT_ASSESSED", [c["status"] for c in report["categoryCoverage"]])     # nothing fabricated
+        self.assertEqual(sorted(f["category"] for f in report["findings"]), sorted(c for cats in self.SPLIT.values() for c in cats))  # nothing lost
+        self.assertEqual(validate_report(report, allow_forced_detected_partial=True), [])
+        self.assertTrue(any("R-05" in e for e in validate_report(report)))  # the default (single-pass, CLI) still rejects it
+        self.assertIn("partial", result["rendered"])
+        self.assertIn(mp.FAILED_PASSES_REASON_CODE, result["rendered"])
+
+    def test_same_run_without_the_exception_fails_closed_on_r05(self):
+        # The pre-D-101 global validation: a pipeline that ignores the flag.
+        class _NoExceptionCounters(_WorkerCounters):
+            def pipeline_fn(self, paths, *, allow_forced_detected_partial=False, **kwargs):
+                return super().pipeline_fn(paths, allow_forced_detected_partial=False, **kwargs)
+        with self.assertRaises(llm_client.Step6Failed) as ctx:
+            _run(self.art, self.budget, _SplitCategoriesProvider(self.SPLIT, failing=[2]), counters=_NoExceptionCounters())
+        self.assertIn("R-05", str(ctx.exception))
+
+    def test_a_category_left_undetected_still_becomes_not_assessed(self):
+        split = {1: ["SC01", "SC02", "SC03", "SC04"], 3: ["SC06", "SC07", "SC08", "SC09", "SC10"]}  # SC05 never detected
+        result, counters = _run(self.art, self.budget, _SplitCategoriesProvider(split, failing=[2]), counters=_WorkerCounters())
+        report = result["scoredReport"]
+        self.assertEqual(report["scope"]["completeness"], "partial")
+        statuses = {c["category"]: c["status"] for c in report["categoryCoverage"]}
+        self.assertEqual(statuses["SC05"], "NOT_ASSESSED")
+        self.assertEqual([s for s in statuses.values() if s != "DETECTED"], ["NOT_ASSESSED"])
+        self.assertEqual(validate_report(report), [])  # satisfies the unchanged default R-05 as before
+
+    def test_complete_run_with_all_categories_detected_is_unchanged(self):
+        result, _ = _run(self.art, self.budget, _SplitCategoriesProvider(self.SPLIT), counters=_WorkerCounters())
+        report = result["scoredReport"]
+        self.assertEqual(report["scope"]["completeness"], "complete")
+        self.assertEqual([c["status"] for c in report["categoryCoverage"]], ["DETECTED"] * 10)
+        self.assertEqual(validate_report(report), [])
 
 
 class DiscardOutOfScopeTests(unittest.TestCase):

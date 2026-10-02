@@ -289,7 +289,17 @@ def _validate_architecture_notes(notes: Any, errors: ErrorCollector) -> None:
         errors.require(not unknown, "%s has unknown fields: %s" % (path, sorted(unknown)))
 
 
-def validate_report(report: Any, *, enforce_partial_coverage_rule: bool = True) -> List[str]:
+def _every_category_forced_detected(coverage_by_category: Dict[str, str], referenced_categories: set) -> bool:
+    """True only when all ten SC categories are DETECTED AND each one is
+    referenced by at least one valid non-informational finding - i.e. rule
+    R-04 itself forbids every one of them from being NOT_ASSESSED. A
+    DETECTED category without such a finding never counts."""
+    return (set(coverage_by_category) == set(SC_CATEGORIES)
+            and all(status == "DETECTED" for status in coverage_by_category.values())
+            and set(SC_CATEGORIES) <= referenced_categories)
+
+
+def validate_report(report: Any, *, enforce_partial_coverage_rule: bool = True, allow_forced_detected_partial: bool = False) -> List[str]:
     """Validates a report and returns every error found.
 
     enforce_partial_coverage_rule (default True) applies rule R-05, which
@@ -299,7 +309,16 @@ def validate_report(report: Any, *, enforce_partial_coverage_rule: bool = True) 
     intermediate multi-pass draft, whose "partial" means "this pass covers
     only part of the submission", not "a category could not be assessed";
     R-05 is applied later to the merged report that is actually rendered.
-    No other rule is affected by this flag."""
+    No other rule is affected by this flag.
+
+    allow_forced_detected_partial (default False) is internal: only the
+    merged multi-pass report's validation sets it (docs/decisiones.md
+    D-101). With it, R-05 counts as satisfied in exactly one case - scope
+    "partial" (never "failed"), all ten categories DETECTED and each backed
+    by a valid non-informational finding - where R-04 makes any
+    NOT_ASSESSED impossible; the report's incompleteness is then carried by
+    scope.completeness/reasons and limitations. Every other R-05 case, and
+    every other rule (R-04 included), is unchanged."""
     if not isinstance(report, dict):
         raise ReportValidationError("report must be a JSON object")
 
@@ -358,7 +377,9 @@ def validate_report(report: Any, *, enforce_partial_coverage_rule: bool = True) 
             )
 
     if enforce_partial_coverage_rule and completeness in ("partial", "failed"):
-        if coverage_by_category and "NOT_ASSESSED" not in coverage_by_category.values():
+        forced = (allow_forced_detected_partial and completeness == "partial"
+                  and _every_category_forced_detected(coverage_by_category, referenced_categories))
+        if coverage_by_category and "NOT_ASSESSED" not in coverage_by_category.values() and not forced:
             errors.add(
                 "scope.completeness is %r but no categoryCoverage entry is 'NOT_ASSESSED' "
                 "(rule R-05: a partial analysis must never look complete)" % completeness

@@ -156,6 +156,76 @@ class AnalyzePipelineTests(unittest.TestCase):
             ap.run_analyze_pipeline([self.src_path], mode="not-a-real-mode", draft_report=make_raw_draft(), attempt=1)
 
 
+MULTI_PASS_REASONS = [
+    {"code": "LOC_LIMIT_EXCEEDED", "detail": "Effective LOC exceeds the mode limit."},
+    {"code": "MULTI_PASS_ANALYSIS", "detail": "Analyzed in 2 deterministic whole-file pass(es): 1 of 2 source files analyzed as primary by a successful pass."},
+    {"code": "MULTI_PASS_FAILED_PASSES", "detail": "pass 2 of 2 failed (provider error) - files not analyzed: B.sol"},
+]
+MULTI_PASS_LIMITATION_TEXT = "Multi-pass analysis: limitation carried into the merged report."
+
+
+def make_all_detected_partial_draft():
+    """A pre-score merged multi-pass draft: scope "partial", all ten
+    categories DETECTED, each backed by one non-informational finding."""
+    draft = make_raw_draft(mode="pro")
+    findings = []
+    for index, category in enumerate(SC_CATEGORIES):
+        finding = _base_finding()
+        finding.update({"category": category, "signature": "sig-%s" % category.lower(), "severity": "LOW"})
+        finding["locations"] = [{"file": "A.sol", "lineStart": 1, "lineEnd": 1, "contract": "A", "function": "f%d" % index}]
+        findings.append(finding)
+    draft["findings"] = findings
+    draft["categoryCoverage"] = [{"category": c, "status": "DETECTED"} for c in SC_CATEGORIES]
+    draft["scope"] = {"completeness": "partial", "reasons": MULTI_PASS_REASONS}
+    draft["limitations"] = [MULTI_PASS_LIMITATION_TEXT]
+    return draft
+
+
+class ForcedDetectedPartialTests(unittest.TestCase):
+    """allow_forced_detected_partial (docs/decisiones.md D-101): forwarded
+    to validate_report() only; off by default and absent from the CLI."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.src_path = str(Path(self._tmp.name) / "A.sol")
+        with open(self.src_path, "w", encoding="utf-8") as fh:
+            fh.write(SOURCE_TEXT)
+
+    def test_without_the_flag_the_forced_case_needs_revision(self):
+        result = ap.run_analyze_pipeline([self.src_path], mode="pro", draft_report=make_all_detected_partial_draft(), attempt=1)
+        self.assertEqual(result["status"], "needs_revision")
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertIn("R-05", result["errors"][0])
+
+    def test_with_the_flag_it_renders_and_still_declares_partial(self):
+        for render_format in ("markdown", "html"):
+            with self.subTest(render_format=render_format):
+                result = ap.run_analyze_pipeline([self.src_path], mode="pro", draft_report=make_all_detected_partial_draft(), attempt=1,
+                                                 render_format=render_format, allow_forced_detected_partial=True)
+                self.assertEqual(result["status"], "rendered")
+                report = result["scoredReport"]
+                self.assertEqual(report["scope"]["completeness"], "partial")
+                self.assertEqual([r["code"] for r in report["scope"]["reasons"]], [r["code"] for r in MULTI_PASS_REASONS])
+                self.assertEqual(report["limitations"], [MULTI_PASS_LIMITATION_TEXT])
+                self.assertEqual([c["status"] for c in report["categoryCoverage"]], ["DETECTED"] * 10)
+                self.assertEqual(len(report["findings"]), 10)
+                self.assertIn("partial", result["rendered"])
+                self.assertIn("MULTI_PASS_FAILED_PASSES", result["rendered"])
+                self.assertIn(MULTI_PASS_LIMITATION_TEXT, result["rendered"])
+
+    def test_the_flag_does_not_rescue_other_errors(self):
+        draft = make_all_detected_partial_draft()
+        draft["categoryCoverage"][3]["status"] = "NOT_DETECTED"  # R-04 (SC04 has a finding)
+        result = ap.run_analyze_pipeline([self.src_path], mode="pro", draft_report=draft, attempt=1, allow_forced_detected_partial=True)
+        self.assertEqual(result["status"], "needs_revision")
+        self.assertTrue(any("R-04" in e for e in result["errors"]))
+
+    def test_cli_does_not_expose_the_flag(self):
+        options = {o for action in ap.build_arg_parser(ap.load_modes_config())._actions for o in action.option_strings}
+        self.assertFalse([o for o in options if "forced" in o or "detected" in o])
+
+
 class CliTests(unittest.TestCase):
     def _run_cli(self, argv):
         stdout = io.StringIO()
