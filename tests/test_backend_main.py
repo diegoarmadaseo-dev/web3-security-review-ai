@@ -49,8 +49,7 @@ _FAKE_WEB_ENV = {
     "HOST_ALLOWLIST": "example.com,app.example.com",
     "STRIPE_SECRET_KEY": "sk_test_fake",
     "STRIPE_WEBHOOK_SECRET": "whsec_fake",
-    "STRIPE_PRICE_QUICK_MONTHLY": "price_quick_monthly",
-    "STRIPE_PRICE_QUICK_ANNUAL": "price_quick_annual",
+    "STRIPE_PRICE_QUICK_ONETIME": "price_quick_onetime",
     "STRIPE_PRICE_STANDARD_MONTHLY": "price_standard_monthly",
     "STRIPE_PRICE_STANDARD_ANNUAL": "price_standard_annual",
     "STRIPE_PRICE_PRO_MONTHLY": "price_pro_monthly",
@@ -141,18 +140,38 @@ class WebRoleFailFastTests(unittest.TestCase):
     def test_missing_stripe_secret_key_fails_fast(self):
         self._assert_missing_var_fails_fast("STRIPE_SECRET_KEY")
 
-    def test_missing_stripe_price_for_one_plan_interval_fails_fast(self):
-        # D-086: 6 logical Prices now (3 plans x 2 intervals) - confirms
-        # the allowlist is built explicitly per (plan, interval) pair, one
-        # var each - a single missing combination must fail startup,
-        # never silently sell only 5 of 6 plan/interval combinations.
+    def test_missing_stripe_price_for_any_price_mode_fails_fast(self):
+        # D-107: all 5 price modes (Quick one-time + Standard/Pro monthly/
+        # annual) are required - a single missing one must fail startup.
         for var in (
-            "STRIPE_PRICE_QUICK_MONTHLY", "STRIPE_PRICE_QUICK_ANNUAL",
+            "STRIPE_PRICE_QUICK_ONETIME",
             "STRIPE_PRICE_STANDARD_MONTHLY", "STRIPE_PRICE_STANDARD_ANNUAL",
             "STRIPE_PRICE_PRO_MONTHLY", "STRIPE_PRICE_PRO_ANNUAL",
         ):
             with self.subTest(var=var):
                 self._assert_missing_var_fails_fast(var)
+
+    def test_all_five_price_modes_are_loaded(self):
+        with patch.dict(os.environ, _FAKE_WEB_ENV, clear=True):
+            cfg = main._load_web_config()
+        self.assertEqual(cfg["stripe_price_allowlist"]["vericexa_quick_onetime"], "price_quick_onetime")
+        self.assertEqual(len(cfg["stripe_price_allowlist"]), 5)
+
+    def test_retired_d086_quick_subscription_variables_are_rejected(self):
+        for var in ("STRIPE_PRICE_QUICK_MONTHLY", "STRIPE_PRICE_QUICK_ANNUAL"):
+            env = dict(_FAKE_WEB_ENV, **{var: "price_old_quick"})
+            with self.subTest(var=var), patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(main.ConfigError) as ctx:
+                    main._load_web_config()
+                self.assertIn(var, str(ctx.exception))
+
+    def test_malformed_or_reused_price_ids_are_rejected(self):
+        for override in ({"STRIPE_PRICE_PRO_ANNUAL": "not-a-price"},
+                         {"STRIPE_PRICE_PRO_ANNUAL": "price_standard_monthly"}):
+            env = dict(_FAKE_WEB_ENV, **override)
+            with self.subTest(override=override), patch.dict(os.environ, env, clear=True):
+                with self.assertRaises(main.ConfigError):
+                    main._load_web_config()
 
     def test_missing_s3_bucket_fails_fast_before_boto3_is_needed(self):
         self._assert_missing_var_fails_fast("S3_BUCKET")
@@ -189,8 +208,8 @@ class WebRoleFailFastTests(unittest.TestCase):
             storage = main._build_storage(cfg["s3_bucket"], cfg["s3_region"])
             billing = main._build_billing(cfg["stripe_secret_key"], cfg["stripe_webhook_secret"], cfg["stripe_price_allowlist"])
         self.assertIsNotNone(storage)
-        self.assertEqual(billing.resolve_price_id("quick", "monthly"), "price_quick_monthly")
-        self.assertEqual(billing.resolve_price_id("quick", "annual"), "price_quick_annual")
+        self.assertEqual(billing.resolve_price_id("quick", "one_time"), "price_quick_onetime")
+        self.assertEqual(billing.resolve_price_id("standard", "annual"), "price_standard_annual")
         self.assertEqual(billing.resolve_price_id("pro", "annual"), "price_pro_annual")
 
 

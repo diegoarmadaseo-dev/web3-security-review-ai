@@ -121,21 +121,22 @@ class MigrationIntegrationTests(unittest.TestCase):
         self.conn, self.applied = _reset_database_and_migrate()
         self.addCleanup(self.conn.close)
 
-    def test_fresh_database_applies_all_eight_migrations_in_order(self):
+    def test_fresh_database_applies_all_nine_migrations_in_order(self):
         # 0002_auth_tokens.sql (Phase 2), 0003_entitlement_status_expand.sql
         # and 0004_entitlement_event_provenance.sql (Phase 3),
         # 0005_job_queue_hardening.sql (Phase 4, D-079),
         # 0006_retention_purge.sql (Phase 6A, D-081),
         # 0007_billing_interval.sql (Phase 7, D-086), and
         # 0008_queue_fairness.sql (admission control / queue fairness,
-        # post reap-atomicity-fix and worker-fencing hardening) added
-        # alongside 0001_initial_schema.sql (Phase 1).
+        # post reap-atomicity-fix and worker-fencing hardening) and
+        # 0009_commercial_usage.sql (D-107) added alongside
+        # 0001_initial_schema.sql (Phase 1).
         self.assertEqual(
             self.applied,
             [
                 "0001_initial_schema", "0002_auth_tokens", "0003_entitlement_status_expand",
                 "0004_entitlement_event_provenance", "0005_job_queue_hardening", "0006_retention_purge",
-                "0007_billing_interval", "0008_queue_fairness",
+                "0007_billing_interval", "0008_queue_fairness", "0009_commercial_usage",
             ],
         )
 
@@ -158,7 +159,7 @@ class MigrationIntegrationTests(unittest.TestCase):
             seen_statuses.add(repo.get_entitlement_by_workspace(self.conn, workspace_id)["status"])
         self.assertEqual(seen_statuses, {"incomplete_expired", "unpaid"})
 
-    def test_all_fifteen_tables_exist(self):
+    def test_all_eighteen_tables_exist(self):
         cur = db.execute(
             self.conn,
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
@@ -170,6 +171,7 @@ class MigrationIntegrationTests(unittest.TestCase):
             "audit_events", "webhook_events", "auth_tokens",
             "workspace_budgets",  # Phase 4, 0005_job_queue_hardening.sql (D-079).
             "workspace_queue_state",  # Admission control / queue fairness, 0008_queue_fairness.sql.
+            "scan_credits", "usage_periods", "job_usage",  # D-107, 0009_commercial_usage.sql.
         }
         self.assertEqual(tables, expected)
 
@@ -750,7 +752,7 @@ class WebhookHardeningIntegrationTests(unittest.TestCase):
         # failure class that triggered the original bug.
         return {
             "id": "sub_pg_1", "customer": "cus_pg_1", "status": "active",
-            "metadata": {"workspace_id": "00000000-0000-0000-0000-000000000000", "plan": "quick"},
+            "metadata": {"workspace_id": "00000000-0000-0000-0000-000000000000", "plan": "standard"},
             "items": {"data": []},
         }
 
@@ -763,7 +765,7 @@ class WebhookHardeningIntegrationTests(unittest.TestCase):
         workspace_id = repo.create_workspace(self.conn, "PG Retry WS", owner)
         self.conn.commit()
         fixed_event = dict(self._doomed_event())
-        fixed_event["metadata"] = {"workspace_id": workspace_id, "plan": "quick"}
+        fixed_event["metadata"] = {"workspace_id": workspace_id, "plan": "standard"}
 
         second = self._process_once(event_id, event_type, fixed_event)
         self.assertEqual(second, "succeeded")
@@ -801,7 +803,7 @@ class WebhookHardeningIntegrationTests(unittest.TestCase):
         workspace_id = repo.create_workspace(self.conn, "PG Retry Concurrent WS", owner)
         self.conn.commit()
         fixed_event = dict(self._doomed_event())
-        fixed_event["metadata"] = {"workspace_id": workspace_id, "plan": "quick"}
+        fixed_event["metadata"] = {"workspace_id": workspace_id, "plan": "standard"}
 
         barrier = threading.Barrier(2)
         results = {}
@@ -937,7 +939,7 @@ class HttpJobSubmitConcurrencyIntegrationTests(unittest.TestCase):
         status, payload = self._request("POST", "/workspaces", {"name": "PG HTTP Idem WS"}, cookie=cookie)
         self.assertEqual(status, 200, payload)
         workspace_id = payload["workspace_id"]
-        repo.create_entitlement(self.conn, workspace_id, "quick", "active")
+        repo.create_entitlement(self.conn, workspace_id, "standard", "active", billing_interval="monthly")
         self.conn.commit()
 
         for round_number in range(3):  # "repeat several times" - a fresh idempotency_key per round, same workspace/server.
@@ -986,7 +988,7 @@ class HttpJobSubmitConcurrencyIntegrationTests(unittest.TestCase):
         status, payload = self._request("POST", "/workspaces", {"name": "PG HTTP Idem WS 2"}, cookie=cookie)
         self.assertEqual(status, 200, payload)
         workspace_id = payload["workspace_id"]
-        repo.create_entitlement(self.conn, workspace_id, "quick", "active")
+        repo.create_entitlement(self.conn, workspace_id, "standard", "active", billing_interval="monthly")
         self.conn.commit()
 
         status_1, payload_1 = self._request(

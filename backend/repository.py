@@ -39,9 +39,10 @@ import os
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import backend.db as db
+import backend.plans as plans
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SQLITE_SCHEMA_PATH = os.path.join(SCRIPT_DIR, "schema_sqlite.sql")
@@ -248,6 +249,7 @@ def create_entitlement(
     current_period_end: Optional[str] = None,
     stripe_event_created_at: Optional[str] = None,
     billing_interval: Optional[str] = None,
+    current_period_start: Optional[str] = None,
 ) -> str:
     """stripe_event_created_at (docs/decisiones.md D-077 follow-up,
     Phase 3 webhook hardening) establishes the ordering baseline this
@@ -271,9 +273,11 @@ def create_entitlement(
     db.execute(
         conn,
         "INSERT INTO entitlements "
-        "(id, workspace_id, plan, status, stripe_customer_id, stripe_subscription_id, current_period_end, stripe_event_created_at, billing_interval, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (entitlement_id, workspace_id, plan, status, stripe_customer_id, stripe_subscription_id, current_period_end, stripe_event_created_at, billing_interval, now, now),
+        "(id, workspace_id, plan, status, stripe_customer_id, stripe_subscription_id, current_period_end, stripe_event_created_at, billing_interval, "
+        "current_period_start, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (entitlement_id, workspace_id, plan, status, stripe_customer_id, stripe_subscription_id, current_period_end, stripe_event_created_at, billing_interval,
+         current_period_start, now, now),
     )
     conn.commit()
     return entitlement_id
@@ -286,6 +290,10 @@ def update_entitlement_status(
     current_period_end: Optional[str] = None,
     stripe_event_created_at: Optional[str] = None,
     billing_interval: Optional[str] = None,
+    plan: Optional[str] = None,
+    current_period_start: Optional[str] = None,
+    stripe_customer_id: Optional[str] = None,
+    stripe_subscription_id: Optional[str] = None,
 ) -> bool:
     """Returns True if a row was updated, False if this workspace has no
     entitlement row yet (caller must create one via create_entitlement()
@@ -315,22 +323,32 @@ def update_entitlement_status(
     billing_interval (D-086) uses the same COALESCE-on-None pattern as
     current_period_end - a status-only update (e.g. invoice.paid, which
     carries no interval of its own) never wipes out a previously-recorded
-    value."""
+    value.
+
+    plan / current_period_start / stripe_customer_id / stripe_subscription_id
+    (D-107) follow the same COALESCE-on-None rule: a subscription event
+    carries the plan resolved from its own Price ID (a portal upgrade,
+    downgrade or monthly<->annual switch changes it) and its period start
+    (the service-month anchor); a status-only event leaves them as they
+    are."""
+    if plan is not None and plan not in plans.PLANS:
+        raise RepositoryError("plan must be one of %s, got %r" % (sorted(plans.PLANS), plan))
+    sets = ("status = ?, current_period_end = COALESCE(?, current_period_end), billing_interval = COALESCE(?, billing_interval), "
+            "plan = COALESCE(?, plan), current_period_start = COALESCE(?, current_period_start), "
+            "stripe_customer_id = COALESCE(?, stripe_customer_id), stripe_subscription_id = COALESCE(?, stripe_subscription_id), ")
+    values = (status, current_period_end, billing_interval, plan, current_period_start, stripe_customer_id, stripe_subscription_id)
     if stripe_event_created_at is None:
         cur = db.execute(
             conn,
-            "UPDATE entitlements SET status = ?, current_period_end = COALESCE(?, current_period_end), "
-            "billing_interval = COALESCE(?, billing_interval), updated_at = ? WHERE workspace_id = ?",
-            (status, current_period_end, billing_interval, utcnow_iso(), workspace_id),
+            "UPDATE entitlements SET " + sets + "updated_at = ? WHERE workspace_id = ?",
+            values + (utcnow_iso(), workspace_id),
         )
     else:
         cur = db.execute(
             conn,
-            "UPDATE entitlements SET status = ?, current_period_end = COALESCE(?, current_period_end), "
-            "billing_interval = COALESCE(?, billing_interval), "
-            "stripe_event_created_at = ?, updated_at = ? "
+            "UPDATE entitlements SET " + sets + "stripe_event_created_at = ?, updated_at = ? "
             "WHERE workspace_id = ? AND (stripe_event_created_at IS NULL OR stripe_event_created_at < ?)",
-            (status, current_period_end, billing_interval, stripe_event_created_at, utcnow_iso(), workspace_id, stripe_event_created_at),
+            values + (stripe_event_created_at, utcnow_iso(), workspace_id, stripe_event_created_at),
         )
     conn.commit()
     return cur.rowcount > 0
@@ -439,6 +457,15 @@ def enqueue_job(
     this SAME transaction. Same ON CONFLICT syntax on both backends - no
     placeholder-style translation exists for it in backend/db.py, and
     none is needed; both engines accept it identically."""
+    job_id = _insert_job(conn, workspace_id, contract_id, requested_by_user_id, mode, idempotency_key)
+    conn.commit()
+    return job_id
+
+
+def _insert_job(conn: Any, workspace_id: str, contract_id: str, requested_by_user_id: str, mode: str, idempotency_key: Optional[str]) -> str:
+    """enqueue_job()'s two statements without the commit, so
+    enqueue_job_with_usage() can put the usage reservation in the SAME
+    transaction."""
     if mode not in ("quick", "standard", "pro"):
         raise RepositoryError("mode must be one of quick/standard/pro, got %r" % mode)
     job_id = new_id()
@@ -455,7 +482,6 @@ def enqueue_job(
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (job_id, workspace_id, contract_id, requested_by_user_id, mode, idempotency_key, now),
     )
-    conn.commit()
     return job_id
 
 
@@ -854,6 +880,8 @@ def reap_expired_jobs(conn: Any, max_attempts: int = _MAX_JOB_ATTEMPTS) -> Dict[
                     "UPDATE workspace_budgets SET reserved_units = reserved_units - ?, updated_at = ? WHERE workspace_id = ?",
                     (JOB_MODE_BUDGET_COST.get(job["mode"], 1), utcnow_iso(), job["workspace_id"]),
                 )
+            if not will_requeue:
+                _settle_job_usage(conn, job["id"], "release")   # D-107: a requeued job keeps its reservation
             conn.commit()  # the ONE commit for this row - job transition and budget release land together, or neither does.
         except Exception:
             conn.rollback()
@@ -878,11 +906,7 @@ def reap_expired_jobs(conn: Any, max_attempts: int = _MAX_JOB_ATTEMPTS) -> Dict[
 # it reads, never a second hand-copied version.
 # ---------------------------------------------------------------------------
 
-PLAN_ALLOWED_MODES = {
-    "quick": frozenset({"quick"}),
-    "standard": frozenset({"quick", "standard"}),
-    "pro": frozenset({"quick", "standard", "pro"}),
-}
+PLAN_ALLOWED_MODES = plans.PLAN_ALLOWED_MODES   # D-107: the catalog is the single source; values unchanged
 
 # ---------------------------------------------------------------------------
 # Workspace spend control (Phase 4 - a units ledger, never money/billing;
@@ -1019,6 +1043,8 @@ def transition_job_status(
             "UPDATE analysis_jobs SET status = ?, last_error = COALESCE(?, last_error) WHERE id = ? AND status = ?",
             (to_status, error, job_id, from_status),
         )
+    if cur.rowcount > 0:
+        _settle_for_transition(conn, job_id, to_status)
     conn.commit()
     return cur.rowcount > 0
 
@@ -1138,11 +1164,269 @@ def finalize_job_attempt(
                 "UPDATE workspace_budgets SET reserved_units = reserved_units - ?, updated_at = ? WHERE workspace_id = ?",
                 (budget_units, now, workspace_id),
             )
+        _settle_for_transition(conn, job_id, to_status)   # D-107 usage: consume on success, release on failure
         conn.commit()  # the ONE commit for this attempt - transition, report and budget land together, or none do.
     except Exception:
         conn.rollback()
         raise
     return {"applied": True, "report_id": report_id}
+
+
+# ---------------------------------------------------------------------------
+# Commercial usage (docs/decisiones.md D-107) - effective LOC allowance and
+# Quick scan credits. Separate from workspace_budgets above (an internal
+# technical cost guard in units, unchanged) and from any HTTP rate limit.
+#
+# WHEN USAGE IS TAKEN: a submission RESERVES (never consumes) in the same
+# transaction that enqueues the job - a Quick scan credit, or the scan's
+# effective LOC against the current service month - so concurrent
+# submissions can never overshoot the allowance. The reservation is
+# SETTLED exactly once, in the same transaction as the job's terminal
+# transition:
+#   succeeded (complete or partial scope) -> consumed
+#   failed (engine error, timeout, budget exhausted, reaped after the last
+#     attempt) or canceled                -> released (given back)
+#   requeued by the reaper (worker died, lease expired, retry left)
+#                                         -> stays reserved, still pending
+# job_usage.job_id is the PRIMARY KEY and every settlement is a conditional
+# UPDATE on status = 'reserved', so a retried, duplicated or racing
+# finalization can never consume or release twice. A reservation made in
+# one service month is settled against that month even if the job ends
+# in the next one.
+# ---------------------------------------------------------------------------
+
+class UsageLimitError(RepositoryError):
+    """A submission refused by the commercial contract. `code` is a
+    stable machine-readable reason for the HTTP layer."""
+
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
+
+
+def _parse_iso(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def usage_period_for_entitlement(entitlement: Dict[str, Any], now: Optional[datetime] = None) -> Tuple[str, str]:
+    """The [start, end) SERVICE MONTH (ISO-8601 UTC) a Standard/Pro
+    entitlement is metered in right now: whole months counted from the
+    subscription's current_period_start (monthly: the current billing
+    period; annual: month 1..12 of the paid year), falling back to the
+    entitlement row's own created_at when no period start is known yet.
+    Never accumulates months and never rolls unused LOC over."""
+    now = now or datetime.now(timezone.utc)
+    anchor = _parse_iso(entitlement.get("current_period_start")) or _parse_iso(entitlement.get("created_at")) or now
+    start, end = plans.service_month(anchor.astimezone(timezone.utc), now.astimezone(timezone.utc))
+    return start.isoformat(), end.isoformat()
+
+
+def grant_scan_credit(conn: Any, credit_id: str, workspace_id: str) -> bool:
+    """Grants one Quick scan credit for one paid checkout. credit_id is the
+    Stripe Checkout Session id, so a redelivered or duplicated webhook is
+    a no-op (returns False) instead of a second credit."""
+    now = utcnow_iso()
+    cur = db.execute(
+        conn,
+        "INSERT INTO scan_credits (id, workspace_id, status, job_id, granted_at, updated_at) VALUES (?, ?, 'available', NULL, ?, ?) "
+        "ON CONFLICT (id) DO NOTHING",
+        (credit_id, workspace_id, now, now),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def _reserve_scan_credit(conn: Any, workspace_id: str, job_id: str) -> Optional[str]:
+    for _ in range(5):   # a concurrent submission may take the oldest credit first: look again
+        cur = db.execute(
+            conn,
+            "SELECT id FROM scan_credits WHERE workspace_id = ? AND status = 'available' ORDER BY granted_at, id LIMIT 1",
+            (workspace_id,),
+        )
+        row = db.normalize_row(cur.fetchone())
+        if row is None:
+            return None
+        cur = db.execute(
+            conn,
+            "UPDATE scan_credits SET status = 'reserved', job_id = ?, updated_at = ? WHERE id = ? AND status = 'available'",
+            (job_id, utcnow_iso(), row["id"]),
+        )
+        if cur.rowcount > 0:
+            return row["id"]
+    return None
+
+
+def enqueue_job_with_usage(
+    conn: Any,
+    workspace_id: str,
+    contract_id: str,
+    requested_by_user_id: str,
+    mode: str,
+    idempotency_key: Optional[str],
+    entitlement: Dict[str, Any],
+    effective_loc: int,
+    now: Optional[datetime] = None,
+) -> str:
+    """Admission control for one submission: checks the plan's per-scan
+    ceiling, then enqueues the job AND reserves its usage in ONE
+    transaction (one commit) - a Quick scan credit or the scan's effective
+    LOC against the current service month. Raises UsageLimitError (after
+    rolling back: no job, no reservation) when the plan does not allow it;
+    no overage is ever granted. An IntegrityError from the job INSERT (a
+    concurrent duplicate idempotency_key) propagates unchanged for the
+    caller's existing duplicate handling, before any reservation exists."""
+    plan_name = entitlement.get("plan")
+    if plan_name not in plans.PLANS:
+        raise UsageLimitError("plan_unknown", "the workspace entitlement has no known plan")
+    spec = plans.PLANS[plan_name]
+    if not isinstance(effective_loc, int) or effective_loc <= 0:
+        raise UsageLimitError("no_source_code", "the submission contains no Solidity/Vyper source code (0 effective LOC)")
+    if effective_loc > spec["max_loc_per_scan"]:
+        raise UsageLimitError(
+            "loc_per_scan_limit_exceeded",
+            "the submission has %d effective LOC; the %s plan allows at most %d per scan" % (effective_loc, spec["display_name"], spec["max_loc_per_scan"]),
+        )
+    job_id = _insert_job(conn, workspace_id, contract_id, requested_by_user_id, mode, idempotency_key)
+    try:
+        now_iso = utcnow_iso()
+        if spec["usage_model"] == plans.USAGE_SCAN_CREDIT:
+            credit_id = _reserve_scan_credit(conn, workspace_id, job_id)
+            if credit_id is None:
+                conn.rollback()
+                raise UsageLimitError("no_scan_credit", "no unused Quick scan is available: each Quick purchase includes exactly one scan")
+            db.execute(
+                conn,
+                "INSERT INTO job_usage (job_id, workspace_id, plan, usage_model, effective_loc, period_start, credit_id, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, 'scan_credit', ?, NULL, ?, 'reserved', ?, ?)",
+                (job_id, workspace_id, plan_name, effective_loc, credit_id, now_iso, now_iso),
+            )
+        else:
+            limit = spec["monthly_loc_quota"]
+            period_start, period_end = usage_period_for_entitlement(entitlement, now)
+            db.execute(
+                conn,
+                "INSERT INTO usage_periods (workspace_id, period_start, period_end, limit_loc, reserved_loc, consumed_loc, updated_at) "
+                "VALUES (?, ?, ?, ?, 0, 0, ?) ON CONFLICT (workspace_id, period_start) DO NOTHING",
+                (workspace_id, period_start, period_end, limit, now_iso),
+            )
+            cur = db.execute(
+                conn,
+                "UPDATE usage_periods SET reserved_loc = reserved_loc + ?, limit_loc = ?, updated_at = ? "
+                "WHERE workspace_id = ? AND period_start = ? AND reserved_loc + consumed_loc + ? <= ?",
+                (effective_loc, limit, now_iso, workspace_id, period_start, effective_loc, limit),
+            )
+            if cur.rowcount == 0:
+                conn.rollback()
+                raise UsageLimitError(
+                    "loc_quota_exceeded",
+                    "the submission has %d effective LOC, more than what is left of this service month's %d effective LOC allowance" % (effective_loc, limit),
+                )
+            db.execute(
+                conn,
+                "INSERT INTO job_usage (job_id, workspace_id, plan, usage_model, effective_loc, period_start, credit_id, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, 'service_month', ?, ?, NULL, 'reserved', ?, ?)",
+                (job_id, workspace_id, plan_name, effective_loc, period_start, now_iso, now_iso),
+            )
+        conn.commit()
+    except UsageLimitError:
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    return job_id
+
+
+def _settle_job_usage(conn: Any, job_id: str, action: str) -> bool:
+    """Consumes or releases a job's reservation exactly once. Never
+    commits: always called inside the caller's own job-transition
+    transaction. A job with no usage row (enqueued before D-107, or via
+    enqueue_job()) or one already settled is a silent no-op."""
+    cur = db.execute(conn, "SELECT * FROM job_usage WHERE job_id = ? AND status = 'reserved'", (job_id,))
+    row = db.normalize_row(cur.fetchone())
+    if row is None:
+        return False
+    now = utcnow_iso()
+    cur = db.execute(
+        conn,
+        "UPDATE job_usage SET status = ?, updated_at = ? WHERE job_id = ? AND status = 'reserved'",
+        ("consumed" if action == "consume" else "released", now, job_id),
+    )
+    if cur.rowcount == 0:
+        return False
+    if row["usage_model"] == plans.USAGE_SCAN_CREDIT:
+        if action == "consume":
+            db.execute(conn, "UPDATE scan_credits SET status = 'consumed', updated_at = ? WHERE id = ? AND status = 'reserved'", (now, row["credit_id"]))
+        else:
+            db.execute(conn, "UPDATE scan_credits SET status = 'available', job_id = NULL, updated_at = ? WHERE id = ? AND status = 'reserved'", (now, row["credit_id"]))
+    elif action == "consume":
+        db.execute(
+            conn,
+            "UPDATE usage_periods SET reserved_loc = reserved_loc - ?, consumed_loc = consumed_loc + ?, updated_at = ? WHERE workspace_id = ? AND period_start = ?",
+            (row["effective_loc"], row["effective_loc"], now, row["workspace_id"], row["period_start"]),
+        )
+    else:
+        db.execute(
+            conn,
+            "UPDATE usage_periods SET reserved_loc = reserved_loc - ?, updated_at = ? WHERE workspace_id = ? AND period_start = ?",
+            (row["effective_loc"], now, row["workspace_id"], row["period_start"]),
+        )
+    return True
+
+
+def _settle_for_transition(conn: Any, job_id: str, to_status: str) -> None:
+    if to_status == "succeeded":
+        _settle_job_usage(conn, job_id, "consume")
+    elif to_status in ("failed", "canceled"):
+        _settle_job_usage(conn, job_id, "release")
+
+
+def get_job_usage(conn: Any, job_id: str) -> Optional[Dict[str, Any]]:
+    cur = db.execute(conn, "SELECT * FROM job_usage WHERE job_id = ?", (job_id,))
+    return db.normalize_row(cur.fetchone())
+
+
+def usage_summary(conn: Any, workspace_id: str, entitlement: Optional[Dict[str, Any]], now: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
+    """What the workspace's plan allows and how much of it is used, for
+    GET /workspaces/<id>. None without an entitlement. state follows
+    plans.usage_state(); it describes the NEXT request only - a blocked
+    allowance refuses new scans, never the account."""
+    if entitlement is None or entitlement.get("plan") not in plans.PLANS:
+        return None
+    spec = plans.PLANS[entitlement["plan"]]
+    out: Dict[str, Any] = {
+        "plan": entitlement["plan"],
+        "billing_type": spec["billing_type"],
+        "billing_interval": entitlement.get("billing_interval") if spec["billing_type"] == plans.BILLING_SUBSCRIPTION else plans.INTERVAL_ONE_TIME,
+        "usage_model": spec["usage_model"],
+        "max_loc_per_scan": spec["max_loc_per_scan"],
+        "max_projects": spec["max_projects"],
+        "max_members": spec["max_members"],
+    }
+    if spec["usage_model"] == plans.USAGE_SCAN_CREDIT:
+        cur = db.execute(conn, "SELECT status, COUNT(*) AS n FROM scan_credits WHERE workspace_id = ? GROUP BY status", (workspace_id,))
+        counts = {r["status"]: r["n"] for r in (db.normalize_row(x) for x in cur.fetchall())}
+        available = counts.get("available", 0)
+        out.update({"scans_available": available, "scans_reserved": counts.get("reserved", 0), "scans_consumed": counts.get("consumed", 0),
+                    "state": plans.STATE_NORMAL if available > 0 else plans.STATE_BLOCKED})
+        return out
+    period_start, period_end = usage_period_for_entitlement(entitlement, now)
+    cur = db.execute(conn, "SELECT reserved_loc, consumed_loc FROM usage_periods WHERE workspace_id = ? AND period_start = ?", (workspace_id, period_start))
+    row = db.normalize_row(cur.fetchone()) or {"reserved_loc": 0, "consumed_loc": 0}
+    limit = spec["monthly_loc_quota"]
+    used = row["reserved_loc"] + row["consumed_loc"]
+    out.update({"period_start": period_start, "period_end": period_end, "loc_limit": limit, "loc_reserved": row["reserved_loc"],
+                "loc_consumed": row["consumed_loc"], "loc_used": used, "loc_remaining": max(0, limit - used), "state": plans.usage_state(used, limit)})
+    return out
 
 
 # ---------------------------------------------------------------------------

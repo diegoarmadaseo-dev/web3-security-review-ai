@@ -22,7 +22,7 @@
 #     -e DATABASE_URL=... -e HOST_ALLOWLIST=... \
 #     -e S3_BUCKET=... -e S3_REGION=... \
 #     -e STRIPE_SECRET_KEY=... -e STRIPE_WEBHOOK_SECRET=... \
-#     -e STRIPE_PRICE_QUICK_MONTHLY=... -e STRIPE_PRICE_QUICK_ANNUAL=... \
+#     -e STRIPE_PRICE_QUICK_ONETIME=... \
 #     -e STRIPE_PRICE_STANDARD_MONTHLY=... -e STRIPE_PRICE_STANDARD_ANNUAL=... \
 #     -e STRIPE_PRICE_PRO_MONTHLY=... -e STRIPE_PRICE_PRO_ANNUAL=... \
 #     vericexa-web:local
@@ -49,11 +49,15 @@
 # no `anthropic` SDK here (that is worker-image-only, see Dockerfile.worker;
 # ROLE=web never calls an LLM provider).
 #
-# config/modes.json (NOT the rest of .claude/skills/web3-auditor/) is
-# copied in because backend/http_app.py's own _load_modes_config() reads it
-# directly as JSON, best-effort, for entitlement/limit reporting on
-# GET /workspaces/<id> - see that function's own docstring. No Python
-# script from the Skill is ever imported by ROLE=web.
+# config/ and scripts/ of .claude/skills/web3-auditor/ are copied in:
+# backend/http_app.py's own _load_modes_config() reads config/modes.json
+# directly as JSON, best-effort, for limit reporting on GET
+# /workspaces/<id>; and since D-107 backend/loc_count.py imports
+# scripts/preprocess.py's LEXING functions (normalize/bundle split/
+# language/comment masking/line_metrics) to measure a submission's
+# effective LOC exactly as the worker will, for the plan's per-scan and
+# monthly limits. ROLE=web never runs structure parsing, detectors, the
+# pipeline or an LLM - those stay in the per-job worker container.
 #
 # NON-ROOT RUNTIME: a dedicated, unprivileged `appuser` owns /app and is
 # the container's own USER - ROLE=web accepts untrusted public HTTP input,
@@ -83,7 +87,8 @@ COPY backend/requirements.txt /app/backend/requirements.txt
 RUN pip install --no-cache-dir -r /app/backend/requirements.txt
 
 COPY backend/ /app/backend/
-COPY .claude/skills/web3-auditor/config/modes.json /app/.claude/skills/web3-auditor/config/modes.json
+COPY .claude/skills/web3-auditor/config/ /app/.claude/skills/web3-auditor/config/
+COPY .claude/skills/web3-auditor/scripts/ /app/.claude/skills/web3-auditor/scripts/
 RUN touch /app/backend/__init__.py \
     && chown -R appuser:appuser /app
 

@@ -47,7 +47,8 @@ what the code actually reads.
 |---|---|---|---|
 | `STRIPE_SECRET_KEY` | Stripe API secret key. | Yes | **Yes** |
 | `STRIPE_WEBHOOK_SECRET` | Verifies `Stripe-Signature` on `/billing/webhook`. | Yes | **Yes** |
-| `STRIPE_PRICE_QUICK_MONTHLY` / `_ANNUAL`, `STRIPE_PRICE_STANDARD_MONTHLY` / `_ANNUAL`, `STRIPE_PRICE_PRO_MONTHLY` / `_ANNUAL` | The only (plan, interval) -> Stripe Price ID mapping (`backend/billing.py`'s `resolve_price_id()`/`price_key()`, D-086). 6 IDs, not amounts - no price/currency is set anywhere in code (the confirmed $19/$39/$79 monthly, $190/$390/$790 annual - D-086 - live only in `website/content.py`'s marketing copy and in whatever amount each real Stripe Price object is configured with). | Yes (all 6) | No |
+| `STRIPE_PRICE_STANDARD_MONTHLY` / `_ANNUAL`, `STRIPE_PRICE_PRO_MONTHLY` / `_ANNUAL` | Stripe Price IDs of the 4 subscription price modes of the Launch catalog (`backend/plans.py`, D-107: Standard $199.99/month or $1,999.90/year, Pro $289.99/month or $2,899.90/year; annual = 12 service months, usage still metered per service month). Validated at startup (`price_...` shape, no ID reused). | Yes (all 4) | No |
+| `STRIPE_PRICE_QUICK_ONETIME` | Stripe Price ID of Quick ($29.99, one-time payment - Checkout `mode=payment`, never a subscription - exactly 1 scan of up to 3,000 effective LOC). Same validation as the other four. The retired D-086 variables `STRIPE_PRICE_QUICK_MONTHLY` / `_ANNUAL` are a startup error if set. | Yes | No |
 
 Business decisions confirmed in D-086 (prices, billing interval, Black
 Friday) are no longer open - see that entry. Still NOT in code: currency,

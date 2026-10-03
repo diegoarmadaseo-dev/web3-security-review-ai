@@ -111,6 +111,7 @@ import backend.egress_proxy as egress_proxy
 import backend.email_sender as email_sender_module
 import backend.http_app as http_app
 import backend.object_storage as object_storage
+import backend.plans as plans
 import backend.repository as repo
 import backend.worker_supervisor as worker_supervisor
 
@@ -357,17 +358,9 @@ def _load_web_config() -> Dict[str, Any]:
         "s3_region": _require_env("S3_REGION"),
         "stripe_secret_key": _require_env("STRIPE_SECRET_KEY"),
         "stripe_webhook_secret": _require_env("STRIPE_WEBHOOK_SECRET"),
-        # Phase 7 (D-086): 6 logical Prices (3 plans x 2 intervals), keyed
-        # via billing_module.price_key() - the SAME function backend/
-        # billing.py's own resolve_price_id() uses to look this dict back
-        # up, so the key FORMAT is never hand-typed in two places. Every
-        # one of the 6 env vars is required - there is no partial/
-        # monthly-only or annual-only deployment shape.
-        "stripe_price_allowlist": {
-            billing_module.price_key(plan, interval): _require_env("STRIPE_PRICE_%s_%s" % (plan.upper(), interval.upper()))
-            for plan in ("quick", "standard", "pro")
-            for interval in ("monthly", "annual")
-        },
+        # D-107: the Launch catalog's 5 price modes (backend/plans.py) ->
+        # Stripe Price IDs, one required STRIPE_PRICE_* variable each.
+        "stripe_price_allowlist": _load_stripe_price_allowlist(),
         # Phase 6A: bounded grace period for _serve_until_shutdown() below
         # - "shutdown timeout is configurable" per that phase's own spec.
         "shutdown_grace_seconds": _int_env("SHUTDOWN_GRACE_SECONDS", 30),
@@ -376,6 +369,28 @@ def _load_web_config() -> Dict[str, Any]:
     cfg.update(_load_email_config())
     cfg.update(_load_black_friday_config())
     return cfg
+
+
+def _load_stripe_price_allowlist() -> Dict[str, str]:
+    """Price mode key -> Stripe Price ID from backend/plans.py
+    PRICE_ENV_VARS, validated by billing.validate_price_allowlist()
+    (catalog keys only, all five required, price_... shape, no Price ID
+    reused). The retired D-086 Quick subscription variables are a
+    configuration error when set - never silently ignored, so nobody can
+    believe an old Price is still sellable."""
+    legacy = [name for name in plans.LEGACY_PRICE_ENV_VARS if os.environ.get(name, "").strip()]
+    if legacy:
+        raise ConfigError("%s no longer exist (D-107: Quick is a one-time price, STRIPE_PRICE_QUICK_ONETIME) - remove them" % ", ".join(legacy))
+    allowlist: Dict[str, str] = {}
+    for key, env_name in plans.PRICE_ENV_VARS.items():
+        value = os.environ.get(env_name, "").strip()
+        if not value:
+            raise ConfigError("%s is required" % env_name)
+        allowlist[key] = value
+    try:
+        return billing_module.validate_price_allowlist(allowlist)
+    except billing_module.BillingError as exc:
+        raise ConfigError(str(exc))
 
 
 def _load_worker_config() -> Dict[str, Any]:

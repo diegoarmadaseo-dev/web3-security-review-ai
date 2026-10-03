@@ -14,14 +14,21 @@ code). This also makes every function here trivially testable with fake
 config and no real network access.
 
 PRICE SECURITY: create_checkout_session() takes an internal PLAN NAME
-("quick"/"standard"/"pro") and INTERVAL ("monthly"/"annual"), never a
-Stripe Price ID - resolve_price_id() is the one place a (plan, interval)
-pair is looked up (via price_key()) against the server-supplied
-price_allowlist, now 6 entries deep (D-086, docs/decisiones.md) - Stripe
-Price ID -> plan/interval mapping is the caller's config, not this
-module's. An unrecognized plan, interval, or combination raises
-PriceNotAllowedError; there is no code path that accepts a client-
-supplied Price ID at all, so there is nothing to tamper with.
+("quick"/"standard"/"pro") and INTERVAL ("one_time" for Quick,
+"monthly"/"annual" for Standard/Pro), never a Stripe Price ID -
+resolve_price_id() is the one place a (plan, interval) pair becomes a
+price mode of backend/plans.py's Launch catalog (D-107: 3 plans, 5 price
+modes) and is looked up in the server-supplied price_allowlist (price
+mode key -> Stripe Price ID, built by backend/main.py from STRIPE_PRICE_*
+variables; all five are required). An unrecognized plan, interval, or
+combination raises PriceNotAllowedError; a price mode without a Price ID
+in the allowlist (unreachable once validate_price_allowlist() has passed;
+kept as a defensive guard) raises BillingNotConfiguredError - checkout
+then fails closed, never falling back to another Price. There is no code
+path that accepts a client-supplied Price ID at all. The reverse lookup
+(plan_for_price_id) is what webhook handling uses to resolve a
+subscription's plan from its own Price ID: a Price ID outside the
+allowlist (e.g. a retired D-086 price) never maps to any plan.
 
 BLACK FRIDAY DISCOUNT SECURITY (D-086): create_checkout_session()'s
 black_friday_promotion_code_id parameter is likewise never client-
@@ -81,19 +88,23 @@ try:
 except ImportError:  # optional - see module docstring.
     stripe = None
 
-_ALLOWED_PLANS = ("quick", "standard", "pro")
-_ALLOWED_INTERVALS = ("monthly", "annual")
+import re
+
+import backend.plans as plans
+
+_PRICE_ID_RE = re.compile(r"^price_[A-Za-z0-9_]+$")
 
 
-def price_key(plan: str, interval: str) -> str:
-    """The ONE place a (plan, interval) pair becomes a price_allowlist
-    key (D-086) - "quick_monthly", "quick_annual", etc. Used both here
-    (resolve_price_id) and by backend/main.py when building the
-    allowlist from 6 STRIPE_PRICE_* env vars, so the key FORMAT itself
-    is never hand-typed twice. Does not validate plan/interval itself -
-    resolve_price_id() below is the one place that raises for an
-    unrecognized pair; this is a pure string-formatting helper only."""
-    return "%s_%s" % (plan, interval)
+def price_key(plan: str, interval: str) -> Optional[str]:
+    """The price mode key (backend/plans.py PRICE_MODES, D-107) that sells
+    `plan` at `interval` - e.g. ("standard", "annual") ->
+    "vericexa_standard_annual" - or None for a combination the Launch
+    catalog does not sell (quick+monthly, pro+one_time, ...)."""
+    return plans.price_mode_key(plan, interval)
+
+
+def is_valid_price_id(value: Any) -> bool:
+    return isinstance(value, str) and _PRICE_ID_RE.match(value) is not None
 
 
 class BillingError(Exception):
@@ -106,6 +117,13 @@ class BillingError(Exception):
 class PriceNotAllowedError(BillingError):
     """A caller asked to check out a plan name not in the server-side
     allowlist - see module docstring on price security."""
+
+
+class BillingNotConfiguredError(BillingError):
+    """The requested price mode is sold by the catalog but has no Stripe
+    Price ID in the allowlist. Defensive only: validate_price_allowlist()
+    requires all five. The HTTP layer answers billing_not_configured; no
+    other Price is ever substituted."""
 
 
 class WebhookVerificationError(BillingError):
@@ -150,6 +168,28 @@ def subscription_period_end(subscription: Dict[str, Any]) -> Optional[str]:
     return stripe_timestamp_to_iso(items[0].get("current_period_end"))
 
 
+def subscription_period_start(subscription: Dict[str, Any]) -> Optional[str]:
+    """current_period_start of the subscription's first item - the
+    service-month anchor (backend/plans.py service_month(), D-107)."""
+    items = ((subscription.get("items") or {}).get("data")) or []
+    if not items:
+        return None
+    return stripe_timestamp_to_iso(items[0].get("current_period_start"))
+
+
+def subscription_price_id(subscription: Dict[str, Any]) -> Optional[str]:
+    """The Price ID of the subscription's first item (one price per
+    subscription in this catalog), or None when the object carries no
+    item/price at all."""
+    items = ((subscription.get("items") or {}).get("data")) or []
+    if not items:
+        return None
+    price = items[0].get("price")
+    if isinstance(price, dict):
+        price = price.get("id")
+    return price if isinstance(price, str) and price else None
+
+
 def invoice_workspace_id(invoice: Dict[str, Any]) -> Optional[str]:
     """Public for the same reason as subscription_period_end() above. See
     module docstring on invoice metadata inheritance uncertainty across
@@ -174,23 +214,31 @@ class StripeBilling:
             raise BillingError("secret_key is required")
         if not isinstance(webhook_secret, str) or not webhook_secret:
             raise BillingError("webhook_secret is required")
-        if not price_allowlist:
-            raise BillingError("price_allowlist must contain at least one plan_interval -> Price ID mapping")
+        self._price_allowlist: Dict[str, str] = validate_price_allowlist(price_allowlist)
         self._client = stripe.StripeClient(secret_key)
         self._webhook_secret = webhook_secret
-        self._price_allowlist: Dict[str, str] = dict(price_allowlist)
 
     def resolve_price_id(self, plan: str, interval: str) -> str:
         """The ONE place a (plan, interval) pair becomes a Stripe Price
-        ID - see module docstring on price security. price_key() is the
-        single source of truth for how the pair becomes an allowlist
-        key; this is the only function that ever looks one up."""
-        if plan not in _ALLOWED_PLANS or interval not in _ALLOWED_INTERVALS:
-            raise PriceNotAllowedError("plan %r / interval %r is not an allowlisted, sellable combination" % (plan, interval))
-        key = price_key(plan, interval)
+        ID - see module docstring on price security."""
+        key = price_key(plan, interval) if isinstance(plan, str) and isinstance(interval, str) else None
+        if key is None:
+            raise PriceNotAllowedError("plan %r / interval %r is not a sellable combination" % (plan, interval))
         if key not in self._price_allowlist:
-            raise PriceNotAllowedError("plan %r / interval %r is not an allowlisted, sellable combination" % (plan, interval))
+            raise BillingNotConfiguredError("the Stripe Price ID for %s is not configured" % key)
         return self._price_allowlist[key]
+
+    def plan_for_price_id(self, price_id: Optional[str]) -> Optional[Dict[str, str]]:
+        """{"plan", "interval", "price_mode"} for a configured Price ID, or
+        None for any other value (retired, unknown, absent)."""
+        for key, value in self._price_allowlist.items():
+            if price_id is not None and value == price_id:
+                mode = plans.PRICE_MODES[key]
+                return {"plan": str(mode["plan"]), "interval": str(mode["interval"]), "price_mode": key}
+        return None
+
+    def configured_price_modes(self) -> Dict[str, str]:
+        return dict(self._price_allowlist)
 
     def create_checkout_session(
         self,
@@ -224,20 +272,29 @@ class StripeBilling:
         product's Black Friday offer is automatic, no code the customer
         ever sees or types - see docs/decisiones.md D-086)."""
         price_id = self.resolve_price_id(plan, interval)
+        mode = plans.PRICE_MODES[price_key(plan, interval)]
+        metadata = {"workspace_id": workspace_id, "plan": plan, "interval": interval}
         params: Dict[str, Any] = {
-            "mode": "subscription",
+            "mode": mode["checkout_mode"],
             "line_items": [{"price": price_id, "quantity": 1}],
             "success_url": success_url,
             "cancel_url": cancel_url,
             "client_reference_id": workspace_id,
-            "metadata": {"workspace_id": workspace_id, "plan": plan, "interval": interval},
-            "subscription_data": {"metadata": {"workspace_id": workspace_id, "plan": plan, "interval": interval}},
+            "metadata": dict(metadata),
         }
+        if mode["checkout_mode"] == "subscription":
+            params["subscription_data"] = {"metadata": dict(metadata)}
+        else:
+            # Quick (D-107): a one-time payment, no subscription. A Customer
+            # is always created so the purchase stays attributable.
+            params["payment_intent_data"] = {"metadata": dict(metadata)}
+            if not customer_id:
+                params["customer_creation"] = "always"
         if customer_id:
             params["customer"] = customer_id
         elif customer_email:
             params["customer_email"] = customer_email
-        if black_friday_promotion_code_id:
+        if black_friday_promotion_code_id and mode["checkout_mode"] == "subscription":
             params["discounts"] = [{"promotion_code": black_friday_promotion_code_id}]
         return self._client.checkout.sessions.create(params)
 
@@ -258,3 +315,25 @@ class StripeBilling:
             return stripe.Webhook.construct_event(payload, sig_header, self._webhook_secret)
         except (ValueError, stripe.SignatureVerificationError) as exc:
             raise WebhookVerificationError(str(exc)) from exc
+
+
+def validate_price_allowlist(price_allowlist: Dict[str, str]) -> Dict[str, str]:
+    """Checks a price mode key -> Price ID mapping against the Launch
+    catalog (D-107): only backend/plans.py PRICE_MODES keys, all five
+    modes present, every value shaped like a
+    Stripe Price ID, and no Price ID used for two modes (the reverse
+    lookup must be unambiguous). Raises BillingError; returns a copy."""
+    if not isinstance(price_allowlist, dict):
+        raise BillingError("price_allowlist must be a dict of price mode -> Stripe Price ID")
+    unknown = sorted(set(price_allowlist) - set(plans.PRICE_MODES))
+    if unknown:
+        raise BillingError("unknown price mode(s) %s - the catalog sells only %s" % (unknown, sorted(plans.PRICE_MODES)))
+    missing = sorted(set(plans.PRICE_MODES) - set(price_allowlist))
+    if missing:
+        raise BillingError("missing Stripe Price ID(s) for %s" % missing)
+    for key, value in price_allowlist.items():
+        if not is_valid_price_id(value):
+            raise BillingError("the Stripe Price ID for %s must look like price_..." % key)
+    if len(set(price_allowlist.values())) != len(price_allowlist):
+        raise BillingError("the same Stripe Price ID is configured for more than one price mode")
+    return dict(price_allowlist)

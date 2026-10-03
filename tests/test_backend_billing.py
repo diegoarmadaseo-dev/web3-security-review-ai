@@ -42,15 +42,16 @@ from typing import Any, Dict, Optional
 import backend.billing as billing
 import backend.db as db
 import backend.http_app as http_app
+import backend.plans as plans
 import backend.repository as repo
 import backend.tenant_scope as tenant_scope
 from tests.test_backend_http_app import HOST, _CapturingEmailSender, _HttpAppTestCase
 
 WEBHOOK_SECRET = "whsec_test_fake_secret_for_billing_tests"
+# D-107: the Launch catalog's 5 price modes (backend/plans.py).
 PRICE_ALLOWLIST = {
-    billing.price_key(plan, interval): "price_%s_%s_test" % (plan, interval)
-    for plan in ("quick", "standard", "pro")
-    for interval in ("monthly", "annual")
+    key: "price_%s_%s_test" % (mode["plan"], mode["interval"])
+    for key, mode in plans.PRICE_MODES.items()
 }
 BF_PROMOTION_CODE_ID = "promo_bf_test"
 
@@ -171,16 +172,18 @@ class PriceResolutionTests(unittest.TestCase):
         with self.assertRaises(billing.PriceNotAllowedError):
             instance.resolve_price_id("quick", "weekly")
 
-    def test_plan_missing_from_allowlist_despite_valid_name_raises(self):
-        instance = _make_billing(price_allowlist={billing.price_key("quick", "monthly"): "price_quick_monthly_test"})
-        with self.assertRaises(billing.PriceNotAllowedError):
-            instance.resolve_price_id("pro", "monthly")
-        with self.assertRaises(billing.PriceNotAllowedError):
-            instance.resolve_price_id("quick", "annual")
+    def test_unsold_combinations_raise_price_not_allowed(self):
+        # D-107: quick is one-time only; standard/pro have no one-time price.
+        instance = _make_billing()
+        for plan, interval in (("quick", "monthly"), ("quick", "annual"), ("standard", "one_time"), ("pro", "one_time")):
+            with self.assertRaises(billing.PriceNotAllowedError):
+                instance.resolve_price_id(plan, interval)
 
-    def test_price_key_format(self):
-        self.assertEqual(billing.price_key("quick", "monthly"), "quick_monthly")
-        self.assertEqual(billing.price_key("pro", "annual"), "pro_annual")
+    def test_price_key_maps_to_the_catalog_price_modes(self):
+        self.assertEqual(billing.price_key("quick", "one_time"), "vericexa_quick_onetime")
+        self.assertEqual(billing.price_key("standard", "monthly"), "vericexa_standard_monthly")
+        self.assertEqual(billing.price_key("pro", "annual"), "vericexa_pro_annual")
+        self.assertIsNone(billing.price_key("quick", "monthly"))
 
 
 class MissingStripeSdkTests(unittest.TestCase):
@@ -232,25 +235,25 @@ class CheckoutSessionCreationTests(unittest.TestCase):
     def test_unknown_interval_raises_before_any_client_call(self):
         instance = _make_billing()
         with self.assertRaises(billing.PriceNotAllowedError):
-            instance.create_checkout_session("quick", "weekly", "ws-1", "https://app.test/s", "https://app.test/c")
+            instance.create_checkout_session("standard", "weekly", "ws-1", "https://app.test/s", "https://app.test/c")
         self.assertEqual(instance._client.checkout.sessions.calls, [])
 
     def test_existing_customer_id_is_passed_through_never_a_new_customer_email_too(self):
         instance = _make_billing()
-        instance.create_checkout_session("quick", "monthly", "ws-1", "https://app.test/s", "https://app.test/c", customer_id="cus_existing")
+        instance.create_checkout_session("standard", "monthly", "ws-1", "https://app.test/s", "https://app.test/c", customer_id="cus_existing")
         params = instance._client.checkout.sessions.calls[0]
         self.assertEqual(params["customer"], "cus_existing")
         self.assertNotIn("customer_email", params)
 
     def test_returns_a_plain_dict_not_an_sdk_object(self):
         instance = _make_billing()
-        result = instance.create_checkout_session("quick", "monthly", "ws-1", "https://app.test/s", "https://app.test/c")
+        result = instance.create_checkout_session("standard", "monthly", "ws-1", "https://app.test/s", "https://app.test/c")
         self.assertIsInstance(result, dict)
         self.assertIn("url", result)
 
     def test_no_black_friday_promotion_code_means_no_discounts_param_at_all(self):
         instance = _make_billing()
-        instance.create_checkout_session("quick", "annual", "ws-1", "https://app.test/s", "https://app.test/c")
+        instance.create_checkout_session("standard", "annual", "ws-1", "https://app.test/s", "https://app.test/c")
         params = instance._client.checkout.sessions.calls[0]
         self.assertNotIn("discounts", params)
         self.assertNotIn("allow_promotion_codes", params)
@@ -258,7 +261,7 @@ class CheckoutSessionCreationTests(unittest.TestCase):
     def test_black_friday_promotion_code_is_attached_via_discounts_never_allow_promotion_codes(self):
         instance = _make_billing()
         instance.create_checkout_session(
-            "quick", "annual", "ws-1", "https://app.test/s", "https://app.test/c",
+            "standard", "annual", "ws-1", "https://app.test/s", "https://app.test/c",
             black_friday_promotion_code_id=BF_PROMOTION_CODE_ID,
         )
         params = instance._client.checkout.sessions.calls[0]
@@ -278,7 +281,7 @@ class PortalSessionCreationTests(unittest.TestCase):
 class WebhookSignatureVerificationTests(unittest.TestCase):
     def setUp(self):
         self.instance = _make_billing()
-        self.payload = json.dumps(_event("checkout.session.completed", "evt_1", _checkout_session_completed_obj("ws-1", "quick"))).encode("utf-8")
+        self.payload = json.dumps(_event("checkout.session.completed", "evt_1", _checkout_session_completed_obj("ws-1", "standard"))).encode("utf-8")
 
     def test_valid_signature_parses_and_returns_the_event_as_a_plain_dict(self):
         header = _stripe_signature_header(self.payload, WEBHOOK_SECRET)
@@ -441,29 +444,29 @@ class CheckoutEndpointTests(_BillingHttpTestCase):
 
     def test_missing_interval_returns_clean_400(self):
         cookie, workspace_id, _ = self._login_and_own_workspace()
-        status, _, _ = self.post_json("/billing/checkout", {"workspace_id": workspace_id, "plan": "quick"}, headers={"Cookie": cookie})
+        status, _, _ = self.post_json("/billing/checkout", {"workspace_id": workspace_id, "plan": "standard"}, headers={"Cookie": cookie})
         self.assertEqual(status, 400)
 
     def test_unrecognized_interval_returns_clean_400(self):
         cookie, workspace_id, _ = self._login_and_own_workspace()
         status, _, _ = self.post_json(
-            "/billing/checkout", {"workspace_id": workspace_id, "plan": "quick", "interval": "weekly"}, headers={"Cookie": cookie}
+            "/billing/checkout", {"workspace_id": workspace_id, "plan": "standard", "interval": "weekly"}, headers={"Cookie": cookie}
         )
         self.assertEqual(status, 400)
 
     def test_member_role_is_forbidden(self):
         cookie, workspace_id, _ = self._login_and_own_workspace(role="member")
-        status, _, _ = self.post_json("/billing/checkout", {"workspace_id": workspace_id, "plan": "quick", "interval": "monthly"}, headers={"Cookie": cookie})
+        status, _, _ = self.post_json("/billing/checkout", {"workspace_id": workspace_id, "plan": "standard", "interval": "monthly"}, headers={"Cookie": cookie})
         self.assertEqual(status, 403)
 
     def test_admin_role_is_allowed(self):
         cookie, workspace_id, _ = self._login_and_own_workspace(role="admin")
-        status, _, _ = self.post_json("/billing/checkout", {"workspace_id": workspace_id, "plan": "quick", "interval": "monthly"}, headers={"Cookie": cookie})
+        status, _, _ = self.post_json("/billing/checkout", {"workspace_id": workspace_id, "plan": "standard", "interval": "monthly"}, headers={"Cookie": cookie})
         self.assertEqual(status, 200)
 
     def test_unauthenticated_request_is_rejected(self):
         _, workspace_id, _ = self._login_and_own_workspace()
-        status, _, _ = self.post_json("/billing/checkout", {"workspace_id": workspace_id, "plan": "quick", "interval": "monthly"})
+        status, _, _ = self.post_json("/billing/checkout", {"workspace_id": workspace_id, "plan": "standard", "interval": "monthly"})
         self.assertEqual(status, 401)
 
     def test_tampered_workspace_id_the_caller_does_not_belong_to_is_forbidden_not_billed(self):
@@ -472,7 +475,7 @@ class CheckoutEndpointTests(_BillingHttpTestCase):
         victim = repo.create_user(conn, "victim@example.com")
         victim_workspace = repo.create_workspace(conn, "Victim Workspace", victim)
         conn.close()
-        status, _, _ = self.post_json("/billing/checkout", {"workspace_id": victim_workspace, "plan": "quick", "interval": "monthly"}, headers={"Cookie": cookie})
+        status, _, _ = self.post_json("/billing/checkout", {"workspace_id": victim_workspace, "plan": "standard", "interval": "monthly"}, headers={"Cookie": cookie})
         self.assertEqual(status, 403)
         self.assertEqual(self.billing._client.checkout.sessions.calls, [])
 
@@ -485,12 +488,12 @@ class CheckoutEndpointTests(_BillingHttpTestCase):
         cookie, workspace_id, _ = self._login_and_own_workspace()
         status, _, _ = self.post_json(
             "/billing/checkout",
-            {"workspace_id": workspace_id, "plan": "quick", "interval": "monthly", "price_id": "price_evil_free_plan", "customer_id": "cus_evil"},
+            {"workspace_id": workspace_id, "plan": "standard", "interval": "monthly", "price_id": "price_evil_free_plan", "customer_id": "cus_evil"},
             headers={"Cookie": cookie},
         )
         self.assertEqual(status, 200)
         params = self.billing._client.checkout.sessions.calls[0]
-        self.assertEqual(params["line_items"], [{"price": "price_quick_monthly_test", "quantity": 1}])
+        self.assertEqual(params["line_items"], [{"price": "price_standard_monthly_test", "quantity": 1}])
         self.assertNotIn("cus_evil", json.dumps(params))
 
     def test_client_supplied_discount_coupon_or_campaign_flag_is_silently_ignored(self):
@@ -498,7 +501,7 @@ class CheckoutEndpointTests(_BillingHttpTestCase):
         status, _, _ = self.post_json(
             "/billing/checkout",
             {
-                "workspace_id": workspace_id, "plan": "quick", "interval": "annual",
+                "workspace_id": workspace_id, "plan": "standard", "interval": "annual",
                 "discount": "100", "coupon": "cpn_evil", "promotion_code": "promo_evil", "black_friday": True,
             },
             headers={"Cookie": cookie},
@@ -512,7 +515,7 @@ class CheckoutEndpointTests(_BillingHttpTestCase):
     def test_duplicate_checkout_is_blocked_when_entitlement_already_active(self):
         cookie, workspace_id, _ = self._login_and_own_workspace()
         conn = repo.connect(self.db_path)
-        repo.create_entitlement(conn, workspace_id, "quick", "active", stripe_customer_id="cus_existing")
+        repo.create_entitlement(conn, workspace_id, "standard", "active", stripe_customer_id="cus_existing")
         conn.close()
         status, _, _ = self.post_json("/billing/checkout", {"workspace_id": workspace_id, "plan": "standard", "interval": "monthly"}, headers={"Cookie": cookie})
         self.assertEqual(status, 409)
@@ -520,15 +523,15 @@ class CheckoutEndpointTests(_BillingHttpTestCase):
     def test_incomplete_entitlement_does_not_block_a_new_checkout_attempt(self):
         cookie, workspace_id, _ = self._login_and_own_workspace()
         conn = repo.connect(self.db_path)
-        repo.create_entitlement(conn, workspace_id, "quick", "incomplete")
+        repo.create_entitlement(conn, workspace_id, "standard", "incomplete")
         conn.close()
-        status, _, _ = self.post_json("/billing/checkout", {"workspace_id": workspace_id, "plan": "quick", "interval": "monthly"}, headers={"Cookie": cookie})
+        status, _, _ = self.post_json("/billing/checkout", {"workspace_id": workspace_id, "plan": "standard", "interval": "monthly"}, headers={"Cookie": cookie})
         self.assertEqual(status, 200)
 
     def test_cross_origin_checkout_request_is_rejected(self):
         cookie, workspace_id, _ = self._login_and_own_workspace()
         status, _, _ = self.post_json(
-            "/billing/checkout", {"workspace_id": workspace_id, "plan": "quick", "interval": "monthly"}, headers={"Cookie": cookie, "Origin": "http://evil.example"}
+            "/billing/checkout", {"workspace_id": workspace_id, "plan": "standard", "interval": "monthly"}, headers={"Cookie": cookie, "Origin": "http://evil.example"}
         )
         self.assertEqual(status, 403)
 
@@ -561,7 +564,7 @@ class BlackFridayCheckoutTests(_BillingHttpTestCase):
         start, end = self._window()
         self._restart_with_black_friday(enabled=True, start=start, end=end)
         cookie, workspace_id, _ = self._login_and_own_workspace()
-        status, _, _ = self.post_json("/billing/checkout", {"workspace_id": workspace_id, "plan": "quick", "interval": "annual"}, headers={"Cookie": cookie})
+        status, _, _ = self.post_json("/billing/checkout", {"workspace_id": workspace_id, "plan": "standard", "interval": "annual"}, headers={"Cookie": cookie})
         self.assertEqual(status, 200)
         params = self.billing._client.checkout.sessions.calls[0]
         self.assertEqual(params["discounts"], [{"promotion_code": BF_PROMOTION_CODE_ID}])
@@ -570,7 +573,7 @@ class BlackFridayCheckoutTests(_BillingHttpTestCase):
         start, end = self._window()
         self._restart_with_black_friday(enabled=True, start=start, end=end)
         cookie, workspace_id, _ = self._login_and_own_workspace()
-        status, _, _ = self.post_json("/billing/checkout", {"workspace_id": workspace_id, "plan": "quick", "interval": "monthly"}, headers={"Cookie": cookie})
+        status, _, _ = self.post_json("/billing/checkout", {"workspace_id": workspace_id, "plan": "standard", "interval": "monthly"}, headers={"Cookie": cookie})
         self.assertEqual(status, 200)
         self.assertNotIn("discounts", self.billing._client.checkout.sessions.calls[0])
 
@@ -578,7 +581,7 @@ class BlackFridayCheckoutTests(_BillingHttpTestCase):
         now = datetime.now(timezone.utc)
         self._restart_with_black_friday(enabled=True, start=now + timedelta(days=1), end=now + timedelta(days=8))
         cookie, workspace_id, _ = self._login_and_own_workspace()
-        status, _, _ = self.post_json("/billing/checkout", {"workspace_id": workspace_id, "plan": "quick", "interval": "annual"}, headers={"Cookie": cookie})
+        status, _, _ = self.post_json("/billing/checkout", {"workspace_id": workspace_id, "plan": "standard", "interval": "annual"}, headers={"Cookie": cookie})
         self.assertEqual(status, 200)
         self.assertNotIn("discounts", self.billing._client.checkout.sessions.calls[0])
 
@@ -586,7 +589,7 @@ class BlackFridayCheckoutTests(_BillingHttpTestCase):
         now = datetime.now(timezone.utc)
         self._restart_with_black_friday(enabled=True, start=now - timedelta(days=8), end=now - timedelta(days=1))
         cookie, workspace_id, _ = self._login_and_own_workspace()
-        status, _, _ = self.post_json("/billing/checkout", {"workspace_id": workspace_id, "plan": "quick", "interval": "annual"}, headers={"Cookie": cookie})
+        status, _, _ = self.post_json("/billing/checkout", {"workspace_id": workspace_id, "plan": "standard", "interval": "annual"}, headers={"Cookie": cookie})
         self.assertEqual(status, 200)
         self.assertNotIn("discounts", self.billing._client.checkout.sessions.calls[0])
 
@@ -594,7 +597,7 @@ class BlackFridayCheckoutTests(_BillingHttpTestCase):
         start, end = self._window()
         self._restart_with_black_friday(enabled=False, start=start, end=end)
         cookie, workspace_id, _ = self._login_and_own_workspace()
-        status, _, _ = self.post_json("/billing/checkout", {"workspace_id": workspace_id, "plan": "quick", "interval": "annual"}, headers={"Cookie": cookie})
+        status, _, _ = self.post_json("/billing/checkout", {"workspace_id": workspace_id, "plan": "standard", "interval": "annual"}, headers={"Cookie": cookie})
         self.assertEqual(status, 200)
         self.assertNotIn("discounts", self.billing._client.checkout.sessions.calls[0])
 
@@ -605,7 +608,7 @@ class BlackFridayCheckoutTests(_BillingHttpTestCase):
         status, _, _ = self.post_json(
             "/billing/checkout",
             {
-                "workspace_id": workspace_id, "plan": "quick", "interval": "monthly",  # monthly - must NOT get the discount.
+                "workspace_id": workspace_id, "plan": "standard", "interval": "monthly",  # monthly - must NOT get the discount.
                 "black_friday": True, "promotion_code": "promo_evil", "discount_percent": 30,
             },
             headers={"Cookie": cookie},
@@ -628,7 +631,7 @@ class PortalEndpointTests(_BillingHttpTestCase):
     def test_owner_with_existing_customer_gets_a_portal_url(self):
         cookie, workspace_id, _ = self._login_and_own_workspace()
         conn = repo.connect(self.db_path)
-        repo.create_entitlement(conn, workspace_id, "quick", "active", stripe_customer_id="cus_existing")
+        repo.create_entitlement(conn, workspace_id, "standard", "active", stripe_customer_id="cus_existing", stripe_subscription_id="sub_existing")
         conn.close()
         status, _, body = self.post_json("/billing/portal", {"workspace_id": workspace_id}, headers={"Cookie": cookie})
         self.assertEqual(status, 200)
@@ -643,7 +646,7 @@ class PortalEndpointTests(_BillingHttpTestCase):
     def test_client_supplied_customer_id_is_ignored_the_stored_one_is_used(self):
         cookie, workspace_id, _ = self._login_and_own_workspace()
         conn = repo.connect(self.db_path)
-        repo.create_entitlement(conn, workspace_id, "quick", "active", stripe_customer_id="cus_real")
+        repo.create_entitlement(conn, workspace_id, "standard", "active", stripe_customer_id="cus_real", stripe_subscription_id="sub_real")
         conn.close()
         status, _, _ = self.post_json(
             "/billing/portal", {"workspace_id": workspace_id, "customer_id": "cus_evil"}, headers={"Cookie": cookie}
@@ -663,7 +666,7 @@ class MissingBillingConfigurationTests(_HttpAppTestCase):
 
     def test_checkout_returns_503_when_billing_is_not_configured(self):
         cookie = self.request_and_confirm_login("solo@example.com")
-        status, _, _ = self.post_json("/billing/checkout", {"workspace_id": "ws-1", "plan": "quick"}, headers={"Cookie": cookie})
+        status, _, _ = self.post_json("/billing/checkout", {"workspace_id": "ws-1", "plan": "standard"}, headers={"Cookie": cookie})
         self.assertEqual(status, 503)
 
     def test_portal_returns_503_when_billing_is_not_configured(self):
@@ -699,8 +702,8 @@ class WebhookEndpointTests(_BillingHttpTestCase):
         self.assertEqual(entitlement["stripe_customer_id"], "cus_test_1")
 
     def test_subscription_updated_to_active_grants_access(self):
-        self.post_webhook(_event("checkout.session.completed", "evt_1", _checkout_session_completed_obj(self.workspace_id, "quick")))
-        status, _, _ = self.post_webhook(_event("customer.subscription.updated", "evt_2", _subscription_obj(self.workspace_id, "quick", "active")))
+        self.post_webhook(_event("checkout.session.completed", "evt_1", _checkout_session_completed_obj(self.workspace_id, "standard")))
+        status, _, _ = self.post_webhook(_event("customer.subscription.updated", "evt_2", _subscription_obj(self.workspace_id, "standard", "active")))
         self.assertEqual(status, 200)
         self.assertEqual(self.entitlement(self.workspace_id)["status"], "active")
 
@@ -729,21 +732,21 @@ class WebhookEndpointTests(_BillingHttpTestCase):
         self.assertEqual(self.entitlement(self.workspace_id)["status"], "active")
 
     def test_stale_past_due_after_newer_active_is_ignored(self):
-        self.post_webhook(_event("customer.subscription.updated", "evt_1", _subscription_obj(self.workspace_id, "quick", "active"), created=2_000_000_000))
-        status, _, _ = self.post_webhook(_event("customer.subscription.updated", "evt_2", _subscription_obj(self.workspace_id, "quick", "past_due"), created=1_000_000_000))
+        self.post_webhook(_event("customer.subscription.updated", "evt_1", _subscription_obj(self.workspace_id, "standard", "active"), created=2_000_000_000))
+        status, _, _ = self.post_webhook(_event("customer.subscription.updated", "evt_2", _subscription_obj(self.workspace_id, "standard", "past_due"), created=1_000_000_000))
         self.assertEqual(status, 200)  # accepted, recorded, processed - just correctly a no-op on entitlement state.
         self.assertEqual(self.entitlement(self.workspace_id)["status"], "active")
 
     def test_stale_active_after_newer_cancellation_does_not_restore_access(self):
-        self.post_webhook(_event("customer.subscription.updated", "evt_1", _subscription_obj(self.workspace_id, "quick", "active"), created=1_000_000_000))
-        self.post_webhook(_event("customer.subscription.deleted", "evt_2", _subscription_obj(self.workspace_id, "quick", "canceled"), created=2_000_000_000))
-        status, _, _ = self.post_webhook(_event("customer.subscription.updated", "evt_3", _subscription_obj(self.workspace_id, "quick", "active"), created=1_500_000_000))
+        self.post_webhook(_event("customer.subscription.updated", "evt_1", _subscription_obj(self.workspace_id, "standard", "active"), created=1_000_000_000))
+        self.post_webhook(_event("customer.subscription.deleted", "evt_2", _subscription_obj(self.workspace_id, "standard", "canceled"), created=2_000_000_000))
+        status, _, _ = self.post_webhook(_event("customer.subscription.updated", "evt_3", _subscription_obj(self.workspace_id, "standard", "active"), created=1_500_000_000))
         self.assertEqual(status, 200)
         self.assertEqual(self.entitlement(self.workspace_id)["status"], "canceled")
 
     def test_strictly_newer_event_is_accepted(self):
-        self.post_webhook(_event("customer.subscription.updated", "evt_1", _subscription_obj(self.workspace_id, "quick", "past_due"), created=1_000_000_000))
-        status, _, _ = self.post_webhook(_event("customer.subscription.updated", "evt_2", _subscription_obj(self.workspace_id, "quick", "active"), created=1_000_000_001))
+        self.post_webhook(_event("customer.subscription.updated", "evt_1", _subscription_obj(self.workspace_id, "standard", "past_due"), created=1_000_000_000))
+        status, _, _ = self.post_webhook(_event("customer.subscription.updated", "evt_2", _subscription_obj(self.workspace_id, "standard", "active"), created=1_000_000_001))
         self.assertEqual(status, 200)
         self.assertEqual(self.entitlement(self.workspace_id)["status"], "active")
 
@@ -752,34 +755,34 @@ class WebhookEndpointTests(_BillingHttpTestCase):
         # tie is treated as NOT newer, so whichever event was processed
         # FIRST at a given timestamp keeps its effect - never overwritten
         # by a same-timestamp event arriving second.
-        self.post_webhook(_event("customer.subscription.updated", "evt_1", _subscription_obj(self.workspace_id, "quick", "active"), created=1_000_000_000))
-        status, _, _ = self.post_webhook(_event("customer.subscription.updated", "evt_2", _subscription_obj(self.workspace_id, "quick", "past_due"), created=1_000_000_000))
+        self.post_webhook(_event("customer.subscription.updated", "evt_1", _subscription_obj(self.workspace_id, "standard", "active"), created=1_000_000_000))
+        status, _, _ = self.post_webhook(_event("customer.subscription.updated", "evt_2", _subscription_obj(self.workspace_id, "standard", "past_due"), created=1_000_000_000))
         self.assertEqual(status, 200)
         self.assertEqual(self.entitlement(self.workspace_id)["status"], "active")
 
     def test_first_event_establishes_the_ordering_baseline_on_creation(self):
-        status, _, _ = self.post_webhook(_event("customer.subscription.updated", "evt_1", _subscription_obj(self.workspace_id, "quick", "trialing"), created=1_000_000_000))
+        status, _, _ = self.post_webhook(_event("customer.subscription.updated", "evt_1", _subscription_obj(self.workspace_id, "standard", "trialing"), created=1_000_000_000))
         self.assertEqual(status, 200)
         entitlement = self.entitlement(self.workspace_id)
         self.assertEqual(entitlement["status"], "trialing")
         self.assertTrue(entitlement["stripe_event_created_at"].startswith("2001-09-09"))
 
     def test_subscription_deleted_marks_canceled(self):
-        self.post_webhook(_event("checkout.session.completed", "evt_1", _checkout_session_completed_obj(self.workspace_id, "quick")))
-        self.post_webhook(_event("customer.subscription.updated", "evt_2", _subscription_obj(self.workspace_id, "quick", "active")))
-        status, _, _ = self.post_webhook(_event("customer.subscription.deleted", "evt_3", _subscription_obj(self.workspace_id, "quick", "canceled")))
+        self.post_webhook(_event("checkout.session.completed", "evt_1", _checkout_session_completed_obj(self.workspace_id, "standard")))
+        self.post_webhook(_event("customer.subscription.updated", "evt_2", _subscription_obj(self.workspace_id, "standard", "active")))
+        status, _, _ = self.post_webhook(_event("customer.subscription.deleted", "evt_3", _subscription_obj(self.workspace_id, "standard", "canceled")))
         self.assertEqual(status, 200)
         self.assertEqual(self.entitlement(self.workspace_id)["status"], "canceled")
 
     def test_invoice_payment_failed_marks_past_due(self):
-        self.post_webhook(_event("customer.subscription.updated", "evt_1", _subscription_obj(self.workspace_id, "quick", "active")))
-        status, _, _ = self.post_webhook(_event("invoice.payment_failed", "evt_2", _invoice_obj(self.workspace_id, "quick")))
+        self.post_webhook(_event("customer.subscription.updated", "evt_1", _subscription_obj(self.workspace_id, "standard", "active")))
+        status, _, _ = self.post_webhook(_event("invoice.payment_failed", "evt_2", _invoice_obj(self.workspace_id, "standard")))
         self.assertEqual(status, 200)
         self.assertEqual(self.entitlement(self.workspace_id)["status"], "past_due")
 
     def test_invoice_paid_restores_active(self):
-        self.post_webhook(_event("customer.subscription.updated", "evt_1", _subscription_obj(self.workspace_id, "quick", "past_due")))
-        status, _, _ = self.post_webhook(_event("invoice.paid", "evt_2", _invoice_obj(self.workspace_id, "quick")))
+        self.post_webhook(_event("customer.subscription.updated", "evt_1", _subscription_obj(self.workspace_id, "standard", "past_due")))
+        status, _, _ = self.post_webhook(_event("invoice.paid", "evt_2", _invoice_obj(self.workspace_id, "standard")))
         self.assertEqual(status, 200)
         self.assertEqual(self.entitlement(self.workspace_id)["status"], "active")
 
@@ -790,14 +793,14 @@ class WebhookEndpointTests(_BillingHttpTestCase):
         for i, status_value in enumerate(("active", "trialing", "past_due", "canceled", "incomplete", "incomplete_expired", "unpaid")):
             workspace_id = self._create_workspace("Status Workspace %d" % i)
             status, _, _ = self.post_webhook(
-                _event("customer.subscription.updated", "evt-status-%d" % i, _subscription_obj(workspace_id, "quick", status_value, subscription_id="sub_status_%d" % i))
+                _event("customer.subscription.updated", "evt-status-%d" % i, _subscription_obj(workspace_id, "standard", status_value, subscription_id="sub_status_%d" % i))
             )
             self.assertEqual(status, 200, "status %r should be accepted" % status_value)
             self.assertEqual(self.entitlement(workspace_id)["status"], status_value)
 
     def test_current_period_end_is_read_from_the_first_subscription_item(self):
         ts = 1_800_000_000
-        self.post_webhook(_event("customer.subscription.updated", "evt_1", _subscription_obj(self.workspace_id, "quick", "active", period_end_ts=ts)))
+        self.post_webhook(_event("customer.subscription.updated", "evt_1", _subscription_obj(self.workspace_id, "standard", "active", period_end_ts=ts)))
         entitlement = self.entitlement(self.workspace_id)
         self.assertTrue(entitlement["current_period_end"].startswith("2027-01-15"))
 
@@ -815,15 +818,15 @@ class WebhookEndpointTests(_BillingHttpTestCase):
         # reject it anyway, but _upsert_entitlement()/the checkout.session.
         # completed branch both normalize an invalid value to None first,
         # matching D-086's own "never guess/invent" discipline.
-        obj = _checkout_session_completed_obj(self.workspace_id, "quick")
+        obj = _checkout_session_completed_obj(self.workspace_id, "standard")
         obj["metadata"]["interval"] = "lifetime-totally-free"
         status, _, _ = self.post_webhook(_event("checkout.session.completed", "evt_1", obj))
         self.assertEqual(status, 200)
         self.assertIsNone(self.entitlement(self.workspace_id)["billing_interval"])
 
     def test_invoice_paid_status_update_never_wipes_a_previously_recorded_interval(self):
-        self.post_webhook(_event("checkout.session.completed", "evt_1", _checkout_session_completed_obj(self.workspace_id, "quick", interval="annual")))
-        self.post_webhook(_event("invoice.paid", "evt_2", _invoice_obj(self.workspace_id, "quick")))
+        self.post_webhook(_event("checkout.session.completed", "evt_1", _checkout_session_completed_obj(self.workspace_id, "standard", interval="annual")))
+        self.post_webhook(_event("invoice.paid", "evt_2", _invoice_obj(self.workspace_id, "standard")))
         self.assertEqual(self.entitlement(self.workspace_id)["billing_interval"], "annual")
 
     def test_unhandled_event_type_is_recorded_but_causes_no_entitlement_change(self):
@@ -837,7 +840,7 @@ class WebhookEndpointTests(_BillingHttpTestCase):
         self.assertIsNone(row["processing_error"])
 
     def test_processed_at_and_processing_error_recorded_on_success(self):
-        self.post_webhook(_event("checkout.session.completed", "evt_1", _checkout_session_completed_obj(self.workspace_id, "quick")))
+        self.post_webhook(_event("checkout.session.completed", "evt_1", _checkout_session_completed_obj(self.workspace_id, "standard")))
         conn = repo.connect(self.db_path)
         row = _fetch_webhook_event(conn, "evt_1")
         conn.close()
@@ -845,20 +848,20 @@ class WebhookEndpointTests(_BillingHttpTestCase):
         self.assertIsNone(row["processing_error"])
 
     def test_replayed_event_id_is_a_no_op_second_time(self):
-        event = _event("customer.subscription.updated", "evt_1", _subscription_obj(self.workspace_id, "quick", "active"))
+        event = _event("customer.subscription.updated", "evt_1", _subscription_obj(self.workspace_id, "standard", "active"))
         self.post_webhook(event)
         # A second, later event regresses this workspace to past_due -
         # replaying the FIRST event's exact id afterward must never undo it.
-        self.post_webhook(_event("customer.subscription.updated", "evt_2", _subscription_obj(self.workspace_id, "quick", "past_due")))
+        self.post_webhook(_event("customer.subscription.updated", "evt_2", _subscription_obj(self.workspace_id, "standard", "past_due")))
         status, _, body = self.post_webhook(event)
         self.assertEqual(status, 200)
         self.assertTrue(json.loads(body).get("duplicate"))
         self.assertEqual(self.entitlement(self.workspace_id)["status"], "past_due")
 
     def test_tampered_payload_is_rejected_and_nothing_is_recorded(self):
-        body = json.dumps(_event("checkout.session.completed", "evt_1", _checkout_session_completed_obj(self.workspace_id, "quick"))).encode("utf-8")
+        body = json.dumps(_event("checkout.session.completed", "evt_1", _checkout_session_completed_obj(self.workspace_id, "standard"))).encode("utf-8")
         header = _stripe_signature_header(body, WEBHOOK_SECRET)
-        status, _, _ = self.post_webhook(raw_body=body.replace(b'"plan": "quick"', b'"plan": "pro"'), signature_header=header)
+        status, _, _ = self.post_webhook(raw_body=body.replace(b'"plan": "standard"', b'"plan": "pro"'), signature_header=header)
         self.assertEqual(status, 400)
         conn = repo.connect(self.db_path)
         self.assertIsNone(_fetch_webhook_event(conn, "evt_1"))
@@ -866,13 +869,13 @@ class WebhookEndpointTests(_BillingHttpTestCase):
 
     def test_wrong_secret_is_rejected(self):
         status, _, _ = self.post_webhook(
-            _event("checkout.session.completed", "evt_1", _checkout_session_completed_obj(self.workspace_id, "quick")), secret="whsec_wrong"
+            _event("checkout.session.completed", "evt_1", _checkout_session_completed_obj(self.workspace_id, "standard")), secret="whsec_wrong"
         )
         self.assertEqual(status, 400)
 
     def test_missing_signature_header_is_rejected(self):
         status, _, _ = self.post_webhook(
-            _event("checkout.session.completed", "evt_1", _checkout_session_completed_obj(self.workspace_id, "quick")), signature_header=""
+            _event("checkout.session.completed", "evt_1", _checkout_session_completed_obj(self.workspace_id, "standard")), signature_header=""
         )
         self.assertEqual(status, 400)
 
@@ -889,7 +892,7 @@ class WebhookEndpointTests(_BillingHttpTestCase):
     def test_webhook_does_not_check_origin_a_normal_stripe_call_has_none(self):
         # No Origin header at all (post_webhook never sends one) - unlike
         # every other state-changing endpoint, this must still succeed.
-        status, _, _ = self.post_webhook(_event("checkout.session.completed", "evt_1", _checkout_session_completed_obj(self.workspace_id, "quick")))
+        status, _, _ = self.post_webhook(_event("checkout.session.completed", "evt_1", _checkout_session_completed_obj(self.workspace_id, "standard")))
         self.assertEqual(status, 200)
 
 

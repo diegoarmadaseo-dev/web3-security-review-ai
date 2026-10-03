@@ -92,6 +92,9 @@ CREATE TABLE entitlements (
     -- Phase 7 (backend/migrations/0007_billing_interval.sql's mirror):
     -- 'monthly'/'annual', nullable - see that migration's own comment.
     billing_interval            TEXT CHECK (billing_interval IN ('monthly', 'annual')),
+    -- D-107 (backend/migrations/0009_commercial_usage.sql's mirror): anchor
+    -- for Standard/Pro service months; nullable (falls back to created_at).
+    current_period_start        TEXT,
     created_at                  TEXT NOT NULL,
     updated_at                  TEXT NOT NULL
 );
@@ -232,3 +235,46 @@ CREATE TABLE workspace_queue_state (
     created_at       TEXT NOT NULL,
     last_claimed_at  TEXT
 );
+
+-- D-107 (backend/migrations/0009_commercial_usage.sql's mirror) - see that
+-- migration for the full reasoning behind each table.
+CREATE TABLE scan_credits (
+    id           TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+    status       TEXT NOT NULL CHECK (status IN ('available', 'reserved', 'consumed')),
+    job_id       TEXT UNIQUE REFERENCES analysis_jobs(id),
+    granted_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+CREATE INDEX idx_scan_credits_workspace_status ON scan_credits(workspace_id, status, granted_at);
+
+CREATE TABLE usage_periods (
+    workspace_id  TEXT NOT NULL REFERENCES workspaces(id),
+    period_start  TEXT NOT NULL,
+    period_end    TEXT NOT NULL,
+    limit_loc     INTEGER NOT NULL,
+    reserved_loc  INTEGER NOT NULL DEFAULT 0,
+    consumed_loc  INTEGER NOT NULL DEFAULT 0,
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, period_start),
+    CHECK (reserved_loc >= 0 AND consumed_loc >= 0 AND limit_loc >= 0),
+    CHECK (period_end > period_start)
+);
+
+CREATE TABLE job_usage (
+    job_id         TEXT PRIMARY KEY REFERENCES analysis_jobs(id),
+    workspace_id   TEXT NOT NULL REFERENCES workspaces(id),
+    plan           TEXT NOT NULL CHECK (plan IN ('quick', 'standard', 'pro')),
+    usage_model    TEXT NOT NULL CHECK (usage_model IN ('scan_credit', 'service_month')),
+    effective_loc  INTEGER NOT NULL CHECK (effective_loc >= 0),
+    period_start   TEXT,
+    credit_id      TEXT REFERENCES scan_credits(id),
+    status         TEXT NOT NULL CHECK (status IN ('reserved', 'consumed', 'released')),
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    CHECK (
+        (usage_model = 'scan_credit' AND credit_id IS NOT NULL AND period_start IS NULL)
+        OR (usage_model = 'service_month' AND period_start IS NOT NULL AND credit_id IS NULL)
+    )
+);
+CREATE INDEX idx_job_usage_workspace ON job_usage(workspace_id, status);

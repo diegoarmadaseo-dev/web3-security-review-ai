@@ -34,11 +34,20 @@ from urllib.parse import urlencode
 import backend.alerting as alerting
 import backend.billing as billing_module
 import backend.http_app as http_app
+import backend.loc_count as loc_count
 import backend.object_storage as object_storage
 import backend.repository as repo
 import backend.tenant_scope as tenant_scope
 
 HOST = "127.0.0.1"
+# D-107: a complete, catalog-valid fake allowlist (all 5 price modes are required).
+FAKE_PRICE_ALLOWLIST = {
+    "vericexa_quick_onetime": "price_fake_quick_onetime",
+    "vericexa_standard_monthly": "price_fake_standard_monthly",
+    "vericexa_standard_annual": "price_fake_standard_annual",
+    "vericexa_pro_monthly": "price_fake_pro_monthly",
+    "vericexa_pro_annual": "price_fake_pro_annual",
+}
 
 
 @contextlib.contextmanager
@@ -928,6 +937,8 @@ class JobSubmitAuthorizationTests(_WorkspaceStorageTestCase):
         user_id = repo.get_user_by_email(conn, email)["id"]
         workspace_id = repo.create_workspace(conn, "Plan WS", user_id)
         repo.create_entitlement(conn, workspace_id, plan, status)
+        if plan == "quick":
+            repo.grant_scan_credit(conn, "cs_%s" % repo.new_id(), workspace_id)   # D-107: a Quick scan needs a purchased credit
         conn.close()
         return cookie, workspace_id
 
@@ -1229,9 +1240,14 @@ class JobSubmitRawSourceLimitTests(_JobSubmitRequestTestCase):
         self.assertEqual(json.loads(data)["error"], "source exceeds the maximum submission size")
 
     def test_representative_15k_source_over_the_old_512kib_limit_is_accepted(self):
-        source = _representative_15k_source()
+        # D-107: this synthetic bundle is denser than real code (~52 B per
+        # effective LOC), so at 1.36 MB it would exceed Pro's 20,000
+        # effective LOC per scan; 600 KB still proves the byte gate admits
+        # more than the old 512 KiB while staying inside the plan limit.
+        source = _representative_15k_source(target_bytes=600_000)
         size = len(source.encode("utf-8"))
         self.assertGreater(size, 512 * 1024)
+        self.assertLessEqual(loc_count.submission_effective_loc(source), 20000)
         self.assertLessEqual(size, http_app.MAX_RAW_SOURCE_BYTES)
         cookie, workspace_id = self._workspace_with_pro_plan("raw-limit-2@example.com")
         status, _, body = self.post_json("/workspaces/%s/jobs" % workspace_id, {"mode": "pro", "source": source}, headers={"Cookie": cookie})
@@ -1607,7 +1623,7 @@ class HealthReadyFullyConfiguredTests(_HttpAppTestCase):
         self.storage_dir = tempfile.mkdtemp(prefix="ready-full-tests-")
         self.addCleanup(shutil.rmtree, self.storage_dir, True)
         storage = object_storage.LocalFilesystemStorage(self.storage_dir, sign_secret="ready-full-secret")
-        billing = billing_module.StripeBilling(secret_key="sk_test_fake", webhook_secret="whsec_fake", price_allowlist={"quick": "price_fake"})
+        billing = billing_module.StripeBilling(secret_key="sk_test_fake", webhook_secret="whsec_fake", price_allowlist=dict(FAKE_PRICE_ALLOWLIST))
         self.alert_sender = _CollectingAlertSender()
         self.httpd.shutdown()
         self.httpd.server_close()
@@ -1693,7 +1709,7 @@ class WebhookFailureAlertTests(_HttpAppTestCase):
     def setUp(self):
         super().setUp()
         self.alert_sender = _CollectingAlertSender()
-        billing = billing_module.StripeBilling(secret_key="sk_test_fake", webhook_secret="whsec_fake", price_allowlist={"quick": "price_fake"})
+        billing = billing_module.StripeBilling(secret_key="sk_test_fake", webhook_secret="whsec_fake", price_allowlist=dict(FAKE_PRICE_ALLOWLIST))
         self.httpd.shutdown()
         self.httpd.server_close()
         self.httpd = http_app.run_server(

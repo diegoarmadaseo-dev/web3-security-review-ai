@@ -42,7 +42,17 @@ for the full detail on each.
 
 ### Stripe (TEST mode)
 - `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET` - **DIEGO**: from Stripe's TEST mode dashboard.
-- `STRIPE_PRICE_QUICK_MONTHLY` / `_ANNUAL`, `STANDARD_MONTHLY` / `_ANNUAL`, `PRO_MONTHLY` / `_ANNUAL` (6 total, D-086) - **DIEGO**: TEST mode Price IDs, 3 Products x 2 Prices each (never 6 Products - see `docs/decisiones.md` D-086). Real amounts are confirmed (D-086: $19/$39/$79 monthly, $190/$390/$790 annual) but a TEST Price can carry any placeholder amount, since no real charge is possible in test mode.
+- Launch catalog (D-107, `backend/plans.py`): 3 Products, 5 Prices. TEST-mode IDs supplied by Diego (Price IDs are not secrets):
+
+  | Variable | Price mode | Product | TEST-mode Price ID |
+  |---|---|---|---|
+  | `STRIPE_PRICE_QUICK_ONETIME` | Quick, $29.99 one-time (1 scan) | Vericexa Quick `prod_VKuyOnzsrUifKK` | `price_1UMFnY1jc8PYYLrPXxSbSEUF` |
+  | `STRIPE_PRICE_STANDARD_MONTHLY` | Standard, $199.99/month | Vericexa Standard `prod_VMzvv0HgxygXcz` | `price_1UMFvU1jc8PYYLrPsrZuTqJl` |
+  | `STRIPE_PRICE_STANDARD_ANNUAL` | Standard, $1,999.90/year | Vericexa Standard `prod_VMzvv0HgxygXcz` | `price_1UMFvU1jc8PYYLrPg7Kia6bO` |
+  | `STRIPE_PRICE_PRO_MONTHLY` | Pro, $289.99/month | Vericexa Pro `prod_VMzwG1pHzS0d5t` | `price_1UMFwj1jc8PYYLrP2rA1xonm` |
+  | `STRIPE_PRICE_PRO_ANNUAL` | Pro, $2,899.90/year | Vericexa Pro `prod_VMzwG1pHzS0d5t` | `price_1UMFy51jc8PYYLrPLyQHT8Fh` |
+
+  Live-mode IDs are different objects and must come from the live dashboard. The retired D-086 variables `STRIPE_PRICE_QUICK_MONTHLY` / `_ANNUAL` must not be set (startup error).
 - `BLACK_FRIDAY_ENABLED` / `_START` / `_END` / `_PROMOTION_CODE_ID` (D-086) - **DIEGO**: leave `BLACK_FRIDAY_ENABLED` unset/false for ordinary staging; set all four (a TEST-mode PromotionCode id for the last one) only when specifically drilling the campaign flow. See `docs/production-config.md`'s own Black Friday section for the exact validation rules.
 
 ### LLM

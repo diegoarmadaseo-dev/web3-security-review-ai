@@ -188,7 +188,9 @@ import backend.auth as auth
 import backend.billing as billing_module
 import backend.black_friday as black_friday
 import backend.db as db
+import backend.loc_count as loc_count
 import backend.object_storage as object_storage
+import backend.plans as plans
 import backend.repository as repo
 import backend.tenant_scope as tenant_scope
 
@@ -511,7 +513,8 @@ def _parse_limit_offset(qs: Dict[str, List[str]]) -> Tuple[int, int, Optional[st
         return 0, 0, "offset must be >= 0"
     return limit, offset, None
 
-_SUBSCRIPTION_EVENT_TYPES = ("customer.subscription.updated", "customer.subscription.deleted")
+_SUBSCRIPTION_EVENT_TYPES = ("customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted")
+_SUBSCRIPTION_PLANS = tuple(name for name, spec in plans.PLANS.items() if spec["billing_type"] == plans.BILLING_SUBSCRIPTION)
 
 
 def _upsert_entitlement(
@@ -524,6 +527,7 @@ def _upsert_entitlement(
     current_period_end: Optional[str],
     event_created_at: Optional[str],
     interval: Optional[str] = None,
+    current_period_start: Optional[str] = None,
 ) -> None:
     """Shared by every branch of _apply_webhook_event() below that carries
     an authoritative subscription status. Checks existence FIRST (rather
@@ -546,19 +550,53 @@ def _upsert_entitlement(
     reaching repository.py: an unrecognized/missing value is passed
     through as None (repository.py's own CHECK constraint would reject
     anything else at the CREATE path anyway; validating here keeps a
-    malformed metadata value from ever reaching that far)."""
+    malformed metadata value from ever reaching that far).
+
+    D-107: a subscription event now also UPDATES plan (resolved from the
+    subscription's own Price ID by the caller), the subscription/customer
+    ids and current_period_start (service-month anchor) on an existing
+    row, so a portal upgrade/downgrade or monthly<->annual switch is
+    reflected; only subscription plans are accepted here."""
     if not workspace_id:
         return
     if interval not in ("monthly", "annual"):
         interval = None
+    if plan not in _SUBSCRIPTION_PLANS:
+        plan = None
     if repo.get_entitlement_by_workspace(conn, workspace_id) is None:
-        if plan in ("quick", "standard", "pro"):
-            repo.create_entitlement(conn, workspace_id, plan, status, stripe_customer_id, stripe_subscription_id, current_period_end, event_created_at, billing_interval=interval)
+        if plan is not None:
+            repo.create_entitlement(conn, workspace_id, plan, status, stripe_customer_id, stripe_subscription_id, current_period_end, event_created_at,
+                                    billing_interval=interval, current_period_start=current_period_start)
         return
-    repo.update_entitlement_status(conn, workspace_id, status, current_period_end, event_created_at, billing_interval=interval)
+    repo.update_entitlement_status(conn, workspace_id, status, current_period_end, event_created_at, billing_interval=interval, plan=plan,
+                                   current_period_start=current_period_start, stripe_customer_id=stripe_customer_id,
+                                   stripe_subscription_id=stripe_subscription_id)
 
 
-def _apply_webhook_event(conn: Any, event_type: str, obj: Dict[str, Any], event_created_at: Optional[str]) -> None:
+def _apply_quick_payment(conn: Any, obj: Dict[str, Any], event_created_at: Optional[str]) -> None:
+    """A PAID Quick Checkout Session (D-107): grants exactly one scan credit
+    (keyed by the session id - a redelivered event never grants twice) and
+    makes the workspace's entitlement quick/active. Never touches a
+    workspace whose current entitlement is a live subscription (checkout
+    refuses to sell Quick to one; this is defense in depth)."""
+    metadata = obj.get("metadata") or {}
+    workspace_id = obj.get("client_reference_id") or metadata.get("workspace_id")
+    session_id = obj.get("id")
+    if not workspace_id or not isinstance(session_id, str) or not session_id or metadata.get("plan") != plans.PLAN_QUICK:
+        return
+    existing = repo.get_entitlement_by_workspace(conn, workspace_id)
+    if existing is not None and existing["plan"] in _SUBSCRIPTION_PLANS and existing["status"] in ("active", "trialing", "past_due"):
+        return
+    repo.grant_scan_credit(conn, session_id, workspace_id)
+    if existing is None:
+        repo.create_entitlement(conn, workspace_id, plans.PLAN_QUICK, "active", stripe_customer_id=obj.get("customer"), stripe_event_created_at=event_created_at)
+    else:
+        repo.update_entitlement_status(conn, workspace_id, "active", stripe_event_created_at=event_created_at, plan=plans.PLAN_QUICK,
+                                       stripe_customer_id=obj.get("customer"))
+
+
+def _apply_webhook_event(conn: Any, event_type: str, obj: Dict[str, Any], event_created_at: Optional[str],
+                         billing: Optional["billing_module.StripeBilling"] = None) -> None:
     """Dispatches one of the 5 handled Stripe event types
     (backend/billing.py's module docstring lists them) to an
     entitlements update. event_created_at is the ENCLOSING Stripe
@@ -577,6 +615,15 @@ def _apply_webhook_event(conn: Any, event_type: str, obj: Dict[str, Any], event_
     mark_webhook_event_processed() that it was received, so nothing is
     lost, but this backend only ACTS on the 5 types this phase is scoped
     to."""
+    if event_type in ("checkout.session.completed", "checkout.session.async_payment_succeeded") and obj.get("mode") == "payment":
+        # D-107 Quick: one-time payment. Only a PAID session grants the
+        # scan; an asynchronous payment method completes later with
+        # checkout.session.async_payment_succeeded (handled here too).
+        if obj.get("payment_status") == "paid":
+            _apply_quick_payment(conn, obj, event_created_at)
+        return
+    if event_type == "checkout.session.async_payment_succeeded":
+        return
     if event_type == "checkout.session.completed":
         # Deliberately NOT _upsert_entitlement(): this event's own object
         # carries no real subscription status (a Checkout Session's
@@ -601,7 +648,7 @@ def _apply_webhook_event(conn: Any, event_type: str, obj: Dict[str, Any], event_
         interval = metadata.get("interval")
         if interval not in ("monthly", "annual"):
             interval = None
-        if workspace_id and plan in ("quick", "standard", "pro") and repo.get_entitlement_by_workspace(conn, workspace_id) is None:
+        if workspace_id and plan in _SUBSCRIPTION_PLANS and repo.get_entitlement_by_workspace(conn, workspace_id) is None:
             repo.create_entitlement(
                 conn,
                 workspace_id,
@@ -620,16 +667,29 @@ def _apply_webhook_event(conn: Any, event_type: str, obj: Dict[str, Any], event_
         status = obj.get("status")
         if not isinstance(status, str):
             return
+        # D-107: the subscription's own Price ID decides plan/interval.
+        # A Price ID outside the configured catalog (a retired D-086
+        # price, a foreign price) is ignored entirely - never mapped to a
+        # plan. Only an object carrying no price at all falls back to the
+        # server-stamped metadata.
+        plan, interval = metadata.get("plan"), metadata.get("interval")
+        price_id = billing_module.subscription_price_id(obj)
+        if price_id is not None:
+            resolved = billing.plan_for_price_id(price_id) if billing is not None else None
+            if resolved is None or resolved["plan"] not in _SUBSCRIPTION_PLANS:
+                return
+            plan, interval = resolved["plan"], resolved["interval"]
         _upsert_entitlement(
             conn,
             workspace_id=metadata.get("workspace_id"),
-            plan=metadata.get("plan"),
+            plan=plan,
             status=status,
             stripe_customer_id=obj.get("customer"),
             stripe_subscription_id=obj.get("id"),
             current_period_end=billing_module.subscription_period_end(obj),
             event_created_at=event_created_at,
-            interval=metadata.get("interval"),
+            interval=interval,
+            current_period_start=billing_module.subscription_period_start(obj),
         )
     elif event_type == "invoice.paid":
         workspace_id = billing_module.invoice_workspace_id(obj)
@@ -1196,7 +1256,8 @@ def make_handler(
                     modes_config = _load_modes_config()
                     if modes_config is not None:
                         limits = (modes_config.get("modes") or {}).get(entitlement["plan"])
-                self._send_json(200, {"ok": True, "workspace": workspace, "entitlement": entitlement, "budget": budget, "limits": limits})
+                usage = repo.usage_summary(conn, workspace_id, entitlement)
+                self._send_json(200, {"ok": True, "workspace": workspace, "entitlement": entitlement, "budget": budget, "limits": limits, "usage": usage})
             except Exception:
                 self._send_json(500, {"ok": False, "error": "internal error"})
             finally:
@@ -1320,6 +1381,15 @@ def make_handler(
                 if role not in ("owner", "admin", "member"):
                     self._send_json(400, {"ok": False, "error": "role must be one of owner/admin/member"})
                     return
+                # D-107: the plan's member ceiling (Standard 2, Pro 5,
+                # owner included) - checked only for an active entitlement
+                # whose plan defines one; existing members are never removed.
+                entitlement = repo.get_entitlement_by_workspace(conn, workspace_id)
+                if entitlement is not None and entitlement["status"] in ("active", "trialing") and entitlement["plan"] in plans.PLANS:
+                    max_members = plans.PLANS[entitlement["plan"]]["max_members"]
+                    if max_members is not None and len(repo.list_workspace_members(conn, workspace_id)) >= max_members:
+                        self._send_json(409, {"ok": False, "error": "member_limit_reached", "detail": "the %s plan allows %d members" % (plans.PLANS[entitlement["plan"]]["display_name"], max_members)})
+                        return
                 existing = repo.get_user_by_email(conn, normalized)
                 target_user_id = existing["id"] if existing is not None else repo.create_user(conn, normalized)
                 try:
@@ -1460,6 +1530,26 @@ def make_handler(
                 if existing is not None:
                     self._send_json(200, {"ok": True, "job_id": existing["id"], "status": existing["status"], "duplicate": True})
                     return
+                # D-107 admission: the engine's own effective LOC (backend/
+                # loc_count.py), checked against the plan before anything
+                # is stored or queued.
+                effective_loc = loc_count.submission_effective_loc(source)
+                spec = plans.PLANS.get(entitlement["plan"])
+                if effective_loc <= 0:
+                    self._send_json(422, {"ok": False, "error": "no_source_code", "detail": "no Solidity/Vyper source code found", "effective_loc": 0})
+                    return
+                if spec is not None and effective_loc > spec["max_loc_per_scan"]:
+                    self._send_json(413, {"ok": False, "error": "loc_per_scan_limit_exceeded", "effective_loc": effective_loc,
+                                          "max_loc_per_scan": spec["max_loc_per_scan"]})
+                    return
+                usage = repo.usage_summary(conn, workspace_id, entitlement) or {}
+                if usage.get("usage_model") == plans.USAGE_SCAN_CREDIT and usage.get("scans_available", 0) <= 0:
+                    self._send_json(402, {"ok": False, "error": "no_scan_credit", "detail": "no unused Quick scan is available", "effective_loc": effective_loc})
+                    return
+                if usage.get("usage_model") == plans.USAGE_SERVICE_MONTH and effective_loc > usage.get("loc_remaining", 0):
+                    self._send_json(402, {"ok": False, "error": "loc_quota_exceeded", "effective_loc": effective_loc,
+                                          "loc_remaining": usage.get("loc_remaining", 0), "period_end": usage.get("period_end")})
+                    return
                 content_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
                 # A fresh id for the storage OBJECT only - decoupled from
                 # the contract row's own id (create_contract() generates
@@ -1469,7 +1559,17 @@ def make_handler(
                 storage.put_object(storage_ref, source.encode("utf-8"), content_type="text/plain")
                 contract_id = repo.create_contract(conn, workspace_id, storage_ref, content_hash, payload.get("filename") or "contract.sol")
                 try:
-                    job_id = repo.enqueue_job(conn, workspace_id, contract_id, current_user_id, mode, idempotency_key=idempotency_key)
+                    job_id = repo.enqueue_job_with_usage(conn, workspace_id, contract_id, current_user_id, mode, idempotency_key, entitlement, effective_loc)
+                except repo.UsageLimitError as exc:
+                    # Nothing was queued or reserved (rolled back). Only a
+                    # submission that lost a concurrent race to the last of
+                    # the allowance gets here (the pre-check above refuses
+                    # the ordinary case before anything is stored); its
+                    # contract row/object are left to retention like any
+                    # other unreferenced upload.
+                    status_code = {"loc_per_scan_limit_exceeded": 413, "no_source_code": 422}.get(exc.code, 402)
+                    self._send_json(status_code, {"ok": False, "error": exc.code, "detail": exc.detail, "effective_loc": effective_loc})
+                    return
                 except db.integrity_error_class(conn):
                     # A concurrent identical submission won the idempotency_key race - same job, not an error.
                     # On Postgres, the IntegrityError above already aborted
@@ -1522,8 +1622,10 @@ def make_handler(
             if not isinstance(workspace_id, str) or not workspace_id:
                 self._send_json(400, {"ok": False, "error": "workspace_id is required"})
                 return
-            if interval not in ("monthly", "annual"):
-                self._send_json(400, {"ok": False, "error": "interval must be one of monthly/annual"})
+            if plan == plans.PLAN_QUICK and interval is None:
+                interval = plans.INTERVAL_ONE_TIME
+            if not isinstance(plan, str) or not isinstance(interval, str) or billing_module.price_key(plan, interval) is None:
+                self._send_json(400, {"ok": False, "error": "unknown plan or billing interval"})
                 return
             host = self.headers.get("Host", "")
             if host.split(":")[0] not in host_allowlist:
@@ -1541,8 +1643,11 @@ def make_handler(
                     self._send_json(403, {"ok": False, "error": "forbidden"})
                     return
                 existing = repo.get_entitlement_by_workspace(conn, workspace_id)
-                if existing is not None and existing["status"] in ("active", "trialing"):
+                if existing is not None and existing["plan"] in _SUBSCRIPTION_PLANS and existing["status"] in ("active", "trialing"):
                     self._send_json(409, {"ok": False, "error": "this workspace already has an active subscription"})
+                    return
+                if plan == plans.PLAN_QUICK and (repo.usage_summary(conn, workspace_id, existing) or {}).get("scans_available", 0) > 0:
+                    self._send_json(409, {"ok": False, "error": "this workspace already has an unused Quick scan"})
                     return
                 scheme = "https" if secure_cookies else "http"
                 success_path = auth.validate_redirect_path(payload.get("success_path") if isinstance(payload, dict) else None)
@@ -1569,6 +1674,11 @@ def make_handler(
                     )
                 except billing_module.PriceNotAllowedError:
                     self._send_json(400, {"ok": False, "error": "unknown plan or billing interval"})
+                    return
+                except billing_module.BillingNotConfiguredError:
+                    # D-107: fail closed if a price mode has no Price ID
+                    # (defensive - startup validation requires all five).
+                    self._send_json(503, {"ok": False, "error": "billing_not_configured", "detail": "this plan cannot be purchased yet"})
                     return
                 self._send_json(200, {"ok": True, "checkout_url": session.get("url")})
             except Exception:
@@ -1613,6 +1723,10 @@ def make_handler(
                 existing = repo.get_entitlement_by_workspace(conn, workspace_id)
                 if existing is None or not existing.get("stripe_customer_id"):
                     self._send_json(400, {"ok": False, "error": "this workspace has no billing account yet"})
+                    return
+                if existing["plan"] not in _SUBSCRIPTION_PLANS or not existing.get("stripe_subscription_id"):
+                    # D-107: Quick is a one-time purchase, not a subscription to manage.
+                    self._send_json(409, {"ok": False, "error": "this workspace has no subscription to manage"})
                     return
                 scheme = "https" if secure_cookies else "http"
                 return_path = auth.validate_redirect_path(payload.get("return_path") if isinstance(payload, dict) else None)
@@ -1667,7 +1781,7 @@ def make_handler(
                     return
                 obj = ((event.get("data") or {}).get("object")) or {}
                 try:
-                    _apply_webhook_event(conn, event_type, obj, event_created_at)
+                    _apply_webhook_event(conn, event_type, obj, event_created_at, billing)
                     repo.mark_webhook_event_processed(conn, event_id)
                     self._send_json(200, {"ok": True})
                 except Exception as exc:
