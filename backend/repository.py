@@ -306,8 +306,8 @@ def update_entitlement_status(
     first) OR - Phase 3 webhook hardening, docs/decisiones.md D-077
     follow-up - the incoming stripe_event_created_at is stale/tied
     against the row's own stored value and was correctly ignored. Both
-    "no row" and "stale, ignored" report False on purpose: a caller that
-    needs to tell them
+    "no row" and "stale, ignored" report False on purpose: a caller like
+    backend/http_app.py's _upsert_entitlement() that needs to tell them
     apart (to decide whether to fall back to create_entitlement()) must
     check existence itself first via get_entitlement_by_workspace() -
     this function alone cannot and should not guess which case applies.
@@ -2105,136 +2105,6 @@ def append_audit_event(
     )
     conn.commit()
     return event_id
-
-
-# D-115: subscription statuses that keep (or will keep) access - a status
-# outside this set never replaces a DIFFERENT current subscription, nor a
-# Quick/Trial entitlement. Stripe's "paused" (not in entitlements' CHECK)
-# is stored as "unpaid": no access, recoverable.
-LIVE_SUBSCRIPTION_STATUSES = ("active", "trialing", "past_due")
-_STRIPE_STATUS_ALIASES = {"paused": "unpaid"}
-
-
-def lock_workspace_billing(conn: Any, workspace_id: str) -> None:
-    """D-115: serializes billing state changes of ONE workspace (the same
-    per-workspace lock admission uses - _lock_workspace_admission()) for
-    the rest of the current transaction, so two webhook deliveries for the
-    same workspace read Stripe's state and write it one after the other:
-    the later writer always applies the later read. Released by the
-    commit/rollback of apply_subscription_state() or the caller."""
-    conn.commit()   # start from no open transaction, so the lock below is really taken
-    _lock_workspace_admission(conn, workspace_id)
-
-
-def apply_subscription_state(
-    conn: Any,
-    workspace_id: str,
-    plan: str,
-    billing_interval: Optional[str],
-    status: str,
-    stripe_customer_id: Optional[str],
-    stripe_subscription_id: str,
-    current_period_start: Optional[str],
-    current_period_end: Optional[str],
-) -> str:
-    """Writes a subscription's AUTHORITATIVE current state (re-read from
-    Stripe by the caller under lock_workspace_billing()) onto the
-    workspace's entitlement and commits. No event-timestamp comparison:
-    the state is the newest Stripe has, and the lock orders concurrent
-    writers. Guards, so a late event about an OLD subscription can never
-    take access away from the current one:
-      - a different subscription than the stored one only replaces it
-        when it is live (a new purchase); a canceled/incomplete other
-        subscription is ignored;
-      - a Quick or Trial entitlement is only replaced by a live
-        subscription (a late "canceled" for an old subscription never
-        overwrites a later Quick purchase).
-    Returns "created", "updated" or "ignored"."""
-    if plan not in plans.PLANS or plans.PLANS[plan]["billing_type"] != plans.BILLING_SUBSCRIPTION:
-        raise RepositoryError("plan must be a subscription plan, got %r" % (plan,))
-    status = _STRIPE_STATUS_ALIASES.get(status, status)
-    if billing_interval not in ("monthly", "annual"):
-        billing_interval = None
-    try:
-        existing = get_entitlement_by_workspace(conn, workspace_id)
-        live = status in LIVE_SUBSCRIPTION_STATUSES
-        if existing is None:
-            db.execute(
-                conn,
-                "INSERT INTO entitlements (id, workspace_id, plan, status, stripe_customer_id, stripe_subscription_id, current_period_end, "
-                "billing_interval, current_period_start, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (new_id(), workspace_id, plan, status, stripe_customer_id, stripe_subscription_id, current_period_end, billing_interval,
-                 current_period_start, utcnow_iso(), utcnow_iso()),
-            )
-            conn.commit()
-            return "created"
-        stored = existing.get("stripe_subscription_id")
-        other_subscription = bool(stored) and stored != stripe_subscription_id
-        not_a_subscription_plan = plans.PLANS.get(existing["plan"], {}).get("billing_type") != plans.BILLING_SUBSCRIPTION
-        if not live and (other_subscription or not_a_subscription_plan):
-            conn.commit()
-            return "ignored"
-        db.execute(
-            conn,
-            "UPDATE entitlements SET plan = ?, status = ?, billing_interval = COALESCE(?, billing_interval), "
-            "current_period_start = COALESCE(?, current_period_start), current_period_end = COALESCE(?, current_period_end), "
-            "stripe_customer_id = COALESCE(?, stripe_customer_id), stripe_subscription_id = ?, updated_at = ? WHERE workspace_id = ?",
-            (plan, status, billing_interval, current_period_start, current_period_end, stripe_customer_id, stripe_subscription_id,
-             utcnow_iso(), workspace_id),
-        )
-        conn.commit()
-        return "updated"
-    except Exception:
-        conn.rollback()
-        raise
-
-
-def apply_quick_purchase(conn: Any, workspace_id: str, credit_id: str, stripe_customer_id: Optional[str],
-                         stripe_event_created_at: Optional[str]) -> str:
-    """D-115: a verified, paid Quick Checkout Session -> one scan credit
-    (keyed by the session id: ON CONFLICT DO NOTHING, so any number of
-    deliveries grant one) and a quick/active entitlement, in ONE
-    transaction under lock_workspace_billing(), so concurrent deliveries
-    for the same session never race on creating the entitlement. A live
-    subscription is never replaced by a Quick purchase (checkout refuses to
-    sell it; defense in depth). The entitlement update keeps the Phase 3
-    ordering rule on stripe_event_created_at. Returns "granted",
-    "already_granted" or "ignored"."""
-    lock_workspace_billing(conn, workspace_id)
-    try:
-        existing = get_entitlement_by_workspace(conn, workspace_id)
-        if (existing is not None and plans.PLANS.get(existing["plan"], {}).get("billing_type") == plans.BILLING_SUBSCRIPTION
-                and existing["status"] in LIVE_SUBSCRIPTION_STATUSES):
-            conn.commit()
-            return "ignored"
-        now = utcnow_iso()
-        cur = db.execute(
-            conn,
-            "INSERT INTO scan_credits (id, workspace_id, status, job_id, granted_at, updated_at) VALUES (?, ?, 'available', NULL, ?, ?) "
-            "ON CONFLICT (id) DO NOTHING",
-            (credit_id, workspace_id, now, now),
-        )
-        granted = cur.rowcount > 0
-        if existing is None:
-            db.execute(
-                conn,
-                "INSERT INTO entitlements (id, workspace_id, plan, status, stripe_customer_id, stripe_event_created_at, created_at, updated_at) "
-                "VALUES (?, ?, ?, 'active', ?, ?, ?, ?)",
-                (new_id(), workspace_id, plans.PLAN_QUICK, stripe_customer_id, stripe_event_created_at, now, now),
-            )
-        else:
-            ordering = "" if stripe_event_created_at is None else " AND (stripe_event_created_at IS NULL OR stripe_event_created_at < ?)"
-            db.execute(
-                conn,
-                "UPDATE entitlements SET plan = ?, status = 'active', stripe_customer_id = COALESCE(?, stripe_customer_id), "
-                "stripe_event_created_at = COALESCE(?, stripe_event_created_at), updated_at = ? WHERE workspace_id = ?" + ordering,
-                (plans.PLAN_QUICK, stripe_customer_id, stripe_event_created_at, now, workspace_id) + ((stripe_event_created_at,) if stripe_event_created_at else ()),
-            )
-        conn.commit()
-        return "granted" if granted else "already_granted"
-    except Exception:
-        conn.rollback()
-        raise
 
 
 def record_webhook_event(conn: Any, event_id: str, event_type: str) -> bool:
