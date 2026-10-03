@@ -468,10 +468,13 @@ def create_contract(
     project_id: Optional[str] = None,
     source_kind: str = "single",
     files: Optional[List[Dict[str, Any]]] = None,
+    git_source: Optional[Dict[str, Any]] = None,
 ) -> str:
     """files (D-109): the per-file manifest of a multi-file/ZIP submission
     (backend/submission_input.py), written in the SAME transaction as the
-    contract row - a contract never exists with a partial manifest."""
+    contract row - a contract never exists with a partial manifest.
+    git_source (D-111): for a GitHub scan, the repository, branch and exact
+    commit SHA analysed (contract_git_sources), in that same transaction."""
     if source_kind not in CONTRACT_SOURCE_KINDS:
         raise RepositoryError("source_kind must be one of %r, got %r" % (CONTRACT_SOURCE_KINDS, source_kind))
     contract_id = new_id()
@@ -487,6 +490,14 @@ def create_contract(
                 "INSERT INTO contract_files (contract_id, workspace_id, path, language, size_bytes, content_sha256, effective_loc) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (contract_id, workspace_id, item["path"], item["language"], item["size_bytes"], item["sha256"], item["effective_loc"]),
             )
+        if git_source is not None:
+            db.execute(
+                conn,
+                "INSERT INTO contract_git_sources (contract_id, workspace_id, provider, connection_id, repository_id, repository_full_name, ref, commit_sha, created_at) "
+                "VALUES (?, ?, 'github', ?, ?, ?, ?, ?, ?)",
+                (contract_id, workspace_id, git_source.get("connection_id"), git_source["repository_id"], git_source["repository_full_name"],
+                 git_source["ref"], git_source["commit_sha"], utcnow_iso()),
+            )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -501,6 +512,15 @@ def list_contract_files(conn: Any, workspace_id: str, contract_id: str) -> List[
         (contract_id, workspace_id),
     )
     return [db.normalize_row(row) for row in cur.fetchall()]
+
+
+def get_contract_git_source(conn: Any, workspace_id: str, contract_id: str) -> Optional[Dict[str, Any]]:
+    cur = db.execute(
+        conn,
+        "SELECT provider, repository_id, repository_full_name, ref, commit_sha, created_at FROM contract_git_sources WHERE contract_id = ? AND workspace_id = ?",
+        (contract_id, workspace_id),
+    )
+    return db.normalize_row(cur.fetchone())
 
 
 def scoped_idempotency_key(workspace_id: str, client_key: str) -> str:
@@ -699,10 +719,12 @@ def list_job_summaries(
     sql = (
         "SELECT j.*, c.project_id AS project_id, c.source_kind AS source_kind, c.name AS source_name, p.name AS project_name, "
         "u.effective_loc AS effective_loc, u.usage_model AS usage_model, u.status AS usage_status, "
-        "r.id AS report_id, r.score_status AS score_status, r.score AS score, r.risk_band AS risk_band, r.purged_at AS report_purged_at "
+        "r.id AS report_id, r.score_status AS score_status, r.score AS score, r.risk_band AS risk_band, r.purged_at AS report_purged_at, "
+        "g.repository_full_name AS git_repository, g.ref AS git_ref, g.commit_sha AS git_commit_sha "
         "FROM analysis_jobs j "
         "JOIN contracts c ON c.id = j.contract_id AND c.workspace_id = j.workspace_id "
         "LEFT JOIN projects p ON p.id = c.project_id AND p.workspace_id = j.workspace_id "
+        "LEFT JOIN contract_git_sources g ON g.contract_id = c.id AND g.workspace_id = j.workspace_id "
         "LEFT JOIN job_usage u ON u.job_id = j.id AND u.workspace_id = j.workspace_id "
         "LEFT JOIN reports r ON r.job_id = j.id AND r.workspace_id = j.workspace_id "
         "WHERE j.workspace_id = ?"
@@ -2064,3 +2086,134 @@ def mark_webhook_event_processed(conn: Any, event_id: str, error: Optional[str] 
     else:
         db.execute(conn, "UPDATE webhook_events SET processing_error = ? WHERE id = ?", (error, event_id))
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Private GitHub connections (D-111) - see backend/migrations/
+# 0012_github_connections.sql. Every read and write is pinned to the
+# workspace (and, for a member's own connection, the user); token columns
+# only ever hold TokenCipher ciphertext, never a raw token.
+# ---------------------------------------------------------------------------
+
+GITHUB_CONNECTION_PUBLIC_FIELDS = ("id", "provider", "github_account_id", "github_login", "status", "scopes", "created_at", "updated_at")
+
+
+def create_github_oauth_state(conn: Any, state_hash: str, workspace_id: str, user_id: str, ttl_seconds: int, now: Optional[datetime] = None) -> None:
+    """Stores only the state's hash; prunes states that expired over a day ago."""
+    now = now or datetime.now(timezone.utc)
+    try:
+        db.execute(conn, "DELETE FROM github_oauth_states WHERE expires_at < ?", ((now - timedelta(days=1)).isoformat(),))
+        db.execute(
+            conn,
+            "INSERT INTO github_oauth_states (state_hash, workspace_id, user_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+            (state_hash, workspace_id, user_id, now.isoformat(), (now + timedelta(seconds=ttl_seconds)).isoformat()),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def consume_github_oauth_state(conn: Any, state_hash: str, user_id: str, now: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
+    """Atomically marks the state used and returns it - only when it exists,
+    belongs to user_id, is unexpired and was never used. Anything else
+    returns None and changes nothing (a replayed state is refused)."""
+    now = now or datetime.now(timezone.utc)
+    try:
+        cur = db.execute(
+            conn,
+            "UPDATE github_oauth_states SET consumed_at = ? WHERE state_hash = ? AND user_id = ? AND consumed_at IS NULL AND expires_at > ?",
+            (now.isoformat(), state_hash, user_id, now.isoformat()),
+        )
+        if cur.rowcount != 1:
+            conn.rollback()
+            return None
+        row = db.normalize_row(db.execute(conn, "SELECT * FROM github_oauth_states WHERE state_hash = ?", (state_hash,)).fetchone())
+        conn.commit()
+        return row
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def save_github_connection(conn: Any, workspace_id: str, user_id: str, github_account_id: int, github_login: str, scopes: str,
+                           access_token_enc: str, access_token_expires_at: Optional[str], refresh_token_enc: Optional[str],
+                           refresh_token_expires_at: Optional[str]) -> str:
+    """The member's new active connection in this workspace; a previous
+    active one is revoked (tokens wiped) in the same transaction."""
+    now = utcnow_iso()
+    connection_id = new_id()
+    try:
+        db.execute(
+            conn,
+            "UPDATE github_connections SET status = 'revoked', access_token_enc = NULL, refresh_token_enc = NULL, access_token_expires_at = NULL, "
+            "refresh_token_expires_at = NULL, revoked_at = ?, updated_at = ? WHERE workspace_id = ? AND user_id = ? AND status = 'active'",
+            (now, now, workspace_id, user_id),
+        )
+        db.execute(
+            conn,
+            "INSERT INTO github_connections (id, workspace_id, user_id, provider, github_account_id, github_login, status, access_token_enc, "
+            "access_token_expires_at, refresh_token_enc, refresh_token_expires_at, scopes, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'github', ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)",
+            (connection_id, workspace_id, user_id, github_account_id, github_login, access_token_enc, access_token_expires_at,
+             refresh_token_enc, refresh_token_expires_at, scopes, now, now),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return connection_id
+
+
+def get_active_github_connection(conn: Any, workspace_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+    cur = db.execute(
+        conn,
+        "SELECT * FROM github_connections WHERE workspace_id = ? AND user_id = ? AND status = 'active'",
+        (workspace_id, user_id),
+    )
+    return db.normalize_row(cur.fetchone())
+
+
+def get_github_connection(conn: Any, workspace_id: str, connection_id: str) -> Optional[Dict[str, Any]]:
+    cur = db.execute(conn, "SELECT * FROM github_connections WHERE id = ? AND workspace_id = ?", (connection_id, workspace_id))
+    return db.normalize_row(cur.fetchone())
+
+
+def update_github_connection_tokens(conn: Any, workspace_id: str, connection_id: str, access_token_enc: str, access_token_expires_at: Optional[str],
+                                    refresh_token_enc: Optional[str], refresh_token_expires_at: Optional[str]) -> bool:
+    cur = db.execute(
+        conn,
+        "UPDATE github_connections SET access_token_enc = ?, access_token_expires_at = ?, refresh_token_enc = ?, refresh_token_expires_at = ?, updated_at = ? "
+        "WHERE id = ? AND workspace_id = ? AND status = 'active'",
+        (access_token_enc, access_token_expires_at, refresh_token_enc, refresh_token_expires_at, utcnow_iso(), connection_id, workspace_id),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def set_github_connection_status(conn: Any, workspace_id: str, connection_id: str, status: str) -> bool:
+    """revoked/invalid: the row is kept for history, both tokens wiped."""
+    if status not in ("revoked", "invalid"):
+        raise RepositoryError("status must be revoked or invalid, got %r" % (status,))
+    now = utcnow_iso()
+    cur = db.execute(
+        conn,
+        "UPDATE github_connections SET status = ?, access_token_enc = NULL, refresh_token_enc = NULL, access_token_expires_at = NULL, "
+        "refresh_token_expires_at = NULL, revoked_at = ?, updated_at = ? WHERE id = ? AND workspace_id = ? AND status = 'active'",
+        (status, now, now, connection_id, workspace_id),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def revoke_workspace_github_connections(conn: Any, workspace_id: str) -> int:
+    """Every active connection of the workspace (workspace deletion)."""
+    now = utcnow_iso()
+    cur = db.execute(
+        conn,
+        "UPDATE github_connections SET status = 'revoked', access_token_enc = NULL, refresh_token_enc = NULL, access_token_expires_at = NULL, "
+        "refresh_token_expires_at = NULL, revoked_at = ?, updated_at = ? WHERE workspace_id = ? AND status = 'active'",
+        (now, now, workspace_id),
+    )
+    conn.commit()
+    return cur.rowcount

@@ -34,6 +34,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 
 try:
     import psycopg
@@ -121,7 +122,7 @@ class MigrationIntegrationTests(unittest.TestCase):
         self.conn, self.applied = _reset_database_and_migrate()
         self.addCleanup(self.conn.close)
 
-    def test_fresh_database_applies_all_eleven_migrations_in_order(self):
+    def test_fresh_database_applies_all_twelve_migrations_in_order(self):
         # 0002_auth_tokens.sql (Phase 2), 0003_entitlement_status_expand.sql
         # and 0004_entitlement_event_provenance.sql (Phase 3),
         # 0005_job_queue_hardening.sql (Phase 4, D-079),
@@ -130,7 +131,8 @@ class MigrationIntegrationTests(unittest.TestCase):
         # 0008_queue_fairness.sql (admission control / queue fairness,
         # post reap-atomicity-fix and worker-fencing hardening) and
         # 0009_commercial_usage.sql (D-107), 0010_commercial_guards.sql
-        # (D-108) and 0011_contract_files.sql (D-109) added alongside
+        # (D-108), 0011_contract_files.sql (D-109) and
+        # 0012_github_connections.sql (D-111) added alongside
         # 0001_initial_schema.sql (Phase 1).
         self.assertEqual(
             self.applied,
@@ -138,7 +140,7 @@ class MigrationIntegrationTests(unittest.TestCase):
                 "0001_initial_schema", "0002_auth_tokens", "0003_entitlement_status_expand",
                 "0004_entitlement_event_provenance", "0005_job_queue_hardening", "0006_retention_purge",
                 "0007_billing_interval", "0008_queue_fairness", "0009_commercial_usage",
-                "0010_commercial_guards", "0011_contract_files",
+                "0010_commercial_guards", "0011_contract_files", "0012_github_connections",
             ],
         )
 
@@ -161,7 +163,7 @@ class MigrationIntegrationTests(unittest.TestCase):
             seen_statuses.add(repo.get_entitlement_by_workspace(self.conn, workspace_id)["status"])
         self.assertEqual(seen_statuses, {"incomplete_expired", "unpaid"})
 
-    def test_all_twenty_one_tables_exist(self):
+    def test_all_twenty_four_tables_exist(self):
         cur = db.execute(
             self.conn,
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
@@ -176,6 +178,7 @@ class MigrationIntegrationTests(unittest.TestCase):
             "scan_credits", "usage_periods", "job_usage",  # D-107, 0009_commercial_usage.sql.
             "technical_budget_periods", "submit_attempts",  # D-108, 0010_commercial_guards.sql.
             "contract_files",  # D-109, 0011_contract_files.sql.
+            "github_connections", "github_oauth_states", "contract_git_sources",  # D-111, 0012_github_connections.sql.
         }
         self.assertEqual(tables, expected)
 
@@ -796,6 +799,59 @@ class ProjectsMultiFileIntegrationTests(unittest.TestCase):
         repo.enqueue_job(self.conn, self.ws, loose, self.user_id, "quick", idempotency_key=repo.scoped_idempotency_key(self.other, "k"))
         self.assertEqual([j["id"] for j in repo.list_jobs_by_workspace(self.conn, self.ws, project_id=pid)], [in_project])
         self.assertEqual(repo.list_jobs_by_workspace(self.conn, self.other, project_id=pid), [])
+
+
+class GitHubConnectionsIntegrationTests(unittest.TestCase):
+    """D-111 against a REAL Postgres server: OAuth state single-use and
+    expiry, one active connection per (workspace, user) with tokens wiped on
+    revoke, the active-needs-token CHECK, and a GitHub scan's repository/
+    ref/commit stored with its contract and shown in the job summaries."""
+
+    def setUp(self):
+        self.conn, _ = _reset_database_and_migrate()
+        self.addCleanup(self.conn.close)
+        self.user_id = repo.create_user(self.conn, "d111-%s@example.com" % repo.new_id())
+        self.other_user = repo.create_user(self.conn, "d111o-%s@example.com" % repo.new_id())
+        self.ws = repo.create_workspace(self.conn, "WS", self.user_id)
+        repo.create_entitlement(self.conn, self.ws, "standard", "active", billing_interval="monthly")
+
+    def test_states_connections_and_git_sources(self):
+        repo.create_github_oauth_state(self.conn, "hash-1", self.ws, self.user_id, 600)
+        self.assertIsNone(repo.consume_github_oauth_state(self.conn, "hash-1", self.other_user))
+        self.assertEqual(repo.consume_github_oauth_state(self.conn, "hash-1", self.user_id)["workspace_id"], self.ws)
+        self.assertIsNone(repo.consume_github_oauth_state(self.conn, "hash-1", self.user_id))
+        repo.create_github_oauth_state(self.conn, "hash-2", self.ws, self.user_id, 1, now=datetime.now(timezone.utc) - timedelta(minutes=5))
+        self.assertIsNone(repo.consume_github_oauth_state(self.conn, "hash-2", self.user_id))
+
+        first = repo.save_github_connection(self.conn, self.ws, self.user_id, 9001, "octo", "", "v1.a", None, "v1.r", None)
+        second = repo.save_github_connection(self.conn, self.ws, self.user_id, 9001, "octo", "", "v1.b", None, None, None)
+        self.assertEqual(repo.get_active_github_connection(self.conn, self.ws, self.user_id)["id"], second)
+        old = repo.get_github_connection(self.conn, self.ws, first)
+        self.assertEqual((old["status"], old["access_token_enc"], old["refresh_token_enc"]), ("revoked", None, None))
+        with self.assertRaises(db.integrity_error_class(self.conn)):
+            db.execute(self.conn, "INSERT INTO github_connections (id, workspace_id, user_id, github_account_id, github_login, status, created_at, updated_at) "
+                       "VALUES (?, ?, ?, 1, 'x', 'active', now(), now())", (repo.new_id(), self.ws, self.other_user))
+        self.conn.rollback()
+        with self.assertRaises(db.integrity_error_class(self.conn)):     # a second ACTIVE connection for the same member
+            db.execute(self.conn, "INSERT INTO github_connections (id, workspace_id, user_id, github_account_id, github_login, status, access_token_enc, created_at, updated_at) "
+                       "VALUES (?, ?, ?, 1, 'x', 'active', 'v1.c', now(), now())", (repo.new_id(), self.ws, self.user_id))
+        self.conn.rollback()
+        self.assertTrue(repo.update_github_connection_tokens(self.conn, self.ws, second, "v1.n", repo.utcnow_iso(), "v1.m", None))
+        self.assertTrue(repo.set_github_connection_status(self.conn, self.ws, second, "invalid"))
+        self.assertIsNone(repo.get_active_github_connection(self.conn, self.ws, self.user_id))
+
+        sha = "a" * 40
+        contract = repo.create_contract(self.conn, self.ws, "s3://x", "h", "octo/vault@aaaa", source_kind="files",
+                                        git_source={"connection_id": second, "repository_id": 101, "repository_full_name": "octo/vault", "ref": "main", "commit_sha": sha})
+        self.assertEqual(repo.get_contract_git_source(self.conn, self.ws, contract)["commit_sha"], sha)
+        ent = repo.get_entitlement_by_workspace(self.conn, self.ws)
+        job = repo.enqueue_job_with_usage(self.conn, self.ws, contract, self.user_id, "quick", None, ent, 10)
+        row = repo.list_job_summaries(self.conn, self.ws)[0]
+        self.assertEqual((row["id"], row["git_repository"], row["git_ref"], row["git_commit_sha"]), (job, "octo/vault", "main", sha))
+        with self.assertRaises(db.integrity_error_class(self.conn)):     # a truncated SHA is refused by the CHECK
+            repo.create_contract(self.conn, self.ws, "s3://y", "h", "n", source_kind="files",
+                                 git_source={"repository_id": 1, "repository_full_name": "a/b", "ref": "main", "commit_sha": "abc"})
+        self.assertEqual(repo.revoke_workspace_github_connections(self.conn, self.ws), 0)
 
 
 class WebAppQueriesIntegrationTests(unittest.TestCase):

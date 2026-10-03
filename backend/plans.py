@@ -133,6 +133,24 @@ PLAN_ALLOWED_MODES = {
 }
 
 
+# Plan -> product features beyond scan limits (D-111). Private GitHub is a
+# Standard/Pro feature; Quick keeps every other input (single file,
+# multi-file, ZIP). Only features that exist are listed - GitHub Actions and
+# the Private API get their entries with their own blocks. Enforced by the
+# backend (backend/http_app.py), never only by the UI.
+FEATURE_PRIVATE_GITHUB = "private_github"
+PLAN_FEATURES = {
+    PLAN_QUICK: frozenset(),
+    PLAN_STANDARD: frozenset({FEATURE_PRIVATE_GITHUB}),
+    PLAN_PRO: frozenset({FEATURE_PRIVATE_GITHUB}),
+}
+
+
+def plan_has_feature(plan_name: Optional[str], feature: str) -> bool:
+    """False for an unknown plan (fails closed)."""
+    return feature in PLAN_FEATURES.get(plan_name or "", frozenset())
+
+
 def price_mode_key(plan: str, interval: str) -> Optional[str]:
     """The price mode selling `plan` at `interval`, or None when that
     combination is not sold (e.g. quick+monthly, pro+one_time)."""

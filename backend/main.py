@@ -109,6 +109,7 @@ import backend.billing as billing_module
 import backend.db as db
 import backend.egress_proxy as egress_proxy
 import backend.email_sender as email_sender_module
+import backend.github_integration as github_integration
 import backend.http_app as http_app
 import backend.object_storage as object_storage
 import backend.plans as plans
@@ -373,7 +374,32 @@ def _load_web_config() -> Dict[str, Any]:
     cfg.update(_load_alert_config())
     cfg.update(_load_email_config())
     cfg.update(_load_black_friday_config())
+    cfg.update(_load_github_config())
     return cfg
+
+
+# D-111 Private GitHub (GitHub App user authorization). All four or none:
+# none set leaves the feature unconfigured (its endpoints answer 503), a
+# partial set is a configuration error - never a half-working integration.
+GITHUB_REQUIRED_ENV_VARS = ("GITHUB_APP_CLIENT_ID", "GITHUB_APP_CLIENT_SECRET", "GITHUB_OAUTH_REDIRECT_URI", "GITHUB_TOKEN_ENCRYPTION_KEY")
+
+
+def _load_github_config() -> Dict[str, Any]:
+    present = [name for name in GITHUB_REQUIRED_ENV_VARS if os.environ.get(name, "").strip()]
+    if not present:
+        return {"github": None}
+    missing = [name for name in GITHUB_REQUIRED_ENV_VARS if name not in present]
+    if missing:
+        raise ConfigError("Private GitHub needs all of %s; missing %s" % (", ".join(GITHUB_REQUIRED_ENV_VARS), ", ".join(missing)))
+    redirect_uri = os.environ["GITHUB_OAUTH_REDIRECT_URI"].strip()
+    if not re.match(r"^https://[^/\s]+/github/callback$", redirect_uri) and not re.match(r"^http://(localhost|127\.0\.0\.1)(:\d+)?/github/callback$", redirect_uri):
+        raise ConfigError("GITHUB_OAUTH_REDIRECT_URI must be https://<host>/github/callback (plain http only for localhost)")
+    try:
+        token_key = github_integration.decode_token_key(os.environ["GITHUB_TOKEN_ENCRYPTION_KEY"])
+    except ValueError as exc:
+        raise ConfigError(str(exc))
+    return {"github": {"client_id": os.environ["GITHUB_APP_CLIENT_ID"].strip(), "client_secret": os.environ["GITHUB_APP_CLIENT_SECRET"].strip(),
+                       "redirect_uri": redirect_uri, "token_key": token_key, "app_slug": os.environ.get("GITHUB_APP_SLUG", "").strip() or None}}
 
 
 def _load_stripe_price_allowlist() -> Dict[str, str]:
@@ -530,6 +556,12 @@ def _build_storage(bucket: str, region: str) -> object_storage.ObjectStorage:
     )
 
 
+def _build_github(github_cfg: Optional[Dict[str, Any]]) -> Optional[github_integration.GitHubIntegration]:
+    if github_cfg is None:
+        return None
+    return github_integration.GitHubIntegration(github_integration.GitHubConfig(**github_cfg))
+
+
 def _build_billing(secret_key: str, webhook_secret: str, price_allowlist: Dict[str, str]) -> billing_module.StripeBilling:
     return billing_module.StripeBilling(secret_key=secret_key, webhook_secret=webhook_secret, price_allowlist=price_allowlist)
 
@@ -613,6 +645,7 @@ def run_web() -> None:
         black_friday_promotion_code_id=cfg["black_friday_promotion_code_id"],
         max_pending_jobs_per_workspace=cfg["max_pending_jobs_per_workspace"],
         submit_rate_limit_per_window=cfg["submit_rate_limit_per_minute"],
+        github=_build_github(cfg["github"]),
     )
     sys.stderr.write("backend web process listening on %s:%d (secure_cookies=%s)\n" % (cfg["host"], cfg["port"], cfg["secure_cookies"]))
     if cfg["black_friday_enabled"]:

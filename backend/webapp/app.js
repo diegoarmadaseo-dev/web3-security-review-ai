@@ -180,7 +180,8 @@
     return el("table", null, el("thead", null, el("tr", null, ["Created", withProject ? "Project" : null, "Source", "Effective LOC", "Status", "Indicator", ""].filter(function (x) { return x !== null; }).map(function (h) { return el("th", { text: h }); }))),
       el("tbody", null, jobs.map(function (j) {
         return el("tr", null, el("td", null, el("a", { href: "#/scans/" + j.id, text: C.formatDate(j.created_at) })),
-          withProject ? el("td", { text: j.project_name || "-" }) : null, el("td", { text: C.sourceKindLabel(j.source_kind) }),
+          withProject ? el("td", { text: j.project_name || "-" }) : null,
+          el("td", { text: C.sourceKindLabel(j.source_kind, j.git_repository) + (j.git_repository ? " - " + j.git_repository + "@" + C.shortSha(j.git_commit_sha) : "") }),
           el("td", { text: C.formatNumber(j.effective_loc) }), el("td", null, badge(j.status)),
           el("td", { text: j.report_id ? (j.score_status === "computed" ? j.score + " (" + j.risk_band + ")" : "Not computed") : "-" }),
           el("td", null, j.report_id ? el("a", { href: "#/reports/" + j.report_id, text: "Report" }) : null));
@@ -242,6 +243,7 @@
 
   function newScanView(query) {
     var token = state.route;
+    if (query.workspace && query.workspace !== state.wsId && state.workspaces.some(function (w) { return w.id === query.workspace; })) { selectWorkspace(query.workspace); }
     Promise.all([loadWs(), api("GET", wsPath("/projects?limit=100")), catalog().catch(function () { return []; })]).then(function (r) {
       if (!current(token)) { return; }
       var ws = r[0], projects = r[1].projects || [], adm = ws.admission || {};
@@ -251,7 +253,12 @@
       var order = ["quick", "standard", "pro"];
       var mode = el("select", { "aria-label": "Analysis mode" }, (adm.allowed_modes || []).slice().sort(function (a, b) { return order.indexOf(a) - order.indexOf(b); })
         .map(function (m) { return el("option", { value: m, text: C.humanize(m) }); }));
-      var kind = "single";
+      // D-111: GitHub is offered only when the backend says the plan includes
+      // it; the backend refuses it for any other plan regardless.
+      var hasGitHub = (adm.features || []).indexOf("private_github") >= 0;
+      var kind = hasGitHub && query.github ? "github" : "single";
+      var gh = { repo: null, ref: "", sha: "" };
+      var ghPane = el("div");
       var source = el("textarea", { spellcheck: "false", placeholder: "Paste Solidity source here" });
       var single = el("input", { type: "file", accept: ".sol,.vy" });
       var multi = el("input", { type: "file", multiple: true, accept: ".sol,.vy,.md,.txt" });
@@ -260,8 +267,69 @@
       var panes = {
         single: el("div", null, source, el("div", { className: "small muted" }, "or load a file: ", single)),
         files: el("div", null, el("div", null, "Files: ", multi), el("div", null, "or a folder: ", folder), el("p", { className: "small muted", text: "Paths are kept, so imports between files resolve. Files other than Solidity/Vyper sources and docs are ignored." })),
-        zip: el("div", null, zip, el("p", { className: "small muted", text: "A ZIP of the project. It is checked on the server and never extracted to disk." }))
+        zip: el("div", null, zip, el("p", { className: "small muted", text: "A ZIP of the project. It is checked on the server and never extracted to disk." })),
+        github: ghPane
       };
+      function ghSelectRepo(repoSelect, branchSelect, shaLine) {
+        gh.repo = null; gh.ref = ""; gh.sha = ""; clear(branchSelect); shaLine.textContent = ""; onChange();
+        if (!repoSelect.value) { return; }
+        branchSelect.appendChild(el("option", { value: "", text: "Loading branches..." }));
+        api("GET", wsPath("/github/repositories/" + encodeURIComponent(repoSelect.value) + "/branches")).then(function (d) {
+          gh.repo = d.repository; clear(branchSelect);
+          var branches = d.branches || [];
+          branches.forEach(function (b) { branchSelect.appendChild(el("option", { value: b.name, text: b.name, selected: b.name === d.repository.default_branch })); });
+          function pick() {
+            var b = branches.filter(function (x) { return x.name === branchSelect.value; })[0];
+            gh.ref = b ? b.name : ""; gh.sha = b ? b.commit_sha : "";
+            shaLine.textContent = b ? "Commit to analyze: " + b.commit_sha : "No branch available.";
+            onChange();
+          }
+          branchSelect.onchange = pick;
+          pick();
+        }).catch(function (err) { clear(branchSelect); clear(result); result.appendChild(errorBox(err)); });
+      }
+      function loadGitHub(notice) {
+        clear(ghPane);
+        if (notice) { ghPane.appendChild(el("div", { className: "alert " + (notice.kind === "ok" ? "ok" : "error"), role: "status", text: notice.text })); }
+        if (!adm.github_configured) { ghPane.appendChild(el("p", { className: "muted", text: "GitHub is not configured on this server yet." })); return; }
+        api("GET", wsPath("/github")).then(function (d) {
+          var c = d.connection;
+          function openExternal(url) { var safe = C.safeExternalUrl(url); if (safe) { window.location.assign(safe); } return !!safe; }
+          if (!c) {
+            ghPane.appendChild(el("p", { text: "Connect your GitHub account to scan a repository. Vericexa never asks for your GitHub password and only gets read access to the repositories you grant to its GitHub App." }));
+            ghPane.appendChild(el("button", { type: "button", text: "Connect GitHub", onclick: function (ev) {
+              ev.target.disabled = true;
+              api("POST", wsPath("/github/connect"), {}).then(function (r) {
+                if (!openExternal(r.authorize_url)) { ev.target.disabled = false; clear(result); result.appendChild(el("div", { className: "alert error", text: "GitHub could not be opened. Please try again." })); }
+              })
+                .catch(function (err) { ev.target.disabled = false; clear(result); result.appendChild(errorBox(err)); });
+            } }));
+            return;
+          }
+          var repoSelect = el("select", { "aria-label": "Repository" }, el("option", { value: "", text: "Loading repositories..." }));
+          var branchSelect = el("select", { "aria-label": "Branch" });
+          var shaLine = el("p", { className: "small" });
+          ghPane.appendChild(el("div", { className: "actions" }, el("span", { text: "Connected to GitHub as " + c.github_login }),
+            el("button", { type: "button", className: "secondary", text: "Disconnect", onclick: function () {
+              if (!window.confirm("Disconnect GitHub from this workspace?")) { return; }
+              api("DELETE", wsPath("/github")).then(function () { loadGitHub(null); }).catch(function (err) { clear(result); result.appendChild(errorBox(err)); });
+            } })));
+          ghPane.appendChild(el("div", { className: "field" }, el("label", { text: "Repository" }), repoSelect));
+          ghPane.appendChild(el("div", { className: "field" }, el("label", { text: "Branch" }), branchSelect));
+          ghPane.appendChild(shaLine);
+          repoSelect.onchange = function () { ghSelectRepo(repoSelect, branchSelect, shaLine); };
+          api("GET", wsPath("/github/repositories")).then(function (r) {
+            clear(repoSelect);
+            var repos = r.repositories || [];
+            repoSelect.appendChild(el("option", { value: "", text: repos.length ? "Choose a repository" : "No repository granted yet" }));
+            repos.forEach(function (x) { repoSelect.appendChild(el("option", { value: String(x.id), text: x.full_name + (x.private ? " (private)" : "") })); });
+            if (r.truncated) { ghPane.appendChild(el("p", { className: "small muted", text: "Only the first " + repos.length + " repositories are listed." })); }
+            if (r.install_url) {
+              ghPane.appendChild(el("p", { className: "small muted" }, "Missing a repository? ", el("button", { type: "button", className: "secondary", text: "Choose repositories on GitHub", onclick: function () { openExternal(r.install_url); } })));
+            }
+          }).catch(function (err) { clear(repoSelect); clear(result); result.appendChild(errorBox(err)); });
+        }).catch(function (err) { clear(result); result.appendChild(errorBox(err)); });
+      }
       var paneHost = el("div");
       function showPane() { clear(paneHost); paneHost.appendChild(panes[kind]); }
       function onChange() { key = C.newIdempotencyKey(); clear(result); }
@@ -270,16 +338,23 @@
       single.addEventListener("change", function () {
         if (single.files[0]) { single.files[0].text().then(function (t) { source.value = t; }); }
       });
-      var tabs = el("div", { className: "tabs", role: "radiogroup" }, [["single", "Single source"], ["files", "Multiple files"], ["zip", "ZIP"]].map(function (t) {
+      var kinds = [["single", "Single source"], ["files", "Multiple files"], ["zip", "ZIP"]].concat(hasGitHub ? [["github", "Import from GitHub"]] : []);
+      var tabs = el("div", { className: "tabs", role: "radiogroup" }, kinds.map(function (t) {
         return el("label", null, el("input", { type: "radio", name: "kind", value: t[0], checked: t[0] === kind, onchange: function () { kind = t[0]; onChange(); showPane(); } }), " " + t[1]);
       }));
       showPane();
+      if (hasGitHub) { loadGitHub(C.githubCallbackMessage(query.github)); }
 
       function payload(dryRun) {
         var base = { mode: mode.value, dry_run: dryRun };
         if (project.value) { base.project_id = project.value; }
         if (!dryRun) { base.idempotency_key = key; }
         if (kind === "single") { base.source = source.value; return Promise.resolve(base); }
+        if (kind === "github") {
+          if (!gh.repo || !gh.ref || !gh.sha) { return Promise.reject({ status: 400, body: { error: "", detail: "Choose a repository and a branch." } }); }
+          base.github = { repository_id: gh.repo.id, ref: gh.ref, commit_sha: gh.sha };
+          return Promise.resolve(base);
+        }
         if (kind === "zip") {
           if (!zip.files[0]) { return Promise.reject({ status: 400, body: { error: "", detail: "Choose a ZIP file." } }); }
           return zip.files[0].arrayBuffer().then(function (buf) { base.archive = { format: "zip", content_base64: C.bytesToBase64(new Uint8Array(buf)) }; return base; });
@@ -295,7 +370,8 @@
           el("ul", null, el("li", { text: "Effective LOC: " + C.formatNumber(d.effective_loc) }),
             d.max_loc_per_scan ? el("li", { text: "Plan limit per scan: " + C.formatNumber(d.max_loc_per_scan) + " effective LOC" }) : null,
             d.usage && typeof d.usage.loc_remaining === "number" ? el("li", { text: "Remaining this service month: " + C.formatNumber(d.usage.loc_remaining) + " effective LOC" }) : null,
-            d.usage && d.usage.usage_model === "scan_credit" ? el("li", { text: "Uses your Quick scan (" + d.usage.scans_available + " available)" }) : null),
+            d.usage && d.usage.usage_model === "scan_credit" ? el("li", { text: "Uses your Quick scan (" + d.usage.scans_available + " available)" }) : null,
+            d.github ? el("li", { text: "GitHub: " + d.github.full_name + " - branch " + d.github.ref + " - commit " + d.github.commit_sha }) : null),
           el("p", { className: "small", text: "Checked by the server. Starting the scan re-checks everything." })));
         if (d.files) {
           result.appendChild(el("table", null, el("thead", null, el("tr", null, ["File", "Language", "Effective LOC"].map(function (h) { return el("th", { text: h }); }))),
@@ -308,6 +384,7 @@
       function run(dryRun, button) {
         button.disabled = true;
         payload(dryRun).then(function (body) { return api("POST", wsPath("/jobs"), body); }).then(function (d) {
+          if (d.github && kind === "github") { gh.sha = d.github.commit_sha; }   // Start analyzes exactly the commit Check pinned
           if (dryRun) { showPreview(d); } else { window.location.hash = "#/scans/" + d.job_id; }
         }).catch(function (err) { clear(result); result.appendChild(errorBox(err)); }).then(function () { button.disabled = false; });
       }
@@ -356,7 +433,9 @@
       var job = d.job, src = d.source || {}, usage = d.usage || {};
       render(el("h1", null, "Scan ", badge(job.status)),
         kv([["Created", C.formatDate(job.created_at)], ["Started", C.formatDate(job.started_at)], ["Finished", C.formatDate(job.completed_at)],
-          ["Mode", C.humanize(job.mode)], ["Source", C.sourceKindLabel(src.kind) + (src.name ? " - " + src.name : "")],
+          ["Mode", C.humanize(job.mode)], ["Source", C.sourceKindLabel(src.kind, src.git && src.git.repository_full_name) + (src.name ? " - " + src.name : "")],
+          src.git ? ["Repository", src.git.repository_full_name] : null, src.git ? ["Branch", src.git.ref] : null,
+          src.git ? ["Commit", el("code", { text: src.git.commit_sha })] : null,
           ["Project", src.project_id ? el("a", { href: "#/projects/" + src.project_id, text: "Open project" }) : "-"],
           ["Effective LOC", C.formatNumber(usage.effective_loc)], job.attempt_count ? ["Attempts", String(job.attempt_count)] : null]),
         job.status === "failed" ? el("div", { className: "alert error" }, el("strong", { text: "The scan failed. " }), "No LOC or Quick scan was charged for it.", job.last_error ? el("pre", { text: job.last_error }) : null) : null,
@@ -401,7 +480,7 @@
       render(el("h1", { text: "Automated security review" }),
         el("div", { className: "alert info", text: C.DISCLAIMER }),
         kv([["Project", d.source.project_name || "-"], ["Date", C.formatDate(rep.created_at)], ["Mode", C.humanize(d.job.mode)],
-          ["Source", C.sourceKindLabel(d.source.kind)], ["Analysis scope", scope.completeness ? C.humanize(scope.completeness) : "-"]]),
+          ["Source", C.sourceKindLabel(d.source.kind, d.source.git && d.source.git.repository_full_name) + (d.source.git ? " - " + d.source.git.repository_full_name + " @ " + d.source.git.commit_sha : "")], ["Analysis scope", scope.completeness ? C.humanize(scope.completeness) : "-"]]),
         (scope.reasons || []).length ? el("ul", { className: "small" }, scope.reasons.map(function (r) { return el("li", { text: typeof r === "string" ? r : (r.message || r.code || JSON.stringify(r)) }); })) : null,
         el("div", { className: "cards" }, el("div", { className: "card" }, el("h3", { text: "Automated Risk Indicator" }),
           el("div", { className: "big", text: computed ? rep.score + " - " + rep.risk_band : "Not computed" }),

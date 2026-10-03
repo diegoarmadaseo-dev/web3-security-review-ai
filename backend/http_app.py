@@ -188,6 +188,7 @@ import backend.auth as auth
 import backend.billing as billing_module
 import backend.black_friday as black_friday
 import backend.db as db
+import backend.github_integration as github_integration
 import backend.loc_count as loc_count
 import backend.object_storage as object_storage
 import backend.plans as plans
@@ -218,6 +219,11 @@ _JOB_ITEM_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/jobs/(?P<job_id
 _REPORT_DOCUMENT_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/reports/(?P<report_id>[^/]+)/document$")
 _REPORT_DOWNLOAD_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/reports/(?P<report_id>[^/]+)/download$")
 _APP_STATIC_RE = re.compile(r"^/app/static/(?P<name>[A-Za-z0-9._-]+)$")
+# D-111 Private GitHub (Standard/Pro). Anchored like every regex above.
+_GITHUB_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/github$")
+_GITHUB_CONNECT_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/github/connect$")
+_GITHUB_REPOSITORIES_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/github/repositories$")
+_GITHUB_BRANCHES_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/github/repositories/(?P<repository_id>[^/]+)/branches$")
 
 # D-110 web app: the ONLY files /app/static/ serves (a fixed allowlist, so no
 # request path is ever joined onto the filesystem), and the headers every
@@ -236,6 +242,13 @@ _APP_SECURITY_HEADERS = (
     ("X-Frame-Options", "DENY"),
     ("Referrer-Policy", "same-origin"),
 )
+
+
+def _public_git_source(git_source: Dict[str, Any]) -> Dict[str, Any]:
+    """What a client sees of a GitHub scan's origin (D-111) - never the
+    connection id, never a token."""
+    return {"repository_id": git_source["repository_id"], "full_name": git_source["repository_full_name"],
+            "ref": git_source["ref"], "commit_sha": git_source["commit_sha"]}
 
 
 def _read_webapp_file(name: str) -> Optional[bytes]:
@@ -362,7 +375,7 @@ JOB_SUBMIT_MAX_BODY_BYTES = 6 * MAX_RAW_SOURCE_BYTES + 3072
 
 # Query parameter names (decoded, lower-cased) this module never lets
 # reach an access log - see module docstring and _redact_query_string().
-_SENSITIVE_QUERY_PARAM_NAMES = frozenset({"token"})
+_SENSITIVE_QUERY_PARAM_NAMES = frozenset({"token", "code", "state"})   # D-111: the GitHub OAuth callback's code and state never reach a log either
 
 
 def _is_utf8_encodable(text: str) -> bool:
@@ -760,6 +773,7 @@ def make_handler(
     black_friday_promotion_code_id: Optional[str] = None,
     max_pending_jobs_per_workspace: int = repo.DEFAULT_MAX_PENDING_JOBS_PER_WORKSPACE,
     submit_rate_limit_per_window: int = repo.DEFAULT_SUBMIT_RATE_LIMIT_PER_WINDOW,
+    github: Optional["github_integration.GitHubIntegration"] = None,
 ) -> type:
     """Returns a fresh Handler class closed over this specific server
     instance's config - never module-level globals, so multiple servers
@@ -791,7 +805,11 @@ def make_handler(
     bound POST /workspaces/<id>/jobs: queued+claimed+running jobs per
     workspace, and submissions per user per
     repo.SUBMIT_RATE_LIMIT_WINDOW_SECONDS. Both default to the repository's
-    own defaults; backend/main.py reads them from the environment."""
+    own defaults; backend/main.py reads them from the environment.
+
+    github (D-111) is OPTIONAL: None leaves Private GitHub unconfigured (its
+    endpoints answer 503 github_not_configured after the plan check); see
+    backend/github_integration.py."""
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "backend-auth/2026.1"
@@ -974,6 +992,9 @@ def make_handler(
             if path == "/billing/plans":
                 self._handle_billing_plans()
                 return
+            if path == "/github/callback":
+                self._handle_github_callback(parsed)
+                return
             if path == "/":
                 # D-110: the signed-in product lives at /app (auth's default
                 # post-login redirect is "/").
@@ -996,6 +1017,18 @@ def make_handler(
             match = _REPORT_DOWNLOAD_RE.match(path)
             if match:
                 self._handle_report_download(match.group("workspace_id"), match.group("report_id"), parsed)
+                return
+            match = _GITHUB_RE.match(path)
+            if match:
+                self._handle_github_status(match.group("workspace_id"))
+                return
+            match = _GITHUB_REPOSITORIES_RE.match(path)
+            if match:
+                self._handle_github_repositories(match.group("workspace_id"))
+                return
+            match = _GITHUB_BRANCHES_RE.match(path)
+            if match:
+                self._handle_github_branches(match.group("workspace_id"), match.group("repository_id"))
                 return
             if path == "/workspaces":
                 self._handle_workspace_list()
@@ -1117,6 +1150,10 @@ def make_handler(
                 match = _PROJECTS_COLLECTION_RE.match(path)
                 if match:
                     self._handle_project_create(match.group("workspace_id"))
+                    return
+                match = _GITHUB_CONNECT_RE.match(path)
+                if match:
+                    self._handle_github_connect(match.group("workspace_id"))
                     return
                 self._send_json(404, {"ok": False, "error": "not found"})
 
@@ -1359,7 +1396,10 @@ def make_handler(
                 # plan may request, and whether checkout is available.
                 admission = {"pending_jobs": repo.count_pending_jobs(conn, workspace_id), "max_pending_jobs": max_pending_jobs_per_workspace,
                              "allowed_modes": sorted(repo.PLAN_ALLOWED_MODES.get(entitlement["plan"], frozenset())) if entitlement else [],
-                             "billing_configured": billing is not None}
+                             "billing_configured": billing is not None,
+                             # D-111: plan features (backend/plans.py) and whether Private GitHub is configured - display only.
+                             "features": sorted(plans.PLAN_FEATURES.get(entitlement["plan"], frozenset())) if entitlement and entitlement["status"] in ("active", "trialing") else [],
+                             "github_configured": github is not None}
                 self._send_json(200, {"ok": True, "workspace": workspace, "entitlement": entitlement, "budget": budget, "limits": limits, "usage": usage,
                                       "admission": admission})
             except Exception:
@@ -1604,11 +1644,19 @@ def make_handler(
             # bundle text, so EVERYTHING below (size ceiling, effective LOC,
             # admission, storage, worker) is the single-source path,
             # unchanged - one LOC count, one reservation.
-            given = [key for key in ("source", "files", "archive") if payload.get(key) is not None]
+            # D-111: "github" is a fourth shape - {repository_id, ref?,
+            # commit_sha?} - validated here, gated by plan below, and fetched
+            # by the backend itself (backend/github_integration.py) into the
+            # SAME D-109 bundle; never a URL, never file content from the client.
+            given = [key for key in ("source", "files", "archive", "github") if payload.get(key) is not None]
             if len(given) > 1:
-                self._send_json(400, {"ok": False, "error": "only one of source, files or archive may be given"})
+                self._send_json(400, {"ok": False, "error": "only one of source, files, archive or github may be given" if "github" in given else "only one of source, files or archive may be given"})
                 return
-            source_kind, manifest, built = "single", None, None
+            source_kind, manifest, built, github_spec, git_source = "single", None, None, None, None
+            if given and given[0] == "github":
+                github_spec = self._parse_github_spec(payload["github"])
+                if github_spec is None:
+                    return
             if given and given[0] in ("files", "archive"):
                 try:
                     if given[0] == "files":
@@ -1627,20 +1675,20 @@ def make_handler(
             if project_id is not None and (not isinstance(project_id, str) or not _UUID_RE.match(project_id)):
                 self._send_json(404, {"ok": False, "error": "project_not_found"})
                 return
-            if not isinstance(source, str) or not source.strip():
+            if github_spec is None and (not isinstance(source, str) or not source.strip()):
                 self._send_json(400, {"ok": False, "error": "source is required"})
                 return
             # json.loads() turns a "\\ud800"-style escape into an unpaired
             # surrogate, which has no UTF-8 encoding: refuse it here instead
             # of letting .encode("utf-8") raise below (which closed the
             # connection with no response).
-            if not _is_utf8_encodable(source):
+            if github_spec is None and not _is_utf8_encodable(source):
                 self._send_json(400, {"ok": False, "error": "source must be valid Unicode text (unpaired surrogates are not allowed)"})
                 return
             # Cheap, fast rejection only - see MAX_RAW_SOURCE_BYTES's own
             # comment on why the authoritative maxEffectiveLoc/
             # maxSourceFiles check happens inside the worker, not here.
-            if len(source.encode("utf-8")) > MAX_RAW_SOURCE_BYTES:
+            if github_spec is None and len(source.encode("utf-8")) > MAX_RAW_SOURCE_BYTES:
                 self._send_json(413, {"ok": False, "error": "source exceeds the maximum submission size"})
                 return
             if client_idempotency_key is not None and (not isinstance(client_idempotency_key, str) or not (1 <= len(client_idempotency_key) <= 200)):
@@ -1671,6 +1719,9 @@ def make_handler(
                 if entitlement is None or entitlement["status"] not in ("active", "trialing"):
                     self._send_json(402, {"ok": False, "error": "this workspace has no active subscription"})
                     return
+                if github_spec is not None and not plans.plan_has_feature(entitlement["plan"], plans.FEATURE_PRIVATE_GITHUB):
+                    self._send_feature_not_available(entitlement["plan"])   # D-111: Quick never reaches GitHub
+                    return
                 # P0 plan authorization (D-086): the ONLY place that
                 # decides whether an entitlement's plan may run a given
                 # mode - repo.PLAN_ALLOWED_MODES is the single source of
@@ -1688,6 +1739,12 @@ def make_handler(
                 if existing is not None:
                     self._send_json(200, {"ok": True, "job_id": existing["id"], "status": existing["status"], "duplicate": True})
                     return
+                if github_spec is not None:
+                    fetched = self._github_submission(conn, workspace_id, current_user_id, github_spec)
+                    if fetched is None:
+                        return
+                    built, git_source = fetched
+                    source, source_kind, manifest = built["source"], "files", built["files"]
                 # D-107 admission: the engine's own effective LOC (backend/
                 # loc_count.py), checked against the plan before anything
                 # is stored or queued.
@@ -1722,6 +1779,8 @@ def make_handler(
                                "plan": entitlement["plan"], "max_loc_per_scan": spec["max_loc_per_scan"] if spec else None, "usage": usage}
                     if built is not None:
                         preview.update({"files": built["files"], "ignored": built["ignored"], "ignored_count": built["ignored_count"]})
+                    if git_source is not None:
+                        preview["github"] = _public_git_source(git_source)
                     self._send_json(200, preview)
                     return
                 content_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
@@ -1733,8 +1792,10 @@ def make_handler(
                 storage.put_object(storage_ref, source.encode("utf-8"), content_type="text/plain")
                 display_name = payload.get("filename") if isinstance(payload.get("filename"), str) and payload.get("filename") else (
                     "contract.sol" if source_kind == "single" else "%s submission" % source_kind)   # display only, never a path
+                if git_source is not None:
+                    display_name = "%s@%s" % (git_source["repository_full_name"], git_source["commit_sha"][:12])
                 contract_id = repo.create_contract(conn, workspace_id, storage_ref, content_hash, display_name,
-                                                   project_id=project_id, source_kind=source_kind, files=manifest)
+                                                   project_id=project_id, source_kind=source_kind, files=manifest, git_source=git_source)
                 try:
                     job_id = repo.enqueue_job_with_usage(conn, workspace_id, contract_id, current_user_id, mode, idempotency_key, entitlement, effective_loc,
                                                          max_pending_jobs=max_pending_jobs_per_workspace)
@@ -1779,6 +1840,8 @@ def make_handler(
                 response = {"ok": True, "job_id": job_id, "status": "queued", "effective_loc": effective_loc, "source_kind": source_kind, "project_id": project_id}
                 if built is not None:
                     response.update({"files": built["files"], "ignored": built["ignored"], "ignored_count": built["ignored_count"]})
+                if git_source is not None:
+                    response["github"] = _public_git_source(git_source)
                 self._send_json(200, response)
             except Exception:
                 self._send_json(500, {"ok": False, "error": "internal error"})
@@ -1786,6 +1849,278 @@ def make_handler(
                 conn.close()
 
 
+
+        # -------------------------------------------------------------
+        # Private GitHub (D-111) - Standard/Pro only, enforced HERE (the
+        # web app merely hides the option). See backend/github_integration.py
+        # for the authorization model, token protection and SSRF/size
+        # bounds. Every endpoint resolves the caller's membership first,
+        # then the workspace's active plan, then the member's OWN
+        # connection in that workspace - a connection is never shared with
+        # other members or usable from another workspace.
+        # -------------------------------------------------------------
+        def _send_feature_not_available(self, plan_name: Optional[str]) -> None:
+            self._send_json(403, {"ok": False, "error": "feature_not_available", "feature": plans.FEATURE_PRIVATE_GITHUB, "plan": plan_name,
+                                  "detail": "Private GitHub is available on the Standard and Pro plans"})
+
+        def _send_github_error(self, conn: Any, workspace_id: str, connection: Optional[Dict[str, Any]], exc: "github_integration.GitHubError") -> None:
+            if exc.code == "github_reconnect_required" and connection is not None:
+                try:
+                    repo.set_github_connection_status(conn, workspace_id, connection["id"], "invalid")
+                except Exception:
+                    pass
+            body: Dict[str, Any] = {"ok": False, "error": exc.code, "detail": exc.detail}
+            headers = None
+            if exc.retry_after:
+                body["retry_after_seconds"] = exc.retry_after
+                headers = [("Retry-After", str(exc.retry_after))]
+            self._send_json(exc.http_status, body, extra_headers=headers)
+
+        def _github_scope(self, conn: Any, workspace_id: str, require_configured: bool = True) -> Optional[str]:
+            """The current user id after the membership, active-plan and
+            Private GitHub feature checks (and, by default, the configured
+            check), or None after sending 401/402/403/503."""
+            current_user_id = self._project_scope(conn, workspace_id)
+            if current_user_id is None:
+                return None
+            entitlement = repo.get_entitlement_by_workspace(conn, workspace_id)
+            if entitlement is None or entitlement["status"] not in ("active", "trialing"):
+                self._send_json(402, {"ok": False, "error": "this workspace has no active subscription"})
+                return None
+            if not plans.plan_has_feature(entitlement["plan"], plans.FEATURE_PRIVATE_GITHUB):
+                self._send_feature_not_available(entitlement["plan"])
+                return None
+            if require_configured and github is None:
+                self._send_json(503, {"ok": False, "error": "github_not_configured", "detail": "Private GitHub is not configured on this server"})
+                return None
+            return current_user_id
+
+        def _github_connection_or_refuse(self, conn: Any, workspace_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+            connection = repo.get_active_github_connection(conn, workspace_id, user_id)
+            if connection is None:
+                self._send_json(409, {"ok": False, "error": "github_not_connected", "detail": "connect GitHub first"})
+            return connection
+
+        def _handle_github_status(self, workspace_id: str) -> None:
+            conn = connect_fn()
+            try:
+                user_id = self._github_scope(conn, workspace_id, require_configured=False)
+                if user_id is None:
+                    return
+                connection = repo.get_active_github_connection(conn, workspace_id, user_id) if github is not None else None
+                public = {k: connection.get(k) for k in repo.GITHUB_CONNECTION_PUBLIC_FIELDS} if connection else None
+                self._send_json(200, {"ok": True, "configured": github is not None, "connection": public,
+                                      "install_url": github.client.install_url() if github is not None else None})
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
+
+        def _handle_github_connect(self, workspace_id: str) -> None:
+            """Starts the GitHub App authorization: a fresh single-use state
+            (only its hash is stored), bound to this member and workspace.
+            Returns the github.com URL for the browser to open - a POST, so
+            the Origin check applies and no third-party page can start it."""
+            if self._reject_if_cross_origin():
+                return
+            _, err_status, err_msg = self._read_body()
+            if err_status:
+                self._send_json(err_status, {"ok": False, "error": err_msg})
+                return
+            conn = connect_fn()
+            try:
+                user_id = self._github_scope(conn, workspace_id)
+                if user_id is None:
+                    return
+                state, digest = github.new_state()
+                repo.create_github_oauth_state(conn, digest, workspace_id, user_id, github_integration.OAUTH_STATE_TTL_SECONDS)
+                self._send_json(200, {"ok": True, "authorize_url": github.client.authorize_url(state)})
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
+
+        def _github_callback_redirect(self, outcome: str, workspace_id: Optional[str] = None) -> None:
+            location = "/app#/scan/new?github=" + outcome + ("&workspace=" + workspace_id if workspace_id and _UUID_RE.match(workspace_id) else "")
+            self.send_response(302)
+            self.send_header("Location", location)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def _handle_github_callback(self, parsed: Any) -> None:
+            """GitHub redirects the member's browser here (a top-level GET,
+            so there is no Origin to check): the state must exist, be
+            unexpired, unused and belong to the member whose session cookie
+            arrives with the request - it is consumed atomically, so a
+            replay or a state started by someone else is refused. Membership
+            and plan are checked again before the code is exchanged. The
+            outcome goes back to the app as a fixed word, never GitHub's
+            own error text; code and state are redacted from the access log."""
+            if github is None:
+                self._github_callback_redirect("not_configured")
+                return
+            qs = parse_qs(parsed.query)
+            state = (qs.get("state") or [""])[0]
+            code = (qs.get("code") or [""])[0]
+            conn = connect_fn()
+            try:
+                user_id = self._current_user_id(conn)
+                if user_id is None:
+                    self.send_response(302)
+                    self.send_header("Location", "/auth/login")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                row = repo.consume_github_oauth_state(conn, github_integration.state_hash(state), user_id) if 1 <= len(state) <= 200 else None
+                if row is None:
+                    self._github_callback_redirect("invalid_state")
+                    return
+                workspace_id = row["workspace_id"]
+                try:
+                    tenant_scope.require_workspace_role(conn, user_id, workspace_id, allowed_roles=("owner", "admin", "member"))
+                except tenant_scope.TenantScopeError:
+                    self._github_callback_redirect("invalid_state")
+                    return
+                entitlement = repo.get_entitlement_by_workspace(conn, workspace_id)
+                if entitlement is None or entitlement["status"] not in ("active", "trialing") or not plans.plan_has_feature(entitlement["plan"], plans.FEATURE_PRIVATE_GITHUB):
+                    self._github_callback_redirect("not_available", workspace_id)
+                    return
+                if (qs.get("error") or [None])[0] is not None:
+                    self._github_callback_redirect("denied", workspace_id)
+                    return
+                if not (1 <= len(code) <= 200):
+                    self._github_callback_redirect("failed", workspace_id)
+                    return
+                try:
+                    grant = github.client.exchange_code(code)
+                    account = github.client.get_user(grant["access_token"])
+                except github_integration.GitHubError:
+                    self._github_callback_redirect("failed", workspace_id)
+                    return
+                now = datetime.now(timezone.utc)
+                fields = github.encrypted_token_fields(workspace_id, user_id, grant, now)
+                scopes = grant.get("scope") if isinstance(grant.get("scope"), str) else ""
+                repo.save_github_connection(conn, workspace_id, user_id, account["id"], account["login"], scopes[:200], **fields)
+                self._github_callback_redirect("connected", workspace_id)
+            except Exception:
+                self._github_callback_redirect("failed")
+            finally:
+                conn.close()
+
+        def _handle_github_disconnect(self, workspace_id: str) -> None:
+            """Removes the member's own connection: tokens wiped from the
+            database (the row is kept, revoked, for history) and, best
+            effort, the token revoked at GitHub. Allowed on any plan, so a
+            workspace that moved to Quick can still remove its credential."""
+            if self._reject_if_cross_origin():
+                return
+            conn = connect_fn()
+            try:
+                user_id = self._project_scope(conn, workspace_id)
+                if user_id is None:
+                    return
+                connection = repo.get_active_github_connection(conn, workspace_id, user_id)
+                if connection is not None and github is not None:
+                    try:
+                        token = github.cipher.decrypt(connection["access_token_enc"], github_integration.token_associated_data(workspace_id, user_id, "access"))
+                        github.client.revoke(token)
+                    except github_integration.GitHubError:
+                        pass
+                disconnected = repo.set_github_connection_status(conn, workspace_id, connection["id"], "revoked") if connection else False
+                self._send_json(200, {"ok": True, "disconnected": disconnected})
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
+
+        def _handle_github_repositories(self, workspace_id: str) -> None:
+            conn = connect_fn()
+            try:
+                user_id = self._github_scope(conn, workspace_id)
+                if user_id is None:
+                    return
+                connection = self._github_connection_or_refuse(conn, workspace_id, user_id)
+                if connection is None:
+                    return
+                try:
+                    token = github.access_token(conn, connection)
+                    conn.commit()
+                    repositories, truncated = github.client.list_repositories(token)
+                except github_integration.GitHubError as exc:
+                    self._send_github_error(conn, workspace_id, connection, exc)
+                    return
+                self._send_json(200, {"ok": True, "repositories": repositories, "truncated": truncated, "install_url": github.client.install_url()})
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
+
+        def _handle_github_branches(self, workspace_id: str, raw_repository_id: str) -> None:
+            conn = connect_fn()
+            try:
+                user_id = self._github_scope(conn, workspace_id)
+                if user_id is None:
+                    return
+                try:
+                    repository_id = github_integration.parse_repository_id(raw_repository_id)
+                except github_integration.GitHubError:
+                    self._send_json(404, {"ok": False, "error": "not found"})
+                    return
+                connection = self._github_connection_or_refuse(conn, workspace_id, user_id)
+                if connection is None:
+                    return
+                try:
+                    token = github.access_token(conn, connection)
+                    conn.commit()
+                    repository = github.client.get_repository(token, repository_id)
+                    branches, truncated = github.client.list_branches(token, repository["full_name"])
+                except github_integration.GitHubError as exc:
+                    self._send_github_error(conn, workspace_id, connection, exc)
+                    return
+                self._send_json(200, {"ok": True, "repository": repository, "branches": branches, "truncated": truncated})
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
+
+        def _parse_github_spec(self, spec: Any) -> Optional[Dict[str, Any]]:
+            """The "github" field of a job submission, or None after a 400."""
+            try:
+                if not isinstance(spec, dict) or set(spec) - {"repository_id", "ref", "commit_sha"}:
+                    raise github_integration.GitHubError("invalid_github_source", "github must be an object {repository_id, ref, commit_sha}", 400)
+                return {"repository_id": github_integration.parse_repository_id(spec.get("repository_id")),
+                        "ref": github_integration.validate_branch_name(spec["ref"]) if spec.get("ref") is not None else None,
+                        "commit_sha": github_integration.validate_commit_sha(spec["commit_sha"]) if spec.get("commit_sha") is not None else None}
+            except github_integration.GitHubError as exc:
+                self._send_json(exc.http_status, {"ok": False, "error": exc.code, "detail": exc.detail})
+                return None
+
+        def _github_submission(self, conn: Any, workspace_id: str, user_id: str, spec: Dict[str, Any]) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+            """Fetches the pinned commit through the member's own connection
+            and builds the D-109 bundle - (built, git_source) or None after
+            an error response. The plan was already checked by the caller."""
+            if github is None:
+                self._send_json(503, {"ok": False, "error": "github_not_configured", "detail": "Private GitHub is not configured on this server"})
+                return None
+            connection = self._github_connection_or_refuse(conn, workspace_id, user_id)
+            if connection is None:
+                return None
+            try:
+                token = github.access_token(conn, connection)
+                conn.commit()   # no database transaction stays open while GitHub is called
+                target = github_integration.resolve_scan_commit(github.client, token, spec["repository_id"], spec["ref"], spec["commit_sha"])
+                entries = github_integration.fetch_repository_entries(github.client, token, target["repository"]["full_name"], target["commit_sha"], MAX_RAW_SOURCE_BYTES)
+                built = submission_input.from_repository_entries(entries, MAX_RAW_SOURCE_BYTES)
+            except github_integration.GitHubError as exc:
+                self._send_github_error(conn, workspace_id, connection, exc)
+                return None
+            except submission_input.SubmissionInputError as exc:
+                self._send_json(exc.http_status, {"ok": False, "error": exc.code, "detail": exc.detail})
+                return None
+            return built, {"connection_id": connection["id"], "repository_id": target["repository"]["id"],
+                           "repository_full_name": target["repository"]["full_name"], "ref": target["ref"], "commit_sha": target["commit_sha"]}
 
         # -------------------------------------------------------------
         # SaaS web app (D-110) - ONE vanilla-JS app served by this same
@@ -1862,7 +2197,7 @@ def make_handler(
                                 "max_loc_per_scan": spec["max_loc_per_scan"], "monthly_loc_quota": spec["monthly_loc_quota"],
                                 "scans_per_purchase": spec["scans_per_purchase"], "max_projects": spec["max_projects"], "max_members": spec["max_members"],
                                 "queue_priority": spec["queue_priority"], "priority_support": spec["priority_support"],
-                                "allowed_modes": sorted(plans.PLAN_ALLOWED_MODES[name]), "prices": prices})
+                                "allowed_modes": sorted(plans.PLAN_ALLOWED_MODES[name]), "features": sorted(plans.PLAN_FEATURES[name]), "prices": prices})
             self._send_json(200, {"ok": True, "plans": catalog})
 
         def _load_report_for(self, conn: Any, workspace_id: str, report_id: str) -> Optional[Dict[str, Any]]:
@@ -1922,7 +2257,8 @@ def make_handler(
                     "ok": True, "report": report, "purged": purged,
                     "job": {k: job.get(k) for k in ("id", "status", "mode", "created_at", "started_at", "completed_at")},
                     "source": {"kind": contract.get("source_kind"), "name": contract.get("name"), "project_id": contract.get("project_id"),
-                               "project_name": project.get("name") if project else None},
+                               "project_name": project.get("name") if project else None,
+                               "git": repo.get_contract_git_source(conn, workspace_id, contract["id"]) if contract.get("id") else None},   # D-111
                 }, **content))
             except Exception:
                 self._send_json(500, {"ok": False, "error": "internal error"})
@@ -2114,7 +2450,8 @@ def make_handler(
                     return
                 contract = repo.get_contract(conn, job["contract_id"]) or {}
                 source = {"kind": contract.get("source_kind", "single"), "project_id": contract.get("project_id"), "name": contract.get("name"),
-                          "files": repo.list_contract_files(conn, workspace_id, job["contract_id"])}
+                          "files": repo.list_contract_files(conn, workspace_id, job["contract_id"]),
+                          "git": repo.get_contract_git_source(conn, workspace_id, job["contract_id"])}   # D-111: repository/ref/commit of a GitHub scan
                 report = repo.get_report_by_job(conn, workspace_id, job_id)
                 report_summary = {k: report.get(k) for k in ("id", "score_status", "score", "risk_band", "created_at", "purged_at")} if report else None
                 self._send_json(200, {"ok": True, "job": job, "source": source, "usage": repo.get_job_usage(conn, job_id), "report": report_summary})
@@ -2339,6 +2676,10 @@ def make_handler(
             if match:
                 self._handle_project_delete(match.group("workspace_id"), match.group("project_id"))
                 return
+            match = _GITHUB_RE.match(path)
+            if match:
+                self._handle_github_disconnect(match.group("workspace_id"))
+                return
             match = _MEMBER_ITEM_RE.match(path)
             if not match:
                 self._send_json(404, {"ok": False, "error": "not found"})
@@ -2393,12 +2734,13 @@ def run_server(
     black_friday_promotion_code_id: Optional[str] = None,
     max_pending_jobs_per_workspace: int = repo.DEFAULT_MAX_PENDING_JOBS_PER_WORKSPACE,
     submit_rate_limit_per_window: int = repo.DEFAULT_SUBMIT_RATE_LIMIT_PER_WINDOW,
+    github: Optional["github_integration.GitHubIntegration"] = None,
 ) -> ThreadingHTTPServer:
     in_flight = _InFlightTracker()
     handler_cls = make_handler(
         connect_fn, email_sender, host_allowlist, secure_cookies, billing, storage, alert_sender, in_flight,
         black_friday_enabled, black_friday_start, black_friday_end, black_friday_promotion_code_id,
-        max_pending_jobs_per_workspace, submit_rate_limit_per_window,
+        max_pending_jobs_per_workspace, submit_rate_limit_per_window, github,
     )
     server = ThreadingHTTPServer((host, port), handler_cls)
     server.in_flight_tracker = in_flight  # see get_in_flight_count() and _InFlightTracker's own docstring.

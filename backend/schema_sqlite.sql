@@ -322,3 +322,49 @@ CREATE TABLE contract_files (
     PRIMARY KEY (contract_id, path)
 );
 CREATE INDEX idx_contract_files_workspace ON contract_files(workspace_id);
+
+-- D-111 (backend/migrations/0012_github_connections.sql's mirror) - Private
+-- GitHub connections (encrypted tokens only), OAuth states (hash only) and
+-- the repository/ref/commit of each GitHub scan. See that migration's header.
+CREATE TABLE github_connections (
+    id                        TEXT PRIMARY KEY,
+    workspace_id              TEXT NOT NULL REFERENCES workspaces(id),
+    user_id                   TEXT NOT NULL REFERENCES users(id),
+    provider                  TEXT NOT NULL DEFAULT 'github' CHECK (provider = 'github'),
+    github_account_id         INTEGER NOT NULL,
+    github_login              TEXT NOT NULL,
+    status                    TEXT NOT NULL CHECK (status IN ('active', 'revoked', 'invalid')),
+    access_token_enc          TEXT,
+    access_token_expires_at   TEXT,
+    refresh_token_enc         TEXT,
+    refresh_token_expires_at  TEXT,
+    scopes                    TEXT NOT NULL DEFAULT '',
+    created_at                TEXT NOT NULL,
+    updated_at                TEXT NOT NULL,
+    revoked_at                TEXT,
+    CHECK (status <> 'active' OR access_token_enc IS NOT NULL)
+);
+CREATE UNIQUE INDEX uq_github_connections_live ON github_connections(workspace_id, user_id) WHERE status = 'active';
+
+CREATE TABLE github_oauth_states (
+    state_hash    TEXT PRIMARY KEY,
+    workspace_id  TEXT NOT NULL REFERENCES workspaces(id),
+    user_id       TEXT NOT NULL REFERENCES users(id),
+    created_at    TEXT NOT NULL,
+    expires_at    TEXT NOT NULL,
+    consumed_at   TEXT
+);
+CREATE INDEX idx_github_oauth_states_expires ON github_oauth_states(expires_at);
+
+CREATE TABLE contract_git_sources (
+    contract_id           TEXT PRIMARY KEY REFERENCES contracts(id),
+    workspace_id          TEXT NOT NULL REFERENCES workspaces(id),
+    provider              TEXT NOT NULL CHECK (provider = 'github'),
+    connection_id         TEXT REFERENCES github_connections(id),
+    repository_id         INTEGER NOT NULL,
+    repository_full_name  TEXT NOT NULL,
+    ref                   TEXT NOT NULL,
+    commit_sha            TEXT NOT NULL CHECK (length(commit_sha) = 40),
+    created_at            TEXT NOT NULL
+);
+CREATE INDEX idx_contract_git_sources_workspace ON contract_git_sources(workspace_id);

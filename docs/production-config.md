@@ -56,6 +56,18 @@ Business decisions confirmed in D-086 (prices, billing interval, Black
 Friday) are no longer open - see that entry. Still NOT in code: currency,
 cancellation/refund policy, VAT handling.
 
+## Private GitHub (ROLE=web, D-111)
+
+Optional: with none of the four required variables set the feature is unconfigured (its endpoints answer `503 github_not_configured`; Quick is refused with `403 feature_not_available` before that). Setting only some of them is a startup error. The GitHub App needs read-only repository permissions (Contents: read, Metadata: read) and its callback URL set to `GITHUB_OAUTH_REDIRECT_URI`.
+
+| Variable | Purpose | Required? | Secret? | Default |
+|---|---|---|---|---|
+| `GITHUB_APP_CLIENT_ID` | Client ID of the Vericexa GitHub App (user authorization web flow). | All four or none | No | - |
+| `GITHUB_APP_CLIENT_SECRET` | Client secret of that GitHub App (code exchange, token refresh, token revocation). | All four or none | **Yes** | - |
+| `GITHUB_OAUTH_REDIRECT_URI` | Must be `https://<host>/github/callback` (plain `http://` only for `localhost`/`127.0.0.1`). | All four or none | No | - |
+| `GITHUB_TOKEN_ENCRYPTION_KEY` | Base64 of at least 32 random bytes; encrypts the stored GitHub user tokens (`backend/github_integration.TokenCipher`). Changing it makes every existing connection require a reconnect. | All four or none | **Yes** | - |
+| `GITHUB_APP_SLUG` | The App's URL slug, used only for the "Choose repositories on GitHub" link. | No | No | - |
+
 ## Black Friday campaign (ROLE=web, Phase 7, D-086)
 
 | Variable | Purpose | Required? | Default |

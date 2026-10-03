@@ -249,7 +249,8 @@ class AppApiTests(_AppCase):
         cookie, ws = self.ws("standard", "wsd@example.com")
         self.submit(cookie, ws, source=_sol(100))
         status, _, body = self.jget("/workspaces/%s" % ws, cookie)
-        self.assertEqual(body["admission"], {"pending_jobs": 1, "max_pending_jobs": 5, "allowed_modes": ["quick", "standard"], "billing_configured": False})
+        self.assertEqual(body["admission"], {"pending_jobs": 1, "max_pending_jobs": 5, "allowed_modes": ["quick", "standard"], "billing_configured": False,
+                                             "features": ["private_github"], "github_configured": False})
         self.assertEqual((body["usage"]["scans_in_period"], body["usage"]["scans_completed_in_period"]), (1, 0))
         cookie2, ws2 = self.ws(None, "wsd2@example.com")
         self.assertEqual(self.jget("/workspaces/%s" % ws2, cookie2)[2]["admission"]["allowed_modes"], [])

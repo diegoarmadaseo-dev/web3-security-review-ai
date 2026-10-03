@@ -226,6 +226,15 @@ def from_files(files: Any, max_source_bytes: int) -> Dict[str, Any]:
     return _assemble(entries, max_source_bytes, "submitted files")
 
 
+def from_repository_entries(entries: List[Tuple[str, Optional[bytes]]], max_source_bytes: int) -> Dict[str, Any]:
+    """D-111: a Git repository's files at one commit, already fetched by
+    backend/github_integration.py - every tree path, with the bytes of the
+    files this policy keeps and None for the ones it ignores (never
+    fetched). Exactly the same validation and bundle as from_files() and
+    from_zip(); only where the bytes come from differs."""
+    return _assemble(entries, max_source_bytes, "repository")
+
+
 def decode_archive(archive: Any) -> bytes:
     """{"format": "zip", "content_base64": "..."} -> the archive bytes."""
     if not isinstance(archive, dict) or set(archive) - {"format", "content_base64"}:

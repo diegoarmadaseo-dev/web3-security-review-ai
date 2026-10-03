@@ -54,8 +54,36 @@
     project_not_found: "The project was not found in this workspace.",
     project_name_taken: "A project with this name already exists in this workspace.",
     billing_not_configured: "This plan cannot be purchased yet.",
-    report_content_unavailable: "The report content is no longer available."
+    report_content_unavailable: "The report content is no longer available.",
+    // D-111 Private GitHub (backend/http_app.py, backend/github_integration.py)
+    feature_not_available: "Private GitHub is available on the Standard and Pro plans.",
+    github_not_configured: "GitHub is not configured on this server yet.",
+    github_not_connected: "Connect your GitHub account first.",
+    github_reconnect_required: "Your GitHub connection expired or was revoked. Connect GitHub again.",
+    github_authorization_failed: "GitHub did not grant access.",
+    github_rate_limited: "GitHub's API rate limit was reached. Please try again later.",
+    github_unavailable: "GitHub could not be reached or returned an unexpected response. Please try again.",
+    github_response_too_large: "GitHub returned more data than allowed.",
+    repository_not_accessible: "This repository is not accessible with your GitHub connection.",
+    repository_too_large: "This repository has too many files to scan from GitHub. Upload a ZIP of the contracts instead.",
+    ref_not_found: "The branch does not exist in this repository.",
+    commit_not_found: "The commit does not exist in this repository.",
+    commit_not_on_ref: "The selected commit is not part of the branch. Run Check again.",
+    invalid_repository_id: "Choose a repository.",
+    invalid_ref: "Choose a branch.",
+    invalid_commit_sha: "The commit SHA is not valid.",
+    invalid_github_source: "The GitHub selection is not valid."
   };
+  // Outcome word the backend appends after GitHub's authorization redirect.
+  var GITHUB_CALLBACK = {
+    connected: ["ok", "GitHub connected."],
+    denied: ["error", "GitHub authorization was cancelled."],
+    invalid_state: ["error", "The GitHub authorization link expired or was already used. Please connect again."],
+    failed: ["error", "GitHub could not be connected. Please try again."],
+    not_available: ["error", "Private GitHub is available on the Standard and Pro plans."],
+    not_configured: ["error", "GitHub is not configured on this server yet."]
+  };
+  function githubCallbackMessage(word) { var m = GITHUB_CALLBACK[word]; return m ? { kind: m[0], text: m[1] } : null; }
   var STATUS_TEXT = {
     401: "Your session has ended. Please sign in again.",
     403: "You do not have access to this in the current workspace.",
@@ -102,7 +130,8 @@
   function isPending(status) { return status === "queued" || status === "claimed" || status === "running"; }
 
   var SOURCE_KIND = { single: "Single source", files: "Multiple files", archive: "ZIP" };
-  function sourceKindLabel(kind) { return SOURCE_KIND[kind] || "Single source"; }
+  function sourceKindLabel(kind, gitRepository) { return gitRepository ? "GitHub" : (SOURCE_KIND[kind] || "Single source"); }
+  function shortSha(sha) { return typeof sha === "string" && /^[0-9a-f]{40}$/.test(sha) ? sha.slice(0, 12) : "-"; }
 
   // Plan limits as stated by the backend's own usage summary and catalog entry.
   function planLimitLines(usage, catalogEntry) {
@@ -190,6 +219,7 @@
     describeError: describeError, formatNumber: formatNumber, formatMoney: formatMoney, formatDate: formatDate,
     jobStatusLabel: jobStatusLabel, isPending: isPending, sourceKindLabel: sourceKindLabel, planLimitLines: planLimitLines,
     usagePercent: usagePercent, safeExternalUrl: safeExternalUrl, sortFindings: sortFindings, humanize: humanize,
-    locationText: locationText, bytesToBase64: bytesToBase64, newIdempotencyKey: newIdempotencyKey, parseHash: parseHash
+    locationText: locationText, bytesToBase64: bytesToBase64, newIdempotencyKey: newIdempotencyKey, parseHash: parseHash,
+    githubCallbackMessage: githubCallbackMessage, shortSha: shortSha
   };
 }));
