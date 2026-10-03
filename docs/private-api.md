@@ -99,6 +99,8 @@ Las entradas son las mismas que en D-109; debe darse exactamente una de ellas:
 
 Campos opcionales en todos los casos: `project_id`, `idempotency_key` y `dry_run` (vista previa: no guarda ni reserva nada).
 
+D-114: `ci` (metadatos de GitHub Actions: `provider`, `repository`, `commit_sha`, `ref`, `event`, `run_id`, `run_attempt`, `pull_request`) marca la petición como de GitHub Actions; solo Standard/Pro (403 `feature_not_available` con `feature: "github_actions"`). Ver `docs/github-actions.md`.
+
 Qué no se acepta:
 - `github`: 400 `source_not_supported`. GitHub sigue disponible por su integración propia en la web app.
 - URLs: `source` es texto. Una URL no es código, así que da 422 `no_source_code`.

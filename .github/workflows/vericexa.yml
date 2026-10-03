@@ -1,0 +1,56 @@
+# Example workflow: Vericexa automated review on push and pull_request
+# (docs/github-actions.md, docs/decisiones.md D-114). Requires a Vericexa
+# Standard or Pro plan.
+#
+# Setup (nothing secret is written in this file):
+#   1. Vericexa web app -> API keys -> Create key.
+#   2. GitHub -> Settings -> Secrets and variables -> Actions:
+#        secret   VERICEXA_API_KEY = the key (shown once by Vericexa)
+#        variable VERICEXA_API_URL = https://<your Vericexa host>
+#   The job is skipped while VERICEXA_API_URL is not set.
+#
+# Security notes:
+#   - Uses pull_request, never pull_request_target: a pull request from a
+#     fork runs without secrets, and the action then skips (exit 0) instead
+#     of exposing the key to untrusted code.
+#   - Least privilege: contents read (checkout) and checks write (Check Run
+#     only; fork pull requests get a read-only token and fall back to the
+#     job summary).
+#   - No ${{ github.event.* }} value is interpolated into a shell command.
+name: Vericexa
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+  checks: write
+
+concurrency:
+  group: vericexa-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  vericexa:
+    if: ${{ vars.VERICEXA_API_URL != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout the exact commit
+        uses: actions/checkout@v4
+        with:
+          # pull_request: the PR head commit itself (not GitHub's merge
+          # commit), so the result belongs to the SHA shown on the PR.
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Vericexa automated review
+        id: vericexa
+        uses: ./.github/actions/vericexa-scan
+        with:
+          api-key: ${{ secrets.VERICEXA_API_KEY }}
+          api-url: ${{ vars.VERICEXA_API_URL }}
+          mode: standard
+          blocking-severities: CRITICAL,HIGH
+          github-token: ${{ github.token }}

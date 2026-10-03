@@ -251,7 +251,7 @@ class AppApiTests(_AppCase):
         self.submit(cookie, ws, source=_sol(100))
         status, _, body = self.jget("/workspaces/%s" % ws, cookie)
         self.assertEqual(body["admission"], {"pending_jobs": 1, "max_pending_jobs": 5, "allowed_modes": ["quick", "standard"], "billing_configured": False,
-                                             "features": ["private_api", "private_github"], "github_configured": False})   # D-113 adds private_api
+                                             "features": ["github_actions", "private_api", "private_github"], "github_configured": False})   # D-113/D-114 add private_api, github_actions
         self.assertEqual((body["usage"]["scans_in_period"], body["usage"]["scans_completed_in_period"]), (1, 0))
         cookie2, ws2 = self.ws(None, "wsd2@example.com")
         self.assertEqual(self.jget("/workspaces/%s" % ws2, cookie2)[2]["admission"]["allowed_modes"], [])

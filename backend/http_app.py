@@ -320,6 +320,52 @@ def _api_error_envelope(status: int, body: Dict[str, Any], request_id: str) -> D
     return {"error": error}
 
 
+_CI_REPOSITORY_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}$")
+_CI_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_CI_REF_RE = re.compile(r"^[A-Za-z0-9._/+@#=,-]{1,255}$")
+_CI_KEYS = frozenset({"provider", "repository", "commit_sha", "ref", "event", "run_id", "run_attempt", "pull_request"})
+
+
+def _parse_ci_source(ci: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """D-114: the "ci" object of a GitHub Action submission ->
+    (normalized dict, None) or (None, reason). Strict: known keys only,
+    exact formats, no booleans posing as integers. Display/traceability
+    metadata only - it never selects what is analysed."""
+    def _int(value: Any, low: int, high: int) -> Optional[int]:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, str) and value.isdigit() and len(value) <= 19:
+            value = int(value)
+        return value if isinstance(value, int) and low <= value <= high else None
+
+    if not isinstance(ci, dict) or set(ci) - _CI_KEYS:
+        return None, "ci must be an object with only %s" % ", ".join(sorted(_CI_KEYS))
+    if ci.get("provider") != "github_actions":
+        return None, "ci.provider must be github_actions"
+    repository, sha, ref, event = ci.get("repository"), ci.get("commit_sha"), ci.get("ref"), ci.get("event")
+    if not isinstance(repository, str) or not _CI_REPOSITORY_RE.match(repository):
+        return None, "ci.repository must be owner/name"
+    if not isinstance(sha, str) or not _CI_SHA_RE.match(sha):
+        return None, "ci.commit_sha must be a full 40-character lowercase hex commit SHA"
+    if ref is not None and (not isinstance(ref, str) or not _CI_REF_RE.match(ref)):
+        return None, "ci.ref must be a git ref of at most 255 characters"
+    if event not in ("push", "pull_request"):
+        return None, "ci.event must be push or pull_request"
+    run_id = _int(ci.get("run_id"), 1, 2 ** 63 - 1)
+    run_attempt = _int(ci.get("run_attempt", 1), 1, 10000)
+    if run_id is None or run_attempt is None:
+        return None, "ci.run_id and ci.run_attempt must be positive integers"
+    pull_request = ci.get("pull_request")
+    if event == "pull_request":
+        pull_request = _int(pull_request, 1, 2 ** 31 - 1)
+        if pull_request is None:
+            return None, "ci.pull_request must be the pull request number for a pull_request event"
+    elif pull_request is not None:
+        return None, "ci.pull_request is only allowed for a pull_request event"
+    return {"provider": "github_actions", "repository": repository, "commit_sha": sha, "ref": ref, "event": event,
+            "run_id": run_id, "run_attempt": run_attempt, "pull_request": pull_request}, None
+
+
 def _request_fingerprint(mode: str, project_id: Optional[str], shape: Optional[str], filename: Any, source: Optional[str],
                          github_spec: Optional[Dict[str, Any]]) -> str:
     """D-113: SHA-256 of a submission's canonical content - what "the same
@@ -1828,6 +1874,10 @@ def make_handler(
             mode = payload.get("mode")
             source = payload.get("source")
             client_idempotency_key = payload.get("idempotency_key")
+            ci_source = None
+            if self._api is None and payload.get("ci") is not None:
+                self._send_json(400, {"ok": False, "error": "ci_not_supported", "detail": "ci metadata is only accepted by the Private API"})
+                return
             if self._api is not None:
                 # D-113: the Private API accepts the D-109 inputs (source,
                 # files, archive, project_id); GitHub scans stay in the web
@@ -1836,6 +1886,14 @@ def make_handler(
                     self._send_json(400, {"ok": False, "error": "source_not_supported",
                                           "detail": "GitHub sources are not accepted by the Private API; send source, files or archive"})
                     return
+                # D-114: CI metadata from the Vericexa GitHub Action. Its
+                # presence is what makes this a GitHub Actions submission,
+                # gated to Standard/Pro below (after the plan is known).
+                if payload.get("ci") is not None:
+                    ci_source, ci_error = _parse_ci_source(payload["ci"])
+                    if ci_source is None:
+                        self._send_json(400, {"ok": False, "error": "invalid_ci_source", "detail": ci_error})
+                        return
                 # The standard Idempotency-Key header is an alias of the
                 # body's idempotency_key; both given and different -> 400.
                 header_key = self.headers.get("Idempotency-Key")
@@ -1933,6 +1991,11 @@ def make_handler(
                 if github_spec is not None and not plans.plan_has_feature(entitlement["plan"], plans.FEATURE_PRIVATE_GITHUB):
                     self._send_feature_not_available(entitlement["plan"])   # D-111: Quick never reaches GitHub
                     return
+                if ci_source is not None and not plans.plan_has_feature(entitlement["plan"], plans.FEATURE_GITHUB_ACTIONS):
+                    # D-114: a Quick key keeps the Private API, never the GitHub Action.
+                    self._send_json(403, {"ok": False, "error": "feature_not_available", "feature": plans.FEATURE_GITHUB_ACTIONS, "plan": entitlement["plan"],
+                                          "detail": "GitHub Actions is available on the Standard and Pro plans"})
+                    return
                 # P0 plan authorization (D-086): the ONLY place that
                 # decides whether an entitlement's plan may run a given
                 # mode - repo.PLAN_ALLOWED_MODES is the single source of
@@ -2013,8 +2076,11 @@ def make_handler(
                     "contract.sol" if source_kind == "single" else "%s submission" % source_kind)   # display only, never a path
                 if git_source is not None:
                     display_name = "%s@%s" % (git_source["repository_full_name"], git_source["commit_sha"][:12])
+                if ci_source is not None:
+                    display_name = "%s@%s" % (ci_source["repository"], ci_source["commit_sha"][:12])   # display only (D-114)
                 contract_id = repo.create_contract(conn, workspace_id, storage_ref, content_hash, display_name,
-                                                   project_id=project_id, source_kind=source_kind, files=manifest, git_source=git_source)
+                                                   project_id=project_id, source_kind=source_kind, files=manifest, git_source=git_source,
+                                                   ci_source=ci_source)
                 try:
                     job_id = repo.enqueue_job_with_usage(conn, workspace_id, contract_id, current_user_id, mode, idempotency_key, entitlement, effective_loc,
                                                          max_pending_jobs=max_pending_jobs_per_workspace, request_fingerprint=request_fingerprint)
@@ -2063,6 +2129,8 @@ def make_handler(
                     response.update({"files": built["files"], "ignored": built["ignored"], "ignored_count": built["ignored_count"]})
                 if git_source is not None:
                     response["github"] = _public_git_source(git_source)
+                if ci_source is not None:
+                    response["ci"] = ci_source
                 self._send_json(200, response)
             except Exception:
                 self._send_json(500, {"ok": False, "error": "internal error"})
@@ -2909,7 +2977,8 @@ def make_handler(
                     "job": {k: job.get(k) for k in ("id", "status", "mode", "created_at", "started_at", "completed_at")},
                     "source": {"kind": contract.get("source_kind"), "name": contract.get("name"), "project_id": contract.get("project_id"),
                                "project_name": project.get("name") if project else None,
-                               "git": repo.get_contract_git_source(conn, workspace_id, contract["id"]) if contract.get("id") else None},   # D-111
+                               "git": repo.get_contract_git_source(conn, workspace_id, contract["id"]) if contract.get("id") else None,   # D-111
+                               "ci": repo.get_contract_ci_source(conn, workspace_id, contract["id"]) if contract.get("id") else None},    # D-114
                 }, **content))
             except Exception:
                 self._send_json(500, {"ok": False, "error": "internal error"})
@@ -3119,7 +3188,8 @@ def make_handler(
                 contract = repo.get_contract(conn, job["contract_id"]) or {}
                 source = {"kind": contract.get("source_kind", "single"), "project_id": contract.get("project_id"), "name": contract.get("name"),
                           "files": repo.list_contract_files(conn, workspace_id, job["contract_id"]),
-                          "git": repo.get_contract_git_source(conn, workspace_id, job["contract_id"])}   # D-111: repository/ref/commit of a GitHub scan
+                          "git": repo.get_contract_git_source(conn, workspace_id, job["contract_id"]),   # D-111: repository/ref/commit of a GitHub scan
+                          "ci": repo.get_contract_ci_source(conn, workspace_id, job["contract_id"])}     # D-114: GitHub Action context
                 report = repo.get_report_by_job(conn, workspace_id, job_id)
                 report_summary = {k: report.get(k) for k in ("id", "score_status", "score", "risk_band", "created_at", "purged_at")} if report else None
                 self._send_json(200, {"ok": True, "job": job, "source": source, "usage": repo.get_job_usage(conn, job_id), "report": report_summary})

@@ -507,12 +507,15 @@ def create_contract(
     source_kind: str = "single",
     files: Optional[List[Dict[str, Any]]] = None,
     git_source: Optional[Dict[str, Any]] = None,
+    ci_source: Optional[Dict[str, Any]] = None,
 ) -> str:
     """files (D-109): the per-file manifest of a multi-file/ZIP submission
     (backend/submission_input.py), written in the SAME transaction as the
     contract row - a contract never exists with a partial manifest.
     git_source (D-111): for a GitHub scan, the repository, branch and exact
-    commit SHA analysed (contract_git_sources), in that same transaction."""
+    commit SHA analysed (contract_git_sources), in that same transaction.
+    ci_source (D-114): for a GitHub Action submission, the CI context it
+    reported (contract_ci_sources), in that same transaction."""
     if source_kind not in CONTRACT_SOURCE_KINDS:
         raise RepositoryError("source_kind must be one of %r, got %r" % (CONTRACT_SOURCE_KINDS, source_kind))
     contract_id = new_id()
@@ -536,6 +539,14 @@ def create_contract(
                 (contract_id, workspace_id, git_source.get("connection_id"), git_source["repository_id"], git_source["repository_full_name"],
                  git_source["ref"], git_source["commit_sha"], utcnow_iso()),
             )
+        if ci_source is not None:
+            db.execute(
+                conn,
+                "INSERT INTO contract_ci_sources (contract_id, workspace_id, provider, repository, commit_sha, ref, event, run_id, run_attempt, "
+                "pull_request_number, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (contract_id, workspace_id, ci_source["provider"], ci_source["repository"], ci_source["commit_sha"], ci_source["ref"],
+                 ci_source["event"], ci_source["run_id"], ci_source["run_attempt"], ci_source["pull_request"], utcnow_iso()),
+            )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -556,6 +567,17 @@ def get_contract_git_source(conn: Any, workspace_id: str, contract_id: str) -> O
     cur = db.execute(
         conn,
         "SELECT provider, repository_id, repository_full_name, ref, commit_sha, created_at FROM contract_git_sources WHERE contract_id = ? AND workspace_id = ?",
+        (contract_id, workspace_id),
+    )
+    return db.normalize_row(cur.fetchone())
+
+
+def get_contract_ci_source(conn: Any, workspace_id: str, contract_id: str) -> Optional[Dict[str, Any]]:
+    """D-114: the CI context a GitHub Action submission reported, or None."""
+    cur = db.execute(
+        conn,
+        "SELECT provider, repository, commit_sha, ref, event, run_id, run_attempt, pull_request_number, created_at "
+        "FROM contract_ci_sources WHERE contract_id = ? AND workspace_id = ?",
         (contract_id, workspace_id),
     )
     return db.normalize_row(cur.fetchone())

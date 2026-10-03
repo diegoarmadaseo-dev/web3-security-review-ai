@@ -122,7 +122,7 @@ class MigrationIntegrationTests(unittest.TestCase):
         self.conn, self.applied = _reset_database_and_migrate()
         self.addCleanup(self.conn.close)
 
-    def test_fresh_database_applies_all_fourteen_migrations_in_order(self):
+    def test_fresh_database_applies_all_fifteen_migrations_in_order(self):
         # 0002_auth_tokens.sql (Phase 2), 0003_entitlement_status_expand.sql
         # and 0004_entitlement_event_provenance.sql (Phase 3),
         # 0005_job_queue_hardening.sql (Phase 4, D-079),
@@ -132,8 +132,8 @@ class MigrationIntegrationTests(unittest.TestCase):
         # post reap-atomicity-fix and worker-fencing hardening) and
         # 0009_commercial_usage.sql (D-107), 0010_commercial_guards.sql
         # (D-108), 0011_contract_files.sql (D-109) and
-        # 0012_github_connections.sql (D-111), 0013_trial.sql (D-112) and
-        # 0014_api_keys.sql (D-113) added alongside
+        # 0012_github_connections.sql (D-111), 0013_trial.sql (D-112),
+        # 0014_api_keys.sql (D-113) and 0015_ci_sources.sql (D-114) added alongside
         # 0001_initial_schema.sql (Phase 1).
         self.assertEqual(
             self.applied,
@@ -142,7 +142,7 @@ class MigrationIntegrationTests(unittest.TestCase):
                 "0004_entitlement_event_provenance", "0005_job_queue_hardening", "0006_retention_purge",
                 "0007_billing_interval", "0008_queue_fairness", "0009_commercial_usage",
                 "0010_commercial_guards", "0011_contract_files", "0012_github_connections", "0013_trial",
-                "0014_api_keys",
+                "0014_api_keys", "0015_ci_sources",
             ],
         )
 
@@ -165,7 +165,7 @@ class MigrationIntegrationTests(unittest.TestCase):
             seen_statuses.add(repo.get_entitlement_by_workspace(self.conn, workspace_id)["status"])
         self.assertEqual(seen_statuses, {"incomplete_expired", "unpaid"})
 
-    def test_all_twenty_six_tables_exist(self):
+    def test_all_twenty_seven_tables_exist(self):
         cur = db.execute(
             self.conn,
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
@@ -183,6 +183,7 @@ class MigrationIntegrationTests(unittest.TestCase):
             "github_connections", "github_oauth_states", "contract_git_sources",  # D-111, 0012_github_connections.sql.
             "trial_grants",  # D-112, 0013_trial.sql.
             "api_keys",  # D-113, 0014_api_keys.sql.
+            "contract_ci_sources",  # D-114, 0015_ci_sources.sql.
         }
         self.assertEqual(tables, expected)
 
@@ -1519,6 +1520,42 @@ class PrivateApiIntegrationTests(unittest.TestCase):
         repo.create_api_key(self.conn, ws_t, user, "planted", prefix, key_hash, 25)
         status, body = self._api("GET", "/usage", planted)
         self.assertEqual((status, body["error"]["code"]), (403, "feature_not_available"))
+
+
+class GitHubActionsIntegrationTests(unittest.TestCase):
+    """D-114 against a REAL Postgres server: 0015's contract_ci_sources
+    (CHECKs, written with the contract) and, through the real HTTP layer,
+    the GitHub Actions gating of POST /api/v1/scans: Standard records the CI
+    context, Quick is refused before anything is stored or reserved."""
+
+    setUp = HttpJobSubmitConcurrencyIntegrationTests.setUp
+    _request = HttpJobSubmitConcurrencyIntegrationTests._request
+    _login = HttpJobSubmitConcurrencyIntegrationTests._login
+    _api = PrivateApiIntegrationTests._api
+    _account = PrivateApiIntegrationTests._account
+    _source = staticmethod(PrivateApiIntegrationTests._source)
+    CI = {"provider": "github_actions", "repository": "octo/vault", "commit_sha": "c" * 40, "ref": "refs/pull/9/head", "event": "pull_request",
+          "run_id": 123456789012, "run_attempt": 2, "pull_request": 9}
+
+    def test_ci_source_is_recorded_and_quick_is_refused(self):
+        _, ws, key = self._account("standard", "pg-gha-std@example.com")
+        status, body = self._api("POST", "/scans", key, {"mode": "standard", "source": self._source("A"), "ci": self.CI, "idempotency_key": "gha:x"})
+        self.assertEqual(status, 200, body)
+        status, detail = self._api("GET", "/scans/%s" % body["job_id"], key)
+        ci = detail["source"]["ci"]
+        self.assertEqual((ci["commit_sha"], ci["event"], int(ci["run_id"]), ci["run_attempt"], ci["pull_request_number"]), ("c" * 40, "pull_request", 123456789012, 2, 9))
+        status, again = self._api("POST", "/scans", key, {"mode": "standard", "source": self._source("A"), "ci": dict(self.CI, run_attempt=3), "idempotency_key": "gha:x"})
+        self.assertEqual((status, again["job_id"], again["duplicate"]), (200, body["job_id"], True))   # a re-run reuses the scan
+        _, qws, qkey = self._account("quick", "pg-gha-quick@example.com")
+        status, refused = self._api("POST", "/scans", qkey, {"mode": "quick", "source": self._source("Q"), "ci": self.CI})
+        self.assertEqual((status, refused["error"]["code"], refused["error"]["details"]["feature"]), (403, "feature_not_available", "github_actions"))
+        self.assertEqual(db.execute(self.conn, "SELECT COUNT(*) AS n FROM analysis_jobs WHERE workspace_id = ?", (qws,)).fetchone()["n"], 0)
+        self.assertEqual(db.execute(self.conn, "SELECT COUNT(*) AS n FROM job_usage WHERE workspace_id = ?", (qws,)).fetchone()["n"], 0)
+        contract = db.execute(self.conn, "SELECT contract_id FROM contract_ci_sources WHERE workspace_id = ?", (ws,)).fetchone()["contract_id"]
+        for column, value in (("commit_sha", "C" * 40), ("event", "workflow_run"), ("pull_request_number", None)):
+            with self.assertRaises(db.integrity_error_class(self.conn)):
+                db.execute(self.conn, "UPDATE contract_ci_sources SET %s = ? WHERE contract_id = ?" % column, (value, contract))
+            self.conn.rollback()
 
 
 class RestoreVerificationIntegrationTests(unittest.TestCase):

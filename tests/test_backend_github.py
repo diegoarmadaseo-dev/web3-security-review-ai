@@ -624,7 +624,7 @@ class GitHubPlanGatingTests(_GitHubHttpCase):
                 cookie, ws = self.workspace(plan, "%s-gh@example.com" % plan)
                 status, _, body = self.jget("/workspaces/%s/github" % ws, cookie)
                 self.assertEqual((status, body["configured"], body["connection"]), (200, True, None))
-                self.assertEqual(self.jget("/workspaces/%s" % ws, cookie)[2]["admission"]["features"], ["private_api", "private_github"])   # D-113 adds private_api
+                self.assertEqual(self.jget("/workspaces/%s" % ws, cookie)[2]["admission"]["features"], ["github_actions", "private_api", "private_github"])   # D-113/D-114 add private_api, github_actions
                 self.connect(cookie, ws)
                 status, _, body = self.scan(cookie, ws, mode=plan)
                 self.assertEqual(status, 200, body)
@@ -641,8 +641,8 @@ class GitHubPlanGatingTests(_GitHubHttpCase):
 
     def test_catalog_lists_the_feature_per_plan(self):
         catalog = {p["plan"]: p["features"] for p in json.loads(self.get("/billing/plans")[2])["plans"]}
-        self.assertEqual(catalog, {"trial": [], "quick": ["private_api"], "standard": ["private_api", "private_github"],
-                                   "pro": ["private_api", "private_github"]})   # D-113 adds private_api
+        self.assertEqual(catalog, {"trial": [], "quick": ["private_api"], "standard": ["github_actions", "private_api", "private_github"],
+                                   "pro": ["github_actions", "private_api", "private_github"]})   # D-113/D-114 add private_api, github_actions
         self.assertFalse(plans.plan_has_feature("quick", plans.FEATURE_PRIVATE_GITHUB))
         self.assertTrue(plans.plan_has_feature("standard", plans.FEATURE_PRIVATE_GITHUB))
         self.assertTrue(plans.plan_has_feature("pro", plans.FEATURE_PRIVATE_GITHUB))

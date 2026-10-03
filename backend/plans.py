@@ -178,16 +178,17 @@ PLAN_ALLOWED_MODES[PLAN_TRIAL] = frozenset({"quick"})
 # Plan -> product features beyond scan limits (D-111). Private GitHub is a
 # Standard/Pro feature; Quick keeps every other input (single file,
 # multi-file, ZIP). The Private API (D-113) is a Quick/Standard/Pro feature,
-# never the Trial. Only features that exist are listed - GitHub Actions gets
-# its entry with its own block. Enforced by the backend
+# never the Trial. GitHub Actions (D-114) - a Private API submission carrying
+# CI metadata - is Standard/Pro only. Enforced by the backend
 # (backend/http_app.py), never only by the UI.
 FEATURE_PRIVATE_GITHUB = "private_github"
 FEATURE_PRIVATE_API = "private_api"
+FEATURE_GITHUB_ACTIONS = "github_actions"
 PLAN_FEATURES = {
-    PLAN_TRIAL: frozenset(),    # D-112: no Private GitHub, no Private API (nor Actions)
+    PLAN_TRIAL: frozenset(),    # D-112: no Private GitHub, no Private API, no GitHub Actions
     PLAN_QUICK: frozenset({FEATURE_PRIVATE_API}),
-    PLAN_STANDARD: frozenset({FEATURE_PRIVATE_GITHUB, FEATURE_PRIVATE_API}),
-    PLAN_PRO: frozenset({FEATURE_PRIVATE_GITHUB, FEATURE_PRIVATE_API}),
+    PLAN_STANDARD: frozenset({FEATURE_PRIVATE_GITHUB, FEATURE_PRIVATE_API, FEATURE_GITHUB_ACTIONS}),
+    PLAN_PRO: frozenset({FEATURE_PRIVATE_GITHUB, FEATURE_PRIVATE_API, FEATURE_GITHUB_ACTIONS}),
 }
 
 

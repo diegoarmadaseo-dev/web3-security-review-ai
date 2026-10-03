@@ -408,3 +408,21 @@ CREATE TABLE api_keys (
     revoked_by_user_id  TEXT REFERENCES users(id)
 );
 CREATE INDEX idx_api_keys_workspace ON api_keys(workspace_id);
+
+-- D-114 (backend/migrations/0015_ci_sources.sql's mirror) - the CI context a
+-- GitHub Action submission reported (repository, exact commit, event, run).
+CREATE TABLE contract_ci_sources (
+    contract_id          TEXT PRIMARY KEY REFERENCES contracts(id),
+    workspace_id         TEXT NOT NULL REFERENCES workspaces(id),
+    provider             TEXT NOT NULL CHECK (provider = 'github_actions'),
+    repository           TEXT NOT NULL CHECK (length(repository) BETWEEN 3 AND 140),
+    commit_sha           TEXT NOT NULL CHECK (length(commit_sha) = 40),
+    ref                  TEXT CHECK (ref IS NULL OR length(ref) BETWEEN 1 AND 255),
+    event                TEXT NOT NULL CHECK (event IN ('push', 'pull_request')),
+    run_id               INTEGER NOT NULL CHECK (run_id > 0),
+    run_attempt          INTEGER NOT NULL CHECK (run_attempt BETWEEN 1 AND 10000),
+    pull_request_number  INTEGER CHECK (pull_request_number IS NULL OR pull_request_number > 0),
+    created_at           TEXT NOT NULL,
+    CHECK ((event = 'pull_request') = (pull_request_number IS NOT NULL))
+);
+CREATE INDEX idx_contract_ci_sources_workspace ON contract_ci_sources(workspace_id);

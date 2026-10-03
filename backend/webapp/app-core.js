@@ -90,6 +90,7 @@
   // feature_not_available names the feature it refers to (backend/plans.py).
   var FEATURE_ERRORS = {
     private_api: "The Private API is available on the Quick, Standard and Pro plans.",
+    github_actions: "GitHub Actions is available on the Standard and Pro plans.",
     report_download: "Report downloads are not included in the free Trial."
   };
   // Outcome word the backend appends after GitHub's authorization redirect.

@@ -1,0 +1,97 @@
+# Vericexa GitHub Action (docs/decisiones.md D-114, docs/github-actions.md).
+#
+# Submits the checkout's Solidity/Vyper files to the Vericexa Private API
+# (POST /api/v1/scans), waits for the scan and publishes the result. The
+# analysis always runs in Vericexa; this action only collects files, calls
+# the API and reports. Requires a Standard or Pro plan (enforced by the
+# Vericexa backend: Trial and Quick keys are refused with 403
+# feature_not_available).
+#
+# Exit codes: 0 = completed and gate passed (or skipped fork PR without the
+# secret), 1 = security gate failed (blocking findings), 2 = execution / API
+# / configuration error.
+#
+# Every input reaches the script through env: - never interpolated into a
+# shell command - so no value (and nothing from the repository or the
+# triggering event) can be executed as a command.
+name: Vericexa automated review
+description: Automated AI-assisted smart contract security review of the checkout through the Vericexa Private API.
+inputs:
+  api-key:
+    description: Vericexa Private API key. Pass it from a secret (secrets.VERICEXA_API_KEY); never write it in the workflow.
+    required: false
+    default: ""
+  api-url:
+    description: Base URL of your Vericexa deployment (https). Recommended as the repository variable VERICEXA_API_URL.
+    required: true
+  mode:
+    description: Analysis mode allowed by your plan (quick or standard on Standard; quick, standard or pro on Pro).
+    required: false
+    default: standard
+  path:
+    description: Directory inside the checkout to scan.
+    required: false
+    default: "."
+  exclude:
+    description: Comma-separated directory names or paths (relative to path) not to send, e.g. dependencies and build output.
+    required: false
+    default: "lib,out,cache,artifacts,build,coverage"
+  project-id:
+    description: Optional Vericexa project id to file the scan under.
+    required: false
+    default: ""
+  blocking-severities:
+    description: Severities that fail the security gate (comma-separated). Empty = report only, never fails on findings.
+    required: false
+    default: "CRITICAL,HIGH"
+  min-confidence:
+    description: Optional minimum confidence (low, medium, high) for a finding to block.
+    required: false
+    default: ""
+  timeout-minutes:
+    description: How long to wait for the scan before giving up (a re-run of the same workflow run resumes the same scan).
+    required: false
+    default: "30"
+  github-token:
+    description: Optional token used ONLY to publish a Check Run on this repository (needs permissions checks write). Never sent to Vericexa.
+    required: false
+    default: ""
+outputs:
+  result:
+    description: passed, gate_failed, error or skipped.
+    value: ${{ steps.scan.outputs.result }}
+  exit-code:
+    description: 0, 1 or 2 (see above).
+    value: ${{ steps.scan.outputs.exit-code }}
+  job-url:
+    description: Link to the scan in the Vericexa web app.
+    value: ${{ steps.scan.outputs.job-url }}
+  report-url:
+    description: Link to the report in the Vericexa web app.
+    value: ${{ steps.scan.outputs.report-url }}
+  risk-band:
+    description: Automated Risk Indicator band (LOW, MODERATE, HIGH, CRITICAL) when computed.
+    value: ${{ steps.scan.outputs.risk-band }}
+  findings-total:
+    description: Number of findings in the report.
+    value: ${{ steps.scan.outputs.findings-total }}
+  blocking-findings:
+    description: Number of findings that failed the security gate.
+    value: ${{ steps.scan.outputs.blocking-findings }}
+runs:
+  using: composite
+  steps:
+    - id: scan
+      shell: bash
+      env:
+        VERICEXA_API_KEY: ${{ inputs.api-key }}
+        VERICEXA_API_URL: ${{ inputs.api-url }}
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_EXCLUDE: ${{ inputs.exclude }}
+        INPUT_PROJECT_ID: ${{ inputs.project-id }}
+        INPUT_BLOCKING_SEVERITIES: ${{ inputs.blocking-severities }}
+        INPUT_MIN_CONFIDENCE: ${{ inputs.min-confidence }}
+        INPUT_TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+        INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: python3 "$GITHUB_ACTION_PATH/vericexa_scan.py"

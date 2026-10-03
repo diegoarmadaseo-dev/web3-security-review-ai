@@ -601,8 +601,12 @@
           })));
       }
       var table = el("div", null, keysTable(keys));
+      var actions = (adm.features || []).indexOf("github_actions") >= 0;   // D-114
       render(el("h1", { text: "API keys" }),
         el("p", { className: "muted", text: "Keys authenticate the Private API (" + window.location.origin + "/api/v1/) for this workspace only. A key acts as the member who created it; revoke a key to stop it immediately." }),
+        el("p", { className: "small muted", text: actions
+          ? "GitHub Actions: store a key as the VERICEXA_API_KEY repository secret and use the Vericexa GitHub Action."
+          : "GitHub Actions is available on the Standard and Pro plans." }),
         msg, created, form, table);
     }).catch(function (err) { if (current(token)) { render(el("h1", { text: "API keys" }), errorBox(err)); } });
   }
