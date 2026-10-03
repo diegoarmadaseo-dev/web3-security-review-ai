@@ -118,7 +118,9 @@ CREATE TABLE contracts (
     storage_ref     TEXT NOT NULL,
     content_hash    TEXT NOT NULL,
     created_at      TEXT NOT NULL,
-    deleted_at      TEXT
+    deleted_at      TEXT,
+    -- D-109 (backend/migrations/0011_contract_files.sql's mirror).
+    source_kind     TEXT NOT NULL DEFAULT 'single' CHECK (source_kind IN ('single', 'files', 'archive'))
 );
 CREATE INDEX idx_contracts_workspace ON contracts(workspace_id);
 CREATE INDEX idx_contracts_project ON contracts(project_id);
@@ -306,3 +308,17 @@ CREATE TABLE submit_attempts (
     created_at    TEXT NOT NULL
 );
 CREATE INDEX idx_submit_attempts_user_created ON submit_attempts(user_id, created_at);
+
+-- D-109 (backend/migrations/0011_contract_files.sql's mirror) - per-file
+-- traceability for multi-file/ZIP submissions; metadata only.
+CREATE TABLE contract_files (
+    contract_id     TEXT NOT NULL REFERENCES contracts(id),
+    workspace_id    TEXT NOT NULL REFERENCES workspaces(id),
+    path            TEXT NOT NULL,
+    language        TEXT NOT NULL,
+    size_bytes      INTEGER NOT NULL CHECK (size_bytes >= 0),
+    content_sha256  TEXT NOT NULL,
+    effective_loc   INTEGER NOT NULL CHECK (effective_loc >= 0),
+    PRIMARY KEY (contract_id, path)
+);
+CREATE INDEX idx_contract_files_workspace ON contract_files(workspace_id);

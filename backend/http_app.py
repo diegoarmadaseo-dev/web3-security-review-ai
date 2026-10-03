@@ -192,6 +192,7 @@ import backend.loc_count as loc_count
 import backend.object_storage as object_storage
 import backend.plans as plans
 import backend.repository as repo
+import backend.submission_input as submission_input
 import backend.tenant_scope as tenant_scope
 
 SESSION_COOKIE_NAME = "session"
@@ -209,6 +210,15 @@ _JOBS_COLLECTION_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/jobs$")
 _WORKSPACE_ITEM_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)$")
 _REPORTS_COLLECTION_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/reports$")
 _REPORT_ITEM_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/reports/(?P<report_id>[^/]+)$")
+# D-109: projects and single-job reads. Anchored like every regex above.
+_PROJECTS_COLLECTION_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/projects$")
+_PROJECT_ITEM_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/projects/(?P<project_id>[^/]+)$")
+_JOB_ITEM_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/jobs/(?P<job_id>[^/]+)$")
+# Every id this backend generates is repository.new_id(), a canonical UUID
+# string. A malformed project/job id is answered 404 up front - never sent
+# to Postgres, where a non-UUID literal would raise instead of matching
+# nothing.
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 _MAX_WORKSPACE_NAME_LENGTH = 200
 _MAX_WORKSPACES_PER_USER = 50  # abuse-safety cap on POST /workspaces - generous for any legitimate account.
@@ -931,6 +941,18 @@ def make_handler(
             if match:
                 self._handle_job_list(match.group("workspace_id"), parsed)
                 return
+            match = _JOB_ITEM_RE.match(path)
+            if match:
+                self._handle_job_get(match.group("workspace_id"), match.group("job_id"))
+                return
+            match = _PROJECTS_COLLECTION_RE.match(path)
+            if match:
+                self._handle_project_list(match.group("workspace_id"), parsed)
+                return
+            match = _PROJECT_ITEM_RE.match(path)
+            if match:
+                self._handle_project_get(match.group("workspace_id"), match.group("project_id"))
+                return
             match = _REPORT_ITEM_RE.match(path)
             if match:
                 self._handle_report_get(match.group("workspace_id"), match.group("report_id"))
@@ -1028,6 +1050,10 @@ def make_handler(
                 match = _JOBS_COLLECTION_RE.match(path)
                 if match:
                     self._handle_job_submit(match.group("workspace_id"))
+                    return
+                match = _PROJECTS_COLLECTION_RE.match(path)
+                if match:
+                    self._handle_project_create(match.group("workspace_id"))
                     return
                 self._send_json(404, {"ok": False, "error": "not found"})
 
@@ -1281,6 +1307,10 @@ def make_handler(
             if status_filter is not None and status_filter not in repo.JOB_STATUSES:
                 self._send_json(400, {"ok": False, "error": "status must be one of %r" % (repo.JOB_STATUSES,)})
                 return
+            project_filter = (qs.get("project_id") or [None])[0]
+            if project_filter is not None and not _UUID_RE.match(project_filter):
+                self._send_json(400, {"ok": False, "error": "project_id must be a project id"})
+                return
             conn = connect_fn()
             try:
                 current_user_id = self._current_user_id(conn)
@@ -1292,7 +1322,7 @@ def make_handler(
                 except tenant_scope.TenantScopeError:
                     self._send_json(403, {"ok": False, "error": "forbidden"})
                     return
-                jobs = repo.list_jobs_by_workspace(conn, workspace_id, limit=limit, offset=offset, status=status_filter)
+                jobs = repo.list_jobs_by_workspace(conn, workspace_id, limit=limit, offset=offset, status=status_filter, project_id=project_filter)
                 self._send_json(200, {"ok": True, "jobs": jobs, "limit": limit, "offset": offset})
             except Exception:
                 self._send_json(500, {"ok": False, "error": "internal error"})
@@ -1497,6 +1527,32 @@ def make_handler(
             if mode not in ("quick", "standard", "pro"):
                 self._send_json(400, {"ok": False, "error": "mode must be one of quick/standard/pro"})
                 return
+            # D-109: exactly one input shape - "source" (one file, or a
+            # bundle the client built itself, unchanged), "files" (a JSON
+            # array) or "archive" (a ZIP). The last two are validated by
+            # backend/submission_input.py and turned into the engine's own
+            # bundle text, so EVERYTHING below (size ceiling, effective LOC,
+            # admission, storage, worker) is the single-source path,
+            # unchanged - one LOC count, one reservation.
+            given = [key for key in ("source", "files", "archive") if payload.get(key) is not None]
+            if len(given) > 1:
+                self._send_json(400, {"ok": False, "error": "only one of source, files or archive may be given"})
+                return
+            source_kind, manifest, built = "single", None, None
+            if given and given[0] in ("files", "archive"):
+                try:
+                    if given[0] == "files":
+                        built = submission_input.from_files(payload["files"], MAX_RAW_SOURCE_BYTES)
+                    else:
+                        built = submission_input.from_zip(submission_input.decode_archive(payload["archive"]), MAX_RAW_SOURCE_BYTES)
+                except submission_input.SubmissionInputError as exc:
+                    self._send_json(exc.http_status, {"ok": False, "error": exc.code, "detail": exc.detail})
+                    return
+                source, source_kind, manifest = built["source"], given[0], built["files"]
+            project_id = payload.get("project_id")
+            if project_id is not None and (not isinstance(project_id, str) or not _UUID_RE.match(project_id)):
+                self._send_json(404, {"ok": False, "error": "project_not_found"})
+                return
             if not isinstance(source, str) or not source.strip():
                 self._send_json(400, {"ok": False, "error": "source is required"})
                 return
@@ -1534,6 +1590,9 @@ def make_handler(
                 except tenant_scope.TenantScopeError:
                     self._send_json(403, {"ok": False, "error": "forbidden"})
                     return
+                if project_id is not None and repo.get_project(conn, workspace_id, project_id) is None:
+                    self._send_json(404, {"ok": False, "error": "project_not_found"})
+                    return
                 entitlement = repo.get_entitlement_by_workspace(conn, workspace_id)
                 if entitlement is None or entitlement["status"] not in ("active", "trialing"):
                     self._send_json(402, {"ok": False, "error": "this workspace has no active subscription"})
@@ -1550,7 +1609,7 @@ def make_handler(
                 if mode not in repo.PLAN_ALLOWED_MODES.get(entitlement["plan"], frozenset()):
                     self._send_json(403, {"ok": False, "error": "mode not included in the current plan"})
                     return
-                idempotency_key = client_idempotency_key or repo.new_id()
+                idempotency_key = repo.scoped_idempotency_key(workspace_id, client_idempotency_key) if client_idempotency_key else repo.new_id()
                 existing = repo.get_job_by_idempotency_key(conn, idempotency_key)
                 if existing is not None:
                     self._send_json(200, {"ok": True, "job_id": existing["id"], "status": existing["status"], "duplicate": True})
@@ -1585,7 +1644,10 @@ def make_handler(
                 # two cannot be the same value chosen up front).
                 storage_ref = object_storage.workspace_key(workspace_id, "sources", repo.new_id())
                 storage.put_object(storage_ref, source.encode("utf-8"), content_type="text/plain")
-                contract_id = repo.create_contract(conn, workspace_id, storage_ref, content_hash, payload.get("filename") or "contract.sol")
+                display_name = payload.get("filename") if isinstance(payload.get("filename"), str) and payload.get("filename") else (
+                    "contract.sol" if source_kind == "single" else "%s submission" % source_kind)   # display only, never a path
+                contract_id = repo.create_contract(conn, workspace_id, storage_ref, content_hash, display_name,
+                                                   project_id=project_id, source_kind=source_kind, files=manifest)
                 try:
                     job_id = repo.enqueue_job_with_usage(conn, workspace_id, contract_id, current_user_id, mode, idempotency_key, entitlement, effective_loc,
                                                          max_pending_jobs=max_pending_jobs_per_workspace)
@@ -1627,7 +1689,164 @@ def make_handler(
                     winner = repo.get_job_by_idempotency_key(conn, idempotency_key)
                     self._send_json(200, {"ok": True, "job_id": winner["id"], "status": winner["status"], "duplicate": True})
                     return
-                self._send_json(200, {"ok": True, "job_id": job_id, "status": "queued"})
+                response = {"ok": True, "job_id": job_id, "status": "queued", "effective_loc": effective_loc, "source_kind": source_kind, "project_id": project_id}
+                if built is not None:
+                    response.update({"files": built["files"], "ignored": built["ignored"], "ignored_count": built["ignored_count"]})
+                self._send_json(200, response)
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
+
+
+        # -------------------------------------------------------------
+        # Projects (D-109) - CRUD inside one workspace. Every handler
+        # resolves the caller's workspace role first (403 for a non-member
+        # or a nonexistent workspace, the existing convention), then looks
+        # the project up by (workspace_id, project_id) - a project of any
+        # other workspace is indistinguishable from a missing one (404).
+        # No entitlement/plan input: no plan limits projects.
+        # -------------------------------------------------------------
+        def _project_scope(self, conn: Any, workspace_id: str, allowed_roles: Tuple[str, ...] = ("owner", "admin", "member")) -> Optional[str]:
+            """Returns the current user id, or None after sending 401/403."""
+            current_user_id = self._current_user_id(conn)
+            if current_user_id is None:
+                self._send_json(401, {"ok": False, "error": "authentication required"})
+                return None
+            try:
+                tenant_scope.require_workspace_role(conn, current_user_id, workspace_id, allowed_roles=allowed_roles)
+            except tenant_scope.TenantScopeError:
+                self._send_json(403, {"ok": False, "error": "forbidden"})
+                return None
+            return current_user_id
+
+        def _read_project_name(self) -> Optional[str]:
+            """The validated "name" of a JSON body, or None after sending 400."""
+            raw, err_status, err_msg = self._read_body()
+            if err_status:
+                self._send_json(err_status, {"ok": False, "error": err_msg})
+                return None
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_json(400, {"ok": False, "error": "request body is not valid UTF-8 JSON"})
+                return None
+            name = payload.get("name") if isinstance(payload, dict) else None
+            name = name.strip() if isinstance(name, str) else None
+            if (not name or len(name) > repo.MAX_PROJECT_NAME_LENGTH or not _is_utf8_encodable(name)
+                    or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in name)):
+                self._send_json(400, {"ok": False, "error": "name must be a non-empty string of at most %d characters without control characters" % repo.MAX_PROJECT_NAME_LENGTH})
+                return None
+            return name
+
+        def _handle_project_create(self, workspace_id: str) -> None:
+            if self._reject_if_cross_origin():
+                return
+            name = self._read_project_name()
+            if name is None:
+                return
+            conn = connect_fn()
+            try:
+                if self._project_scope(conn, workspace_id) is None:
+                    return
+                try:
+                    project_id = repo.create_project(conn, workspace_id, name)
+                except repo.ProjectNameTakenError:
+                    self._send_json(409, {"ok": False, "error": "project_name_taken"})
+                    return
+                self._send_json(200, {"ok": True, "project": repo.get_project(conn, workspace_id, project_id)})
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
+
+        def _handle_project_list(self, workspace_id: str, parsed: Any) -> None:
+            limit, offset, err = _parse_limit_offset(parse_qs(parsed.query))
+            if err:
+                self._send_json(400, {"ok": False, "error": err})
+                return
+            conn = connect_fn()
+            try:
+                if self._project_scope(conn, workspace_id, ("owner", "admin", "member")) is None:
+                    return
+                projects = repo.list_projects(conn, workspace_id, limit=limit, offset=offset)
+                self._send_json(200, {"ok": True, "projects": projects, "limit": limit, "offset": offset})
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
+
+        def _handle_project_get(self, workspace_id: str, project_id: str) -> None:
+            conn = connect_fn()
+            try:
+                if self._project_scope(conn, workspace_id, ("owner", "admin", "member")) is None:
+                    return
+                project = repo.get_project(conn, workspace_id, project_id) if _UUID_RE.match(project_id) else None
+                if project is None:
+                    self._send_json(404, {"ok": False, "error": "project_not_found"})
+                    return
+                self._send_json(200, {"ok": True, "project": project})
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
+
+        def _handle_project_rename(self, workspace_id: str, project_id: str) -> None:
+            if self._reject_if_cross_origin():
+                return
+            name = self._read_project_name()
+            if name is None:
+                return
+            conn = connect_fn()
+            try:
+                if self._project_scope(conn, workspace_id) is None:
+                    return
+                try:
+                    renamed = _UUID_RE.match(project_id) is not None and repo.rename_project(conn, workspace_id, project_id, name)
+                except repo.ProjectNameTakenError:
+                    self._send_json(409, {"ok": False, "error": "project_name_taken"})
+                    return
+                if not renamed:
+                    self._send_json(404, {"ok": False, "error": "project_not_found"})
+                    return
+                self._send_json(200, {"ok": True, "project": repo.get_project(conn, workspace_id, project_id)})
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
+
+        def _handle_project_delete(self, workspace_id: str, project_id: str) -> None:
+            if self._reject_if_cross_origin():
+                return
+            conn = connect_fn()
+            try:
+                if self._project_scope(conn, workspace_id, ("owner", "admin")) is None:
+                    return
+                if not (_UUID_RE.match(project_id) and repo.delete_project(conn, workspace_id, project_id)):
+                    self._send_json(404, {"ok": False, "error": "project_not_found"})
+                    return
+                self._send_json(200, {"ok": True, "deleted": True})
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
+
+        def _handle_job_get(self, workspace_id: str, job_id: str) -> None:
+            """D-109: one job with its source metadata - submission kind,
+            project, display name and, for a multi-file/ZIP scan, the
+            per-file manifest. Never the storage key or any file content."""
+            conn = connect_fn()
+            try:
+                if self._project_scope(conn, workspace_id, ("owner", "admin", "member")) is None:
+                    return
+                job = repo.get_job(conn, job_id) if _UUID_RE.match(job_id) else None
+                if job is None or job["workspace_id"] != workspace_id:
+                    self._send_json(404, {"ok": False, "error": "not found"})
+                    return
+                contract = repo.get_contract(conn, job["contract_id"]) or {}
+                source = {"kind": contract.get("source_kind", "single"), "project_id": contract.get("project_id"), "name": contract.get("name"),
+                          "files": repo.list_contract_files(conn, workspace_id, job["contract_id"])}
+                self._send_json(200, {"ok": True, "job": job, "source": source, "usage": repo.get_job_usage(conn, job_id)})
             except Exception:
                 self._send_json(500, {"ok": False, "error": "internal error"})
             finally:
@@ -1845,11 +2064,23 @@ def make_handler(
         # -------------------------------------------------------------
         def do_DELETE(self) -> None:
             path = urlparse(self.path).path
+            match = _PROJECT_ITEM_RE.match(path)
+            if match:
+                self._handle_project_delete(match.group("workspace_id"), match.group("project_id"))
+                return
             match = _MEMBER_ITEM_RE.match(path)
             if not match:
                 self._send_json(404, {"ok": False, "error": "not found"})
                 return
             self._handle_member_remove(match.group("workspace_id"), match.group("user_id"))
+
+        def do_PATCH(self) -> None:
+            path = urlparse(self.path).path
+            match = _PROJECT_ITEM_RE.match(path)
+            if not match:
+                self._send_json(404, {"ok": False, "error": "not found"})
+                return
+            self._handle_project_rename(match.group("workspace_id"), match.group("project_id"))
 
         def _handle_member_remove(self, workspace_id: str, user_id: str) -> None:
             if self._reject_if_cross_origin():

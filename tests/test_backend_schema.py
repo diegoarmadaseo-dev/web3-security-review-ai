@@ -129,8 +129,13 @@ class SchemaConstraintTests(unittest.TestCase):
         user_id = repo.create_user(self.conn, "u@example.com")
         workspace_id = repo.create_workspace(self.conn, "Acme", user_id)
         repo.create_project(self.conn, workspace_id, "Vault")
-        with self.assertRaises(sqlite3.IntegrityError):
+        # D-109: the unique index still decides; create_project() now turns
+        # its IntegrityError into a domain error (after rolling back).
+        with self.assertRaises(repo.ProjectNameTakenError):
             repo.create_project(self.conn, workspace_id, "Vault")
+        with self.assertRaises(sqlite3.IntegrityError):   # the DB constraint itself, unchanged
+            self.conn.execute("INSERT INTO projects (id, workspace_id, name, created_at, updated_at) VALUES (?, ?, 'Vault', 'x', 'x')", (repo.new_id(), workspace_id))
+        self.conn.rollback()
 
     def test_a_soft_deleted_project_does_not_block_the_name_being_reused(self):
         user_id = repo.create_user(self.conn, "u@example.com")

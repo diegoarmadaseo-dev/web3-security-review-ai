@@ -121,7 +121,7 @@ class MigrationIntegrationTests(unittest.TestCase):
         self.conn, self.applied = _reset_database_and_migrate()
         self.addCleanup(self.conn.close)
 
-    def test_fresh_database_applies_all_ten_migrations_in_order(self):
+    def test_fresh_database_applies_all_eleven_migrations_in_order(self):
         # 0002_auth_tokens.sql (Phase 2), 0003_entitlement_status_expand.sql
         # and 0004_entitlement_event_provenance.sql (Phase 3),
         # 0005_job_queue_hardening.sql (Phase 4, D-079),
@@ -129,15 +129,16 @@ class MigrationIntegrationTests(unittest.TestCase):
         # 0007_billing_interval.sql (Phase 7, D-086), and
         # 0008_queue_fairness.sql (admission control / queue fairness,
         # post reap-atomicity-fix and worker-fencing hardening) and
-        # 0009_commercial_usage.sql (D-107) and 0010_commercial_guards.sql
-        # (D-108) added alongside 0001_initial_schema.sql (Phase 1).
+        # 0009_commercial_usage.sql (D-107), 0010_commercial_guards.sql
+        # (D-108) and 0011_contract_files.sql (D-109) added alongside
+        # 0001_initial_schema.sql (Phase 1).
         self.assertEqual(
             self.applied,
             [
                 "0001_initial_schema", "0002_auth_tokens", "0003_entitlement_status_expand",
                 "0004_entitlement_event_provenance", "0005_job_queue_hardening", "0006_retention_purge",
                 "0007_billing_interval", "0008_queue_fairness", "0009_commercial_usage",
-                "0010_commercial_guards",
+                "0010_commercial_guards", "0011_contract_files",
             ],
         )
 
@@ -160,7 +161,7 @@ class MigrationIntegrationTests(unittest.TestCase):
             seen_statuses.add(repo.get_entitlement_by_workspace(self.conn, workspace_id)["status"])
         self.assertEqual(seen_statuses, {"incomplete_expired", "unpaid"})
 
-    def test_all_twenty_tables_exist(self):
+    def test_all_twenty_one_tables_exist(self):
         cur = db.execute(
             self.conn,
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
@@ -174,6 +175,7 @@ class MigrationIntegrationTests(unittest.TestCase):
             "workspace_queue_state",  # Admission control / queue fairness, 0008_queue_fairness.sql.
             "scan_credits", "usage_periods", "job_usage",  # D-107, 0009_commercial_usage.sql.
             "technical_budget_periods", "submit_attempts",  # D-108, 0010_commercial_guards.sql.
+            "contract_files",  # D-109, 0011_contract_files.sql.
         }
         self.assertEqual(tables, expected)
 
@@ -750,6 +752,52 @@ class CommercialGuardsIntegrationTests(unittest.TestCase):
             self.assertTrue(repo.transition_job_status(self.conn, claimed["id"], "claimed", "queued"))
 
 
+class ProjectsMultiFileIntegrationTests(unittest.TestCase):
+    """D-109 against a REAL Postgres server: project CRUD and isolation on
+    UUID columns, the per-file manifest written atomically with its
+    contract, the project filter on the job list, and workspace-scoped
+    idempotency keys. tests/test_backend_projects_multifile.py covers the
+    same rules (and the input validation) on SQLite."""
+
+    def setUp(self):
+        self.conn, _ = _reset_database_and_migrate()
+        self.addCleanup(self.conn.close)
+        self.user_id = repo.create_user(self.conn, "d109-%s@example.com" % repo.new_id())
+        self.ws = repo.create_workspace(self.conn, "WS", self.user_id)
+        self.other = repo.create_workspace(self.conn, "Other", self.user_id)
+
+    def test_project_crud_and_isolation(self):
+        pid = repo.create_project(self.conn, self.ws, "Vault")
+        with self.assertRaises(repo.ProjectNameTakenError):
+            repo.create_project(self.conn, self.ws, "Vault")
+        repo.create_project(self.conn, self.ws, "After a refused name")   # the connection is usable after the rollback
+        foreign = repo.create_project(self.conn, self.other, "Vault")
+        self.assertIsNone(repo.get_project(self.conn, self.ws, foreign))
+        self.assertFalse(repo.rename_project(self.conn, self.ws, foreign, "x"))
+        self.assertFalse(repo.delete_project(self.conn, self.ws, foreign))
+        self.assertTrue(repo.rename_project(self.conn, self.ws, pid, "Vault 2"))
+        self.assertTrue(repo.delete_project(self.conn, self.ws, pid))
+        self.assertIsNone(repo.get_project(self.conn, self.ws, pid))
+        self.assertEqual({p["name"] for p in repo.list_projects(self.conn, self.ws)}, {"After a refused name"})
+
+    def test_manifest_is_atomic_and_jobs_filter_by_project(self):
+        import backend.submission_input as si
+        built = si.from_files([{"path": "src/A.sol", "content": "pragma solidity ^0.8.20;\ncontract A {}\n"},
+                               {"path": "src/B.sol", "content": "pragma solidity ^0.8.20;\ncontract B {}\n"}], 2 * 1024 * 1024)
+        pid = repo.create_project(self.conn, self.ws, "P")
+        cid = repo.create_contract(self.conn, self.ws, "s3://x", "h", "n", project_id=pid, source_kind="files", files=built["files"])
+        self.assertEqual([r["path"] for r in repo.list_contract_files(self.conn, self.ws, cid)], ["src/A.sol", "src/B.sol"])
+        n_before = db.execute(self.conn, "SELECT COUNT(*) AS n FROM contracts").fetchone()["n"]
+        with self.assertRaises(Exception):
+            repo.create_contract(self.conn, self.ws, "s3://y", "h", "n", source_kind="files", files=built["files"] + [built["files"][0]])
+        self.assertEqual(db.execute(self.conn, "SELECT COUNT(*) AS n FROM contracts").fetchone()["n"], n_before)
+        loose = repo.create_contract(self.conn, self.ws, "s3://z", "h", "n")
+        in_project = repo.enqueue_job(self.conn, self.ws, cid, self.user_id, "quick", idempotency_key=repo.scoped_idempotency_key(self.ws, "k"))
+        repo.enqueue_job(self.conn, self.ws, loose, self.user_id, "quick", idempotency_key=repo.scoped_idempotency_key(self.other, "k"))
+        self.assertEqual([j["id"] for j in repo.list_jobs_by_workspace(self.conn, self.ws, project_id=pid)], [in_project])
+        self.assertEqual(repo.list_jobs_by_workspace(self.conn, self.other, project_id=pid), [])
+
+
 class AuthTokenIntegrationTests(unittest.TestCase):
     """Phase 2 identity/access (docs/decisiones.md D-077/D-078 follow-up):
     backend/auth.py against real PostgreSQL - UUID/TIMESTAMPTZ
@@ -1099,7 +1147,8 @@ class HttpJobSubmitConcurrencyIntegrationTests(unittest.TestCase):
                     self.assertEqual(payload["status"], "queued")
                     self.assertEqual(payload["job_id"], list(job_ids)[0])
 
-                cur = db.execute(self.conn, "SELECT COUNT(*) AS n FROM analysis_jobs WHERE idempotency_key = %s", (idem_key,))
+                # D-109: the client key is stored namespaced by its workspace (repo.scoped_idempotency_key()).
+                cur = db.execute(self.conn, "SELECT COUNT(*) AS n FROM analysis_jobs WHERE idempotency_key = %s", (repo.scoped_idempotency_key(workspace_id, idem_key),))
                 self.assertEqual(db.normalize_row(cur.fetchone())["n"], 1, "expected exactly one real row in analysis_jobs for this idempotency_key")
 
     def test_different_idempotency_keys_create_separate_jobs(self):

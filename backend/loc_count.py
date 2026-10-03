@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import sys
+from typing import Optional
 
 _SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".claude", "skills", "web3-auditor", "scripts")
 if _SCRIPTS_DIR not in sys.path:
@@ -34,24 +35,38 @@ import preprocess as _pp  # noqa: E402
 
 WORKER_SOURCE_NAME = "contract.sol"   # basename of backend/worker_entrypoint.py's SOURCE_PATH
 
+# preprocess.py's own file policy and bundle markers, re-exported (never
+# copied) for backend/submission_input.py (D-109), so the multi-file/ZIP
+# validation and the engine can never disagree on what a source file or a
+# bundle marker is.
+SOURCE_EXTENSIONS = _pp.SOURCE_EXTENSIONS
+DOCUMENT_EXTENSIONS = _pp.DOCUMENT_EXTENSIONS
+DOCUMENT_BASENAMES = _pp.DOCUMENT_BASENAMES
+BUNDLE_START_RE = _pp.BUNDLE_START_RE
+BUNDLE_END_RE = _pp.BUNDLE_END_RE
+detect_language = _pp.detect_language
+
+
+def entry_effective_loc(path: str, text: Optional[str]) -> int:
+    """Effective LOC of ONE file as the engine counts it (0 for anything
+    that is not Solidity/Vyper source)."""
+    if text is None or not text.strip():
+        return 0
+    language = _pp.detect_language(path, text)
+    if language not in ("solidity", "vyper"):
+        return 0
+    masked = _pp.mask_solidity(text) if language == "solidity" else _pp.mask_vyper(text)
+    return _pp.line_metrics(text, masked["masked"])["effective"]
+
 
 def submission_effective_loc(source: str) -> int:
     """Total effective LOC the worker's preprocess run will report for
-    this exact `source` string."""
+    this exact `source` string (a single file or a bundle - D-109's
+    multi-file/ZIP submissions arrive here as the bundle they built)."""
     data = source.encode("utf-8")
     text, _, _ = _pp.normalize_text(data)
     if text is not None and _pp.looks_like_bundle(text):
         entries = [{"path": item["path"], "text": item["text"]} for item in _pp.parse_bundle(text, WORKER_SOURCE_NAME)]
     else:
         entries = [{"path": WORKER_SOURCE_NAME, "text": text}]
-    total = 0
-    for entry in entries:
-        body = entry["text"]
-        if body is None or not body.strip():
-            continue
-        language = _pp.detect_language(entry["path"], body)
-        if language not in ("solidity", "vyper"):
-            continue
-        masked = _pp.mask_solidity(body) if language == "solidity" else _pp.mask_vyper(body)
-        total += _pp.line_metrics(body, masked["masked"])["effective"]
-    return total
+    return sum(entry_effective_loc(entry["path"], entry["text"]) for entry in entries)

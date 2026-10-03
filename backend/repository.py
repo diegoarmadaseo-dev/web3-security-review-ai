@@ -367,16 +367,91 @@ def get_entitlement_by_workspace(conn: Any, workspace_id: str) -> Optional[Dict[
 # Application data
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Projects (D-109) - a named grouping of scans inside ONE workspace. Every
+# read and write below takes workspace_id and filters on it together with
+# the project id, so a project id from another workspace behaves exactly
+# like a nonexistent one. No plan or Stripe input anywhere: the catalog
+# defines no project limit for any plan (plans.PLANS max_projects = None),
+# so none is enforced. Deletion is soft (deleted_at): scans keep pointing at
+# their project for history, and the name becomes reusable.
+# ---------------------------------------------------------------------------
+
+MAX_PROJECT_NAME_LENGTH = 200
+
+
+class ProjectNameTakenError(RepositoryError):
+    """Another live project in the same workspace already has this name
+    (uq_projects_workspace_name_live)."""
+
+
 def create_project(conn: Any, workspace_id: str, name: str) -> str:
     project_id = new_id()
     now = utcnow_iso()
-    db.execute(
+    try:
+        db.execute(
+            conn,
+            "INSERT INTO projects (id, workspace_id, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (project_id, workspace_id, name, now, now),
+        )
+        conn.commit()
+    except db.integrity_error_class(conn):
+        conn.rollback()
+        raise ProjectNameTakenError("a project named %r already exists in this workspace" % name)
+    return project_id
+
+
+def get_project(conn: Any, workspace_id: str, project_id: str) -> Optional[Dict[str, Any]]:
+    """The LIVE project with this id in this workspace, else None."""
+    cur = db.execute(
         conn,
-        "INSERT INTO projects (id, workspace_id, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-        (project_id, workspace_id, name, now, now),
+        "SELECT * FROM projects WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL",
+        (project_id, workspace_id),
+    )
+    return db.normalize_row(cur.fetchone())
+
+
+def list_projects(conn: Any, workspace_id: str, limit: int = 20, offset: int = 0) -> List[Dict[str, Any]]:
+    if not (1 <= limit <= MAX_LIST_LIMIT):
+        raise RepositoryError("limit must be between 1 and %d, got %r" % (MAX_LIST_LIMIT, limit))
+    if offset < 0:
+        raise RepositoryError("offset must be >= 0, got %r" % (offset,))
+    cur = db.execute(
+        conn,
+        "SELECT * FROM projects WHERE workspace_id = ? AND deleted_at IS NULL ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+        (workspace_id, limit, offset),
+    )
+    return [db.normalize_row(row) for row in cur.fetchall()]
+
+
+def rename_project(conn: Any, workspace_id: str, project_id: str, name: str) -> bool:
+    """False when no live project with this id exists in this workspace."""
+    try:
+        cur = db.execute(
+            conn,
+            "UPDATE projects SET name = ?, updated_at = ? WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL",
+            (name, utcnow_iso(), project_id, workspace_id),
+        )
+        conn.commit()
+    except db.integrity_error_class(conn):
+        conn.rollback()
+        raise ProjectNameTakenError("a project named %r already exists in this workspace" % name)
+    return cur.rowcount > 0
+
+
+def delete_project(conn: Any, workspace_id: str, project_id: str) -> bool:
+    """Soft delete; idempotent (False when already deleted or absent)."""
+    now = utcnow_iso()
+    cur = db.execute(
+        conn,
+        "UPDATE projects SET deleted_at = ?, updated_at = ? WHERE id = ? AND workspace_id = ? AND deleted_at IS NULL",
+        (now, now, project_id, workspace_id),
     )
     conn.commit()
-    return project_id
+    return cur.rowcount > 0
+
+
+CONTRACT_SOURCE_KINDS = ("single", "files", "archive")
 
 
 def create_contract(
@@ -386,15 +461,49 @@ def create_contract(
     content_hash: str,
     name: str,
     project_id: Optional[str] = None,
+    source_kind: str = "single",
+    files: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
+    """files (D-109): the per-file manifest of a multi-file/ZIP submission
+    (backend/submission_input.py), written in the SAME transaction as the
+    contract row - a contract never exists with a partial manifest."""
+    if source_kind not in CONTRACT_SOURCE_KINDS:
+        raise RepositoryError("source_kind must be one of %r, got %r" % (CONTRACT_SOURCE_KINDS, source_kind))
     contract_id = new_id()
-    db.execute(
-        conn,
-        "INSERT INTO contracts (id, workspace_id, project_id, name, storage_ref, content_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (contract_id, workspace_id, project_id, name, storage_ref, content_hash, utcnow_iso()),
-    )
-    conn.commit()
+    try:
+        db.execute(
+            conn,
+            "INSERT INTO contracts (id, workspace_id, project_id, name, storage_ref, content_hash, created_at, source_kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (contract_id, workspace_id, project_id, name, storage_ref, content_hash, utcnow_iso(), source_kind),
+        )
+        for item in files or []:
+            db.execute(
+                conn,
+                "INSERT INTO contract_files (contract_id, workspace_id, path, language, size_bytes, content_sha256, effective_loc) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (contract_id, workspace_id, item["path"], item["language"], item["size_bytes"], item["sha256"], item["effective_loc"]),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     return contract_id
+
+
+def list_contract_files(conn: Any, workspace_id: str, contract_id: str) -> List[Dict[str, Any]]:
+    cur = db.execute(
+        conn,
+        "SELECT path, language, size_bytes, content_sha256, effective_loc FROM contract_files WHERE contract_id = ? AND workspace_id = ? ORDER BY path",
+        (contract_id, workspace_id),
+    )
+    return [db.normalize_row(row) for row in cur.fetchall()]
+
+
+def scoped_idempotency_key(workspace_id: str, client_key: str) -> str:
+    """D-109 tenant-isolation fix: analysis_jobs.idempotency_key is UNIQUE
+    across ALL workspaces, so a client key is stored namespaced by its
+    workspace - the same key used in two workspaces now names two different
+    jobs, and a lookup can never return another workspace's job."""
+    return "%s:%s" % (workspace_id, client_key)
 
 
 def get_contract(conn: Any, contract_id: str) -> Optional[Dict[str, Any]]:
@@ -518,8 +627,10 @@ def list_jobs_by_workspace(
     limit: int = DEFAULT_LIST_LIMIT,
     offset: int = 0,
     status: Optional[str] = None,
+    project_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Tenant-scoped by construction (workspace_id is a WHERE clause, not
+    """project_id (D-109), if given, keeps only jobs whose contract belongs
+    to that project - still inside workspace_id. Tenant-scoped by construction (workspace_id is a WHERE clause, not
     a filter applied after a broader query) - the caller must still have
     already resolved workspace_id against the authenticated user via
     tenant_scope, same trust boundary as every other function in this
@@ -537,7 +648,15 @@ def list_jobs_by_workspace(
         raise RepositoryError("offset must be >= 0, got %r" % (offset,))
     if status is not None and status not in JOB_STATUSES:
         raise RepositoryError("status must be one of %r, got %r" % (JOB_STATUSES, status))
-    if status is None:
+    if project_id is not None:
+        sql = ("SELECT j.* FROM analysis_jobs j JOIN contracts c ON c.id = j.contract_id "
+               "WHERE j.workspace_id = ? AND c.workspace_id = ? AND c.project_id = ?")
+        params: Tuple[Any, ...] = (workspace_id, workspace_id, project_id)
+        if status is not None:
+            sql += " AND j.status = ?"
+            params += (status,)
+        cur = db.execute(conn, sql + " ORDER BY j.created_at DESC, j.id DESC LIMIT ? OFFSET ?", params + (limit, offset))
+    elif status is None:
         cur = db.execute(
             conn,
             "SELECT * FROM analysis_jobs WHERE workspace_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
