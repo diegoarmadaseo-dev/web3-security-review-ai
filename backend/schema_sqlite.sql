@@ -79,7 +79,7 @@ CREATE INDEX idx_sessions_user ON sessions(user_id);
 CREATE TABLE entitlements (
     id                          TEXT PRIMARY KEY,
     workspace_id                TEXT NOT NULL UNIQUE REFERENCES workspaces(id),
-    plan                        TEXT NOT NULL CHECK (plan IN ('quick', 'standard', 'pro')),
+    plan                        TEXT NOT NULL CHECK (plan IN ('trial', 'quick', 'standard', 'pro')),   -- 'trial': D-112
     -- Phase 3 (backend/migrations/0003_entitlement_status_expand.sql's
     -- mirror): the full set of real Stripe Subscription statuses.
     status                      TEXT NOT NULL CHECK (status IN ('active', 'trialing', 'past_due', 'canceled', 'incomplete', 'incomplete_expired', 'unpaid')),
@@ -210,6 +210,7 @@ CREATE TABLE auth_tokens (
     created_at      TEXT NOT NULL,
     expires_at      TEXT NOT NULL,
     consumed_at     TEXT,
+    purpose         TEXT NOT NULL DEFAULT 'login' CHECK (purpose IN ('login', 'signup')),   -- D-112
     CHECK (expires_at > created_at),
     CHECK (email = lower(email))
 );
@@ -270,8 +271,8 @@ CREATE TABLE usage_periods (
 CREATE TABLE job_usage (
     job_id         TEXT PRIMARY KEY REFERENCES analysis_jobs(id),
     workspace_id   TEXT NOT NULL REFERENCES workspaces(id),
-    plan           TEXT NOT NULL CHECK (plan IN ('quick', 'standard', 'pro')),
-    usage_model    TEXT NOT NULL CHECK (usage_model IN ('scan_credit', 'service_month')),
+    plan           TEXT NOT NULL CHECK (plan IN ('trial', 'quick', 'standard', 'pro')),
+    usage_model    TEXT NOT NULL CHECK (usage_model IN ('scan_credit', 'service_month', 'trial')),   -- 'trial': D-112
     effective_loc  INTEGER NOT NULL CHECK (effective_loc >= 0),
     period_start   TEXT,
     credit_id      TEXT REFERENCES scan_credits(id),
@@ -282,6 +283,7 @@ CREATE TABLE job_usage (
     CHECK (
         (usage_model = 'scan_credit' AND credit_id IS NOT NULL AND period_start IS NULL)
         OR (usage_model = 'service_month' AND period_start IS NOT NULL AND credit_id IS NULL)
+        OR (usage_model = 'trial' AND period_start IS NULL AND credit_id IS NULL)
     )
 );
 CREATE INDEX idx_job_usage_workspace ON job_usage(workspace_id, status);
@@ -368,3 +370,20 @@ CREATE TABLE contract_git_sources (
     created_at            TEXT NOT NULL
 );
 CREATE INDEX idx_contract_git_sources_workspace ON contract_git_sources(workspace_id);
+
+-- D-112 (backend/migrations/0013_trial.sql's mirror) - one Trial per
+-- normalized email, for ever (no foreign key to users: it outlives the
+-- account). See that migration's header.
+CREATE TABLE trial_grants (
+    normalized_email  TEXT PRIMARY KEY CHECK (normalized_email = lower(normalized_email) AND normalized_email = trim(normalized_email)),
+    user_id           TEXT,
+    workspace_id      TEXT NOT NULL REFERENCES workspaces(id),
+    status            TEXT NOT NULL CHECK (status IN ('available', 'reserved', 'consumed')),
+    job_id            TEXT,
+    granted_at        TEXT NOT NULL,
+    reserved_at       TEXT,
+    consumed_at       TEXT,
+    updated_at        TEXT NOT NULL,
+    CHECK ((status = 'available') = (job_id IS NULL))
+);
+CREATE UNIQUE INDEX uq_trial_grants_workspace ON trial_grants(workspace_id);

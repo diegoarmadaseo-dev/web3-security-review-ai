@@ -64,6 +64,7 @@ from typing import Any, Dict, List, Optional
 
 import backend.auth as auth
 import backend.object_storage as object_storage
+import backend.plans as plans
 import backend.repository as repo
 
 
@@ -125,6 +126,33 @@ def purge_expired_reports(
         if repo.mark_report_purged(conn, report["id"]):
             purged += 1
     return {"dry_run": False, "purged": purged, "report_ids": report_ids}
+
+
+def purge_expired_trial_results(
+    conn: Any, storage: object_storage.ObjectStorage, dry_run: bool = True, now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """D-112: a free-Trial scan's source and report CONTENT is kept 7 days
+    (plans.TRIAL history_days), independently of RETENTION_DAYS. Same
+    purge-content-keep-rows discipline as purge_expired_contracts()/
+    purge_expired_reports(); never touches a scan still queued or running.
+    The HTTP layer already hides and refuses these results after 7 days."""
+    days = int(plans.TRIAL["history_days"])
+    candidates = repo.list_expired_trial_results(conn, _cutoff_iso(days, now))
+    if dry_run:
+        return {"dry_run": True, "would_purge": len(candidates)}
+    purged = 0
+    for row in candidates:
+        if row.get("contract_deleted_at") is None:
+            storage.delete_object(row["contract_storage_ref"])
+            if repo.mark_contract_deleted(conn, row["contract_id"]):
+                purged += 1
+        if row.get("report_id") and row.get("report_purged_at") is None:
+            if row.get("report_storage_ref"):
+                storage.delete_object(row["report_storage_ref"])
+                _delete_report_companions(storage, row["report_storage_ref"])
+            if repo.mark_report_purged(conn, row["report_id"]):
+                purged += 1
+    return {"dry_run": False, "purged": purged}
 
 
 def delete_workspace_data(

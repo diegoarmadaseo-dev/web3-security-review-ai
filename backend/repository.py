@@ -215,7 +215,7 @@ def remove_workspace_member(conn: Any, workspace_id: str, user_id: str) -> bool:
 
 
 def get_user(conn: Any, user_id: str) -> Optional[Dict[str, Any]]:
-    cur = db.execute(conn, "SELECT id, email, created_at FROM users WHERE id = ?", (user_id,))
+    cur = db.execute(conn, "SELECT id, email, email_verified_at, created_at FROM users WHERE id = ?", (user_id,))   # email_verified_at: D-112 Trial eligibility
     return db.normalize_row(cur.fetchone())
 
 
@@ -403,6 +403,44 @@ def create_project(conn: Any, workspace_id: str, name: str) -> str:
     except db.integrity_error_class(conn):
         conn.rollback()
         raise ProjectNameTakenError("a project named %r already exists in this workspace" % name)
+    return project_id
+
+
+class ProjectLimitError(RepositoryError):
+    """The workspace already has as many live projects as its plan allows."""
+
+
+def create_project_capped(conn: Any, workspace_id: str, name: str, max_projects: int) -> str:
+    """create_project() for a plan that defines a project ceiling (D-112:
+    only the Trial, 1). The count and the INSERT run in ONE transaction
+    under the existing per-workspace admission lock
+    (_lock_workspace_admission(): Postgres row lock, SQLite BEGIN
+    IMMEDIATE), so concurrent creations are serialized and exactly
+    max_projects can succeed. Raises ProjectLimitError or
+    ProjectNameTakenError (nothing is created either way)."""
+    conn.commit()   # start from no open transaction, so the lock below is really taken
+    project_id = new_id()
+    now = utcnow_iso()
+    try:
+        _lock_workspace_admission(conn, workspace_id)
+        cur = db.execute(conn, "SELECT COUNT(*) AS n FROM projects WHERE workspace_id = ? AND deleted_at IS NULL", (workspace_id,))
+        if int(db.normalize_row(cur.fetchone())["n"]) >= max_projects:
+            conn.rollback()
+            raise ProjectLimitError("this workspace already has %d project(s), the most its plan allows" % max_projects)
+        db.execute(
+            conn,
+            "INSERT INTO projects (id, workspace_id, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (project_id, workspace_id, name, now, now),
+        )
+        conn.commit()
+    except ProjectLimitError:
+        raise
+    except db.integrity_error_class(conn):
+        conn.rollback()
+        raise ProjectNameTakenError("a project named %r already exists in this workspace" % name)
+    except Exception:
+        conn.rollback()
+        raise
     return project_id
 
 
@@ -703,8 +741,12 @@ def list_job_summaries(
     offset: int = 0,
     status: Optional[str] = None,
     project_id: Optional[str] = None,
+    trial_history_cutoff: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """list_jobs_by_workspace()'s rows (every analysis_jobs column, same
+    """trial_history_cutoff (D-112): when given, Trial scans created before
+    it are left out (the Trial keeps 7 days of history).
+
+    list_jobs_by_workspace()'s rows (every analysis_jobs column, same
     filters, same order, same bounds) plus what a history view needs
     (D-110): the submission's project and kind, its effective LOC as
     admitted, and its report's id/score/band when one exists. Every join is
@@ -736,6 +778,9 @@ def list_job_summaries(
     if project_id is not None:
         sql += " AND c.project_id = ?"
         params += (project_id,)
+    if trial_history_cutoff is not None:
+        sql += " AND NOT (COALESCE(u.plan, '') = 'trial' AND j.created_at < ?)"
+        params += (trial_history_cutoff,)
     cur = db.execute(conn, sql + " ORDER BY j.created_at DESC, j.id DESC LIMIT ? OFFSET ?", params + (limit, offset))
     return [db.normalize_row(row) for row in cur.fetchall()]
 
@@ -1571,9 +1616,9 @@ def enqueue_job_with_usage(
     carries priority 1 when the plan's catalog queue_priority is
     "priority"."""
     plan_name = entitlement.get("plan")
-    if plan_name not in plans.PLANS:
+    spec = plans.plan_spec(plan_name)   # D-112: the paid plans or the Trial
+    if spec is None:
         raise UsageLimitError("plan_unknown", "the workspace entitlement has no known plan")
-    spec = plans.PLANS[plan_name]
     if not isinstance(effective_loc, int) or effective_loc <= 0:
         raise UsageLimitError("no_source_code", "the submission contains no Solidity/Vyper source code (0 effective LOC)")
     if effective_loc > spec["max_loc_per_scan"]:
@@ -1600,7 +1645,24 @@ def enqueue_job_with_usage(
         raise
     try:
         now_iso = utcnow_iso()
-        if spec["usage_model"] == plans.USAGE_SCAN_CREDIT:
+        if spec["usage_model"] == plans.USAGE_TRIAL:
+            # D-112: the workspace's single Trial (one per email, ever) -
+            # never a Quick credit, never a service month, never Stripe.
+            cur = db.execute(
+                conn,
+                "UPDATE trial_grants SET status = 'reserved', job_id = ?, reserved_at = ?, updated_at = ? WHERE workspace_id = ? AND status = 'available'",
+                (job_id, now_iso, now_iso, workspace_id),
+            )
+            if cur.rowcount == 0:
+                conn.rollback()
+                raise UsageLimitError("trial_already_used", "the free Trial includes exactly one scan and it has already been used")
+            db.execute(
+                conn,
+                "INSERT INTO job_usage (job_id, workspace_id, plan, usage_model, effective_loc, period_start, credit_id, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, 'trial', ?, NULL, NULL, 'reserved', ?, ?)",
+                (job_id, workspace_id, plan_name, effective_loc, now_iso, now_iso),
+            )
+        elif spec["usage_model"] == plans.USAGE_SCAN_CREDIT:
             credit_id = _reserve_scan_credit(conn, workspace_id, job_id)
             if credit_id is None:
                 conn.rollback()
@@ -1715,7 +1777,14 @@ def _settle_job_usage(conn: Any, job_id: str, action: str) -> bool:
     )
     if cur.rowcount == 0:
         return False
-    if row["usage_model"] == plans.USAGE_SCAN_CREDIT:
+    if row["usage_model"] == plans.USAGE_TRIAL:
+        # D-112: a succeeded Trial scan burns the email's Trial for ever; a
+        # failed one gives it back (the user was never served a result).
+        if action == "consume":
+            db.execute(conn, "UPDATE trial_grants SET status = 'consumed', consumed_at = ?, updated_at = ? WHERE job_id = ? AND status = 'reserved'", (now, now, job_id))
+        else:
+            db.execute(conn, "UPDATE trial_grants SET status = 'available', job_id = NULL, reserved_at = NULL, updated_at = ? WHERE job_id = ? AND status = 'reserved'", (now, job_id))
+    elif row["usage_model"] == plans.USAGE_SCAN_CREDIT:
         if action == "consume":
             db.execute(conn, "UPDATE scan_credits SET status = 'consumed', updated_at = ? WHERE id = ? AND status = 'reserved'", (now, row["credit_id"]))
         else:
@@ -1864,9 +1933,9 @@ def usage_summary(conn: Any, workspace_id: str, entitlement: Optional[Dict[str, 
     GET /workspaces/<id>. None without an entitlement. state follows
     plans.usage_state(); it describes the NEXT request only - a blocked
     allowance refuses new scans, never the account."""
-    if entitlement is None or entitlement.get("plan") not in plans.PLANS:
+    spec = plans.plan_spec(entitlement.get("plan")) if entitlement is not None else None
+    if spec is None:
         return None
-    spec = plans.PLANS[entitlement["plan"]]
     out: Dict[str, Any] = {
         "plan": entitlement["plan"],
         "billing_type": spec["billing_type"],
@@ -1876,6 +1945,12 @@ def usage_summary(conn: Any, workspace_id: str, entitlement: Optional[Dict[str, 
         "max_projects": spec["max_projects"],
         "max_members": spec["max_members"],
     }
+    if spec["usage_model"] == plans.USAGE_TRIAL:
+        grant = get_trial_grant_by_workspace(conn, workspace_id)
+        available = 1 if grant is not None and grant["status"] == "available" else 0
+        out.update({"scans_available": available, "trial_status": grant["status"] if grant else None, "history_days": spec["history_days"],
+                    "report_downloads": spec["report_downloads"], "state": plans.STATE_NORMAL if available else plans.STATE_BLOCKED})
+        return out
     if spec["usage_model"] == plans.USAGE_SCAN_CREDIT:
         cur = db.execute(conn, "SELECT status, COUNT(*) AS n FROM scan_credits WHERE workspace_id = ? GROUP BY status", (workspace_id,))
         counts = {r["status"]: r["n"] for r in (db.normalize_row(x) for x in cur.fetchall())}
@@ -2217,3 +2292,76 @@ def revoke_workspace_github_connections(conn: Any, workspace_id: str) -> int:
     )
     conn.commit()
     return cur.rowcount
+
+
+# ---------------------------------------------------------------------------
+# Free Trial (D-112) - see backend/migrations/0013_trial.sql and
+# backend/trial.py. trial_grants is keyed by the NORMALIZED email and has no
+# foreign key to users, so the record outlives the account.
+# ---------------------------------------------------------------------------
+
+TRIAL_WORKSPACE_NAME = "Trial workspace"
+
+
+class TrialAlreadyGrantedError(RepositoryError):
+    """This normalized email already received its Trial (trial_grants
+    primary key) - permanently."""
+
+
+def get_trial_grant(conn: Any, normalized_email: str) -> Optional[Dict[str, Any]]:
+    cur = db.execute(conn, "SELECT * FROM trial_grants WHERE normalized_email = ?", (normalized_email,))
+    return db.normalize_row(cur.fetchone())
+
+
+def get_trial_grant_by_workspace(conn: Any, workspace_id: str) -> Optional[Dict[str, Any]]:
+    cur = db.execute(conn, "SELECT * FROM trial_grants WHERE workspace_id = ?", (workspace_id,))
+    return db.normalize_row(cur.fetchone())
+
+
+def grant_trial(conn: Any, normalized_email: str, user_id: str, workspace_name: str = TRIAL_WORKSPACE_NAME) -> str:
+    """Creates the Trial in ONE transaction: a workspace owned by user_id,
+    its owner membership, an active 'trial' entitlement (no Stripe ids, no
+    period) and the trial_grants row. The trial_grants primary key is the
+    guarantee: a second grant for the same email - sequential or
+    concurrent - fails on it and rolls EVERYTHING back
+    (TrialAlreadyGrantedError), so no stray workspace or entitlement is
+    left behind. Eligibility (verified email, allowed domain) is the
+    caller's job (backend/trial.py)."""
+    now = utcnow_iso()
+    workspace_id = new_id()
+    try:
+        db.execute(conn, "INSERT INTO workspaces (id, name, owner_user_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                   (workspace_id, workspace_name, user_id, now, now))
+        db.execute(conn, "INSERT INTO workspace_members (workspace_id, user_id, role, created_at) VALUES (?, ?, 'owner', ?)", (workspace_id, user_id, now))
+        db.execute(conn, "INSERT INTO entitlements (id, workspace_id, plan, status, created_at, updated_at) VALUES (?, ?, 'trial', 'active', ?, ?)",
+                   (new_id(), workspace_id, now, now))
+        db.execute(conn, "INSERT INTO trial_grants (normalized_email, user_id, workspace_id, status, granted_at, updated_at) VALUES (?, ?, ?, 'available', ?, ?)",
+                   (normalized_email, user_id, workspace_id, now, now))
+        conn.commit()
+    except db.integrity_error_class(conn):
+        conn.rollback()
+        if get_trial_grant(conn, normalized_email) is not None:
+            raise TrialAlreadyGrantedError("this email already received its free Trial")
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    return workspace_id
+
+
+def list_expired_trial_results(conn: Any, cutoff_iso: str) -> List[Dict[str, Any]]:
+    """Trial scans created before cutoff_iso whose contract or report
+    content still exists - for the 7-day Trial history purge
+    (backend/retention.py)."""
+    cur = db.execute(
+        conn,
+        "SELECT j.id AS job_id, c.id AS contract_id, c.storage_ref AS contract_storage_ref, c.deleted_at AS contract_deleted_at, "
+        "r.id AS report_id, r.storage_ref AS report_storage_ref, r.purged_at AS report_purged_at "
+        "FROM analysis_jobs j JOIN job_usage u ON u.job_id = j.id AND u.workspace_id = j.workspace_id "
+        "JOIN contracts c ON c.id = j.contract_id AND c.workspace_id = j.workspace_id "
+        "LEFT JOIN reports r ON r.job_id = j.id AND r.workspace_id = j.workspace_id "
+        "WHERE u.plan = 'trial' AND j.created_at < ? AND j.status NOT IN ('queued', 'claimed', 'running') "
+        "AND (c.deleted_at IS NULL OR (r.id IS NOT NULL AND r.purged_at IS NULL))",
+        (cutoff_iso,),
+    )
+    return [db.normalize_row(row) for row in cur.fetchall()]

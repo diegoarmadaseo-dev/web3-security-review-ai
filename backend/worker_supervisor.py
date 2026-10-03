@@ -74,6 +74,7 @@ container this module launches.
 """
 from __future__ import annotations
 
+import copy
 import json
 import subprocess
 import threading
@@ -166,6 +167,21 @@ class WorkerConfig:
         """The container's own Step 6 deadline - see
         WORKER_STEP6_STARTUP_RESERVE_SECONDS."""
         return max(1, self.wall_clock_timeout_seconds - WORKER_STEP6_STARTUP_RESERVE_SECONDS)
+
+
+def _config_for_job(conn: Any, config: "WorkerConfig", job_id: str) -> "WorkerConfig":
+    """D-112: a scan admitted under the free Trial never runs Layer 2 (the
+    targeted review), whatever TARGETED_REVIEW_ENABLED says; every other
+    setting is unchanged. Decided by the plan recorded at admission
+    (job_usage), never by a later plan change."""
+    if not config.targeted_review_enabled:
+        return config
+    usage = repo.get_job_usage(conn, job_id)
+    if not usage or usage.get("plan") != "trial":
+        return config
+    trial_config = copy.copy(config)
+    trial_config.targeted_review_enabled = False
+    return trial_config
 
 
 def build_docker_create_args(config: WorkerConfig, container_name: str) -> List[str]:
@@ -409,7 +425,7 @@ def claim_and_run_one_job(
         return job_id
 
     try:
-        result = run_job_in_container(config, job_id, mode, source)
+        result = run_job_in_container(_config_for_job(conn, config, job_id), job_id, mode, source)
     except Exception as exc:  # never let a single job's unexpected failure kill the supervisor loop.
         result = {"status": "failed", "error": "supervisor error: %s" % type(exc).__name__}
 
@@ -551,6 +567,7 @@ def run_worker_supervisor_loop(
     iteration connection reap/claim already use, never a second one."""
     iterations = 0
     next_retention_check = 0.0  # 0.0 - due immediately on the very first iteration this process ever runs, if retention_days is configured at all.
+    next_trial_history_check = 0.0  # D-112: the Trial's 7-day history is purged whether or not RETENTION_DAYS is set.
     while max_iterations is None or iterations < max_iterations:
         if shutdown_event is not None and shutdown_event.is_set():
             break
@@ -563,6 +580,15 @@ def run_worker_supervisor_loop(
                 purged_total = contracts_result.get("purged", 0) + reports_result.get("purged", 0)
                 if purged_total:
                     alerting.emit_safe(alert_sender, alerting.EVENT_RETENTION_PURGE, "info", {"purged_contracts": contracts_result.get("purged", 0), "purged_reports": reports_result.get("purged", 0)})
+            if time.monotonic() >= next_trial_history_check:
+                next_trial_history_check = time.monotonic() + retention_check_interval_seconds
+                try:
+                    trial_result = retention.purge_expired_trial_results(conn, storage, dry_run=retention_dry_run)
+                except Exception:
+                    conn.rollback()   # housekeeping only - never stops job processing; retried next interval
+                    trial_result = {}
+                if trial_result.get("purged"):
+                    alerting.emit_safe(alert_sender, alerting.EVENT_RETENTION_PURGE, "info", {"purged_trial_results": trial_result["purged"]})
             reap_result = repo.reap_expired_jobs(conn)
             if reap_result.get("requeued"):
                 alerting.emit_safe(alert_sender, alerting.EVENT_WORKER_REPEATED_RETRY, "warning", {"requeued": reap_result["requeued"]})

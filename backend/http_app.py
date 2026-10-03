@@ -188,6 +188,7 @@ import backend.auth as auth
 import backend.billing as billing_module
 import backend.black_friday as black_friday
 import backend.db as db
+import backend.email_policy as email_policy
 import backend.github_integration as github_integration
 import backend.loc_count as loc_count
 import backend.object_storage as object_storage
@@ -196,6 +197,7 @@ import backend.repository as repo
 import backend.submission_input as submission_input
 import backend.targeted_review as targeted_review
 import backend.tenant_scope as tenant_scope
+import backend.trial as trial
 
 SESSION_COOKIE_NAME = "session"
 MAX_BODY_BYTES = 64 * 1024  # generous for a JSON/form body this small; bounds per-request memory use.
@@ -491,8 +493,34 @@ _LOGIN_PAGE = (
     b"<form method=\"POST\" action=\"/auth/request-link\">"
     b"<input type=\"email\" name=\"email\" required placeholder=\"you@example.com\">"
     b"<button type=\"submit\">Send sign-in link</button>"
-    b"</form></body></html>"
+    b"</form><p>New here? <a href=\"/auth/signup\">Create an account and start a free Trial</a></p></body></html>"
 )
+
+# D-112: public sign-up - the same JS-free form style, posting to
+# /auth/signup. Sign-up only sends a verification link; the free Trial is
+# granted when that link is verified (backend/trial.py).
+_SIGNUP_PAGE = (
+    b"<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Create your account</title></head>"
+    b"<body><h1>Create your Vericexa account</h1>"
+    b"<p>Enter your email. We will send a link to verify it; once verified, your free Trial starts: "
+    b"one automated security review of up to 500 effective lines of code. No card required.</p>"
+    b"<form method=\"POST\" action=\"/auth/signup\">"
+    b"<input type=\"email\" name=\"email\" required maxlength=\"254\" placeholder=\"you@example.com\">"
+    b"<button type=\"submit\">Send verification link</button>"
+    b"</form><p>Already have an account? <a href=\"/auth/login\">Sign in</a></p></body></html>"
+)
+
+
+def _render_signup_page(title: str, message: str) -> bytes:
+    return (
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>%s</title></head>"
+        "<body><h1>%s</h1><p>%s</p><p><a href=\"/auth/signup\">Back to sign-up</a></p></body></html>"
+        % (html.escape(title, quote=True), html.escape(title, quote=True), html.escape(message, quote=True))
+    ).encode("utf-8")
+
+
+SIGNUP_SENT_MESSAGE = ("If this address can receive email, a verification link has been sent. "
+                       "Open it within 15 minutes to verify your email and start your free Trial.")
 
 
 def _render_request_link_sent_page(message: str) -> bytes:
@@ -774,6 +802,7 @@ def make_handler(
     max_pending_jobs_per_workspace: int = repo.DEFAULT_MAX_PENDING_JOBS_PER_WORKSPACE,
     submit_rate_limit_per_window: int = repo.DEFAULT_SUBMIT_RATE_LIMIT_PER_WINDOW,
     github: Optional["github_integration.GitHubIntegration"] = None,
+    disposable_policy: Optional["email_policy.DisposableDomainPolicy"] = None,
 ) -> type:
     """Returns a fresh Handler class closed over this specific server
     instance's config - never module-level globals, so multiple servers
@@ -809,7 +838,12 @@ def make_handler(
 
     github (D-111) is OPTIONAL: None leaves Private GitHub unconfigured (its
     endpoints answer 503 github_not_configured after the plan check); see
-    backend/github_integration.py."""
+    backend/github_integration.py.
+
+    disposable_policy (D-112) is the denylist of disposable email domains
+    refused for the free Trial; None loads the bundled list
+    (backend/email_policy.py)."""
+    trial_policy = disposable_policy if disposable_policy is not None else email_policy.load_policy()
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "backend-auth/2026.1"
@@ -989,6 +1023,12 @@ def make_handler(
             if path == "/auth/me":
                 self._handle_me()
                 return
+            if path == "/auth/signup":
+                self._send_html(200, _SIGNUP_PAGE)
+                return
+            if path == "/trial":
+                self._handle_trial_status()
+                return
             if path == "/billing/plans":
                 self._handle_billing_plans()
                 return
@@ -1130,6 +1170,10 @@ def make_handler(
                 self._handle_verify_post()
             elif path == "/auth/logout":
                 self._handle_logout()
+            elif path == "/auth/signup":
+                self._handle_signup()
+            elif path == "/trial/activate":
+                self._handle_trial_activate()
             elif path == "/workspaces":
                 self._handle_workspace_create()
             elif path == "/billing/checkout":
@@ -1275,6 +1319,8 @@ def make_handler(
             conn = connect_fn()
             try:
                 session = auth.consume_token_and_create_session(conn, token)
+                if session is not None and session.get("purpose") == "signup":
+                    self._grant_trial_after_signup(conn, session["user_id"])
             except Exception:
                 self._send_json(500, {"ok": False, "error": "internal error"})
                 return
@@ -1432,7 +1478,8 @@ def make_handler(
                 except tenant_scope.TenantScopeError:
                     self._send_json(403, {"ok": False, "error": "forbidden"})
                     return
-                jobs = repo.list_job_summaries(conn, workspace_id, limit=limit, offset=offset, status=status_filter, project_id=project_filter)
+                jobs = repo.list_job_summaries(conn, workspace_id, limit=limit, offset=offset, status=status_filter, project_id=project_filter,
+                                               trial_history_cutoff=trial.history_cutoff())   # D-112: 7-day Trial history
                 self._send_json(200, {"ok": True, "jobs": jobs, "limit": limit, "offset": offset})
             except Exception:
                 self._send_json(500, {"ok": False, "error": "internal error"})
@@ -1457,6 +1504,7 @@ def make_handler(
                     self._send_json(403, {"ok": False, "error": "forbidden"})
                     return
                 reports = repo.list_reports_by_workspace(conn, workspace_id, limit=limit, offset=offset)
+                reports = [r for r in reports if not self._is_expired_trial_result(conn, r.get("job_id"))]   # D-112: 7-day Trial history
                 for report in reports:
                     report.pop("storage_ref", None)  # never a raw storage path - see module docstring.
                 self._send_json(200, {"ok": True, "reports": reports, "limit": limit, "offset": offset})
@@ -1487,8 +1535,11 @@ def make_handler(
                     # indistinguishable from a nonexistent one.
                     self._send_json(404, {"ok": False, "error": "not found"})
                     return
+                gate = self._trial_result_gate(conn, report.get("job_id"))
+                if gate is None:
+                    return
                 storage_ref = report.pop("storage_ref", None)
-                if storage is not None and storage_ref:
+                if storage is not None and storage_ref and not gate["trial"]:   # D-112: no download URL for a Trial report
                     report["report_url"] = storage.generate_signed_url(storage_ref, expires_in_seconds=_REPORT_SIGNED_URL_TTL_SECONDS)
                 self._send_json(200, {"ok": True, "report": report})
             except Exception:
@@ -1749,7 +1800,7 @@ def make_handler(
                 # loc_count.py), checked against the plan before anything
                 # is stored or queued.
                 effective_loc = loc_count.submission_effective_loc(source)
-                spec = plans.PLANS.get(entitlement["plan"])
+                spec = plans.plan_spec(entitlement["plan"])   # D-112: includes the Trial (500 effective LOC per scan)
                 if effective_loc <= 0:
                     self._send_json(422, {"ok": False, "error": "no_source_code", "detail": "no Solidity/Vyper source code found", "effective_loc": 0})
                     return
@@ -1758,6 +1809,10 @@ def make_handler(
                                           "max_loc_per_scan": spec["max_loc_per_scan"]})
                     return
                 usage = repo.usage_summary(conn, workspace_id, entitlement) or {}
+                if usage.get("usage_model") == plans.USAGE_TRIAL and usage.get("scans_available", 0) <= 0:
+                    self._send_json(402, {"ok": False, "error": "trial_already_used", "effective_loc": effective_loc,
+                                          "detail": "the free Trial includes exactly one scan and it has already been used"})
+                    return
                 if usage.get("usage_model") == plans.USAGE_SCAN_CREDIT and usage.get("scans_available", 0) <= 0:
                     self._send_json(402, {"ok": False, "error": "no_scan_credit", "detail": "no unused Quick scan is available", "effective_loc": effective_loc})
                     return
@@ -1849,6 +1904,160 @@ def make_handler(
                 conn.close()
 
 
+
+        # -------------------------------------------------------------
+        # Sign-up and free Trial (D-112) - see backend/trial.py. Sign-up
+        # only sends a verification link; verifying it (the existing
+        # single-use magic-link token) grants the Trial. Every rule is
+        # decided here, in the backend.
+        # -------------------------------------------------------------
+        def _handle_signup(self) -> None:
+            if self._reject_if_cross_origin():
+                return
+            raw, err_status, err_msg = self._read_body()
+            if err_status:
+                self._send_json(err_status, {"ok": False, "error": err_msg})
+                return
+            content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            is_form = content_type == "application/x-www-form-urlencoded"
+            try:
+                if is_form:
+                    email_value = (parse_qs(raw.decode("utf-8")).get("email") or [None])[0]
+                else:
+                    payload = json.loads(raw.decode("utf-8"))
+                    email_value = payload.get("email") if isinstance(payload, dict) else None
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_json(400, {"ok": False, "error": "request body is not valid UTF-8 JSON"})
+                return
+
+            def refuse(status: int, code: str, title: str, detail: str) -> None:
+                if is_form:
+                    self._send_html(status, _render_signup_page(title, detail))
+                else:
+                    self._send_json(status, {"ok": False, "error": code, "detail": detail})
+
+            host = self.headers.get("Host", "")
+            if host.split(":")[0] not in host_allowlist:
+                refuse(400, "unrecognized host", "Sign-up failed", "Unrecognized host.")
+                return
+            try:
+                normalized = email_policy.normalize_email(email_value)
+            except auth.AuthError:
+                refuse(400, "invalid_email", "Check your email address", "Enter a valid email address.")
+                return
+            if trial_policy.is_disposable(normalized):
+                # Deterministic and checked BEFORE any token or email exists:
+                # no account, no link, no Trial for this address.
+                refuse(422, "disposable_email_not_allowed", "Use another email address", trial.NOT_ELIGIBLE_DETAIL)
+                return
+            conn = connect_fn()
+            try:
+                token = auth.request_magic_link(conn, normalized, self._client_ip(), purpose="signup")
+            except auth.RateLimitExceeded:
+                alerting.emit_safe(alert_sender, alerting.EVENT_AUTH_RATE_LIMIT, "warning", {"ip": self._client_ip()})
+                refuse(429, "signup_rate_limited", "Please wait", "Too many requests. Please wait a few minutes and try again.")
+                return
+            except auth.AuthError:
+                refuse(400, "invalid_email", "Check your email address", "Enter a valid email address.")
+                return
+            except Exception:
+                refuse(500, "internal error", "Sign-up failed", "Something went wrong. Please try again.")
+                return
+            finally:
+                conn.close()
+            scheme = "https" if secure_cookies else "http"
+            verify_url = "%s://%s/auth/verify?token=%s&redirect=%s" % (scheme, host, quote(token), quote("/app#/dashboard", safe=""))
+            try:
+                email_sender.send(normalized, "Verify your email for Vericexa",
+                                  "Confirm your email address to start your free Vericexa Trial (link expires in 15 minutes): %s" % verify_url)
+            except Exception as exc:
+                alerting.emit_safe(alert_sender, alerting.EVENT_EMAIL_DELIVERY_FAILURE, "error", {"ip": self._client_ip(), "error_type": type(exc).__name__})
+            # Same answer whether or not an account already exists for this
+            # address (anti-enumeration, like /auth/request-link).
+            if is_form:
+                self._send_html(200, _render_signup_page("Check your email", SIGNUP_SENT_MESSAGE))
+            else:
+                self._send_json(200, {"ok": True, "message": SIGNUP_SENT_MESSAGE})
+
+        def _grant_trial_after_signup(self, conn: Any, user_id: str) -> None:
+            """A verified sign-up link: grant the Trial when eligible. A
+            refusal (already used, not eligible) never blocks the sign-in;
+            the app shows the Trial state from GET /trial."""
+            try:
+                user = repo.get_user(conn, user_id)
+                if user is not None:
+                    trial.grant_for_user(conn, user, trial_policy)
+            except trial.TrialError:
+                pass
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+
+        def _handle_trial_status(self) -> None:
+            conn = connect_fn()
+            try:
+                user_id = self._current_user_id(conn)
+                if user_id is None:
+                    self._send_json(401, {"ok": False, "error": "authentication required"})
+                    return
+                user = repo.get_user(conn, user_id)
+                self._send_json(200, {"ok": True, "trial": trial.status_for_user(conn, user, trial_policy)})
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
+
+        def _handle_trial_activate(self) -> None:
+            if self._reject_if_cross_origin():
+                return
+            _, err_status, err_msg = self._read_body()
+            if err_status:
+                self._send_json(err_status, {"ok": False, "error": err_msg})
+                return
+            conn = connect_fn()
+            try:
+                user_id = self._current_user_id(conn)
+                if user_id is None:
+                    self._send_json(401, {"ok": False, "error": "authentication required"})
+                    return
+                try:
+                    workspace_id = trial.grant_for_user(conn, repo.get_user(conn, user_id), trial_policy)
+                except trial.TrialError as exc:
+                    self._send_json(exc.http_status, {"ok": False, "error": exc.code, "detail": exc.detail})
+                    return
+                self._send_json(200, {"ok": True, "workspace_id": workspace_id})
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
+
+        def _is_expired_trial_result(self, conn: Any, job_id: Optional[str]) -> bool:
+            usage = repo.get_job_usage(conn, job_id) if job_id else None
+            if not usage or usage.get("plan") != plans.PLAN_TRIAL:
+                return False
+            job = repo.get_job(conn, job_id) or {}
+            created = repo._parse_iso(job.get("created_at"))
+            return created is not None and created < repo._parse_iso(trial.history_cutoff())
+
+        def _trial_result_gate(self, conn: Any, job_id: Optional[str], refuse_download: bool = False) -> Optional[Dict[str, bool]]:
+            """{"trial": bool} for a job/report the caller may already see,
+            or None after a refusal: a Trial scan older than the Trial's
+            7-day history (410), or a download of a Trial report (403).
+            Decided by the plan the scan was ADMITTED under (job_usage), so
+            a later upgrade never re-opens a Trial result's limits."""
+            usage = repo.get_job_usage(conn, job_id) if job_id else None
+            if not usage or usage.get("plan") != plans.PLAN_TRIAL:
+                return {"trial": False}
+            if self._is_expired_trial_result(conn, job_id):
+                self._send_json(410, {"ok": False, "error": "trial_history_expired", "detail": "Trial results are kept for %d days" % plans.TRIAL["history_days"]})
+                return None
+            if refuse_download:
+                self._send_json(403, {"ok": False, "error": "feature_not_available", "feature": "report_download", "plan": plans.PLAN_TRIAL,
+                                      "detail": "Report downloads are not included in the free Trial"})
+                return None
+            return {"trial": True}
 
         # -------------------------------------------------------------
         # Private GitHub (D-111) - Standard/Pro only, enforced HERE (the
@@ -2188,7 +2397,14 @@ def make_handler(
             """Display data for the plan catalog (D-110): backend/plans.py
             only - never a Stripe Price ID, never a rule the browser
             enforces (checkout and admission stay server-side)."""
-            catalog = []
+            spec = plans.TRIAL   # D-112: shown, never sold - no checkout, no portal, no Stripe price
+            catalog = [{"plan": plans.PLAN_TRIAL, "display_name": spec["display_name"], "billing_type": spec["billing_type"], "usage_model": spec["usage_model"],
+                        "max_loc_per_scan": spec["max_loc_per_scan"], "monthly_loc_quota": None, "scans_per_purchase": None,
+                        "scans_per_email": spec["scans_per_email"], "max_projects": spec["max_projects"], "max_members": spec["max_members"],
+                        "queue_priority": spec["queue_priority"], "priority_support": spec["priority_support"], "history_days": spec["history_days"],
+                        "report_downloads": spec["report_downloads"], "allowed_modes": sorted(plans.PLAN_ALLOWED_MODES[plans.PLAN_TRIAL]),
+                        "features": sorted(plans.PLAN_FEATURES[plans.PLAN_TRIAL]), "checkout": False,
+                        "prices": [{"interval": "free", "amount_cents": 0, "currency": "usd", "service_months": None}]}]
             for name in plans.PLANS_ORDER:
                 spec = plans.PLANS[name]
                 prices = [{"interval": mode["interval"], "amount_cents": mode["amount_cents"], "currency": mode["currency"], "service_months": mode["service_months"]}
@@ -2239,6 +2455,9 @@ def make_handler(
                 report = self._load_report_for(conn, workspace_id, report_id)
                 if report is None:
                     return
+                gate = self._trial_result_gate(conn, report.get("job_id"))
+                if gate is None:
+                    return
                 ref = report.pop("storage_ref", None)
                 purged = report.get("purged_at") is not None
                 job = repo.get_job(conn, report["job_id"]) or {}
@@ -2251,10 +2470,10 @@ def make_handler(
                     content = {
                         "scored_report": self._storage_json(object_storage.report_json_key(ref)),
                         "markdown": markdown.decode("utf-8", "replace") if markdown is not None else None,
-                        "advisory": self._storage_json(ref + targeted_review.OBJECT_SUFFIX),
+                        "advisory": None if gate["trial"] else self._storage_json(ref + targeted_review.OBJECT_SUFFIX),   # D-112: no Layer 2 in the Trial
                     }
                 self._send_json(200, dict({
-                    "ok": True, "report": report, "purged": purged,
+                    "ok": True, "report": report, "purged": purged, "trial": gate["trial"], "downloads": not gate["trial"],
                     "job": {k: job.get(k) for k in ("id", "status", "mode", "created_at", "started_at", "completed_at")},
                     "source": {"kind": contract.get("source_kind"), "name": contract.get("name"), "project_id": contract.get("project_id"),
                                "project_name": project.get("name") if project else None,
@@ -2274,6 +2493,8 @@ def make_handler(
             try:
                 report = self._load_report_for(conn, workspace_id, report_id)
                 if report is None:
+                    return
+                if self._trial_result_gate(conn, report.get("job_id"), refuse_download=True) is None:
                     return
                 ref = report.get("storage_ref")
                 if report.get("purged_at") is not None or not ref:
@@ -2354,8 +2575,21 @@ def make_handler(
             try:
                 if self._project_scope(conn, workspace_id) is None:
                     return
+                # D-112: a plan that defines a project ceiling (only the
+                # Trial: 1) creates under the per-workspace lock, so the
+                # ceiling holds under concurrency; Quick/Standard/Pro define
+                # none and keep the unchanged create_project() path.
+                entitlement = repo.get_entitlement_by_workspace(conn, workspace_id)
+                spec = plans.plan_spec(entitlement["plan"]) if entitlement is not None and entitlement["status"] in ("active", "trialing") else None
                 try:
-                    project_id = repo.create_project(conn, workspace_id, name)
+                    if spec is not None and spec["max_projects"] is not None:
+                        project_id = repo.create_project_capped(conn, workspace_id, name, spec["max_projects"])
+                    else:
+                        project_id = repo.create_project(conn, workspace_id, name)
+                except repo.ProjectLimitError:
+                    self._send_json(409, {"ok": False, "error": "project_limit_reached", "max_projects": spec["max_projects"],
+                                          "detail": "the %s plan includes %d project" % (spec["display_name"], spec["max_projects"])})
+                    return
                 except repo.ProjectNameTakenError:
                     self._send_json(409, {"ok": False, "error": "project_name_taken"})
                     return
@@ -2448,6 +2682,8 @@ def make_handler(
                 if job is None or job["workspace_id"] != workspace_id:
                     self._send_json(404, {"ok": False, "error": "not found"})
                     return
+                if self._trial_result_gate(conn, job_id) is None:
+                    return
                 contract = repo.get_contract(conn, job["contract_id"]) or {}
                 source = {"kind": contract.get("source_kind", "single"), "project_id": contract.get("project_id"), "name": contract.get("name"),
                           "files": repo.list_contract_files(conn, workspace_id, job["contract_id"]),
@@ -2508,7 +2744,7 @@ def make_handler(
                 if existing is not None and existing["plan"] in _SUBSCRIPTION_PLANS and existing["status"] in ("active", "trialing"):
                     self._send_json(409, {"ok": False, "error": "this workspace already has an active subscription"})
                     return
-                if plan == plans.PLAN_QUICK and (repo.usage_summary(conn, workspace_id, existing) or {}).get("scans_available", 0) > 0:
+                if plan == plans.PLAN_QUICK and existing is not None and existing["plan"] == plans.PLAN_QUICK and (repo.usage_summary(conn, workspace_id, existing) or {}).get("scans_available", 0) > 0:
                     self._send_json(409, {"ok": False, "error": "this workspace already has an unused Quick scan"})
                     return
                 scheme = "https" if secure_cookies else "http"
@@ -2735,12 +2971,13 @@ def run_server(
     max_pending_jobs_per_workspace: int = repo.DEFAULT_MAX_PENDING_JOBS_PER_WORKSPACE,
     submit_rate_limit_per_window: int = repo.DEFAULT_SUBMIT_RATE_LIMIT_PER_WINDOW,
     github: Optional["github_integration.GitHubIntegration"] = None,
+    disposable_policy: Optional["email_policy.DisposableDomainPolicy"] = None,
 ) -> ThreadingHTTPServer:
     in_flight = _InFlightTracker()
     handler_cls = make_handler(
         connect_fn, email_sender, host_allowlist, secure_cookies, billing, storage, alert_sender, in_flight,
         black_friday_enabled, black_friday_start, black_friday_end, black_friday_promotion_code_id,
-        max_pending_jobs_per_workspace, submit_rate_limit_per_window, github,
+        max_pending_jobs_per_workspace, submit_rate_limit_per_window, github, disposable_policy,
     )
     server = ThreadingHTTPServer((host, port), handler_cls)
     server.in_flight_tracker = in_flight  # see get_in_flight_count() and _InFlightTracker's own docstring.

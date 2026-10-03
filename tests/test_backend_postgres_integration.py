@@ -122,7 +122,7 @@ class MigrationIntegrationTests(unittest.TestCase):
         self.conn, self.applied = _reset_database_and_migrate()
         self.addCleanup(self.conn.close)
 
-    def test_fresh_database_applies_all_twelve_migrations_in_order(self):
+    def test_fresh_database_applies_all_thirteen_migrations_in_order(self):
         # 0002_auth_tokens.sql (Phase 2), 0003_entitlement_status_expand.sql
         # and 0004_entitlement_event_provenance.sql (Phase 3),
         # 0005_job_queue_hardening.sql (Phase 4, D-079),
@@ -132,7 +132,8 @@ class MigrationIntegrationTests(unittest.TestCase):
         # post reap-atomicity-fix and worker-fencing hardening) and
         # 0009_commercial_usage.sql (D-107), 0010_commercial_guards.sql
         # (D-108), 0011_contract_files.sql (D-109) and
-        # 0012_github_connections.sql (D-111) added alongside
+        # 0012_github_connections.sql (D-111) and 0013_trial.sql (D-112)
+        # added alongside
         # 0001_initial_schema.sql (Phase 1).
         self.assertEqual(
             self.applied,
@@ -140,7 +141,7 @@ class MigrationIntegrationTests(unittest.TestCase):
                 "0001_initial_schema", "0002_auth_tokens", "0003_entitlement_status_expand",
                 "0004_entitlement_event_provenance", "0005_job_queue_hardening", "0006_retention_purge",
                 "0007_billing_interval", "0008_queue_fairness", "0009_commercial_usage",
-                "0010_commercial_guards", "0011_contract_files", "0012_github_connections",
+                "0010_commercial_guards", "0011_contract_files", "0012_github_connections", "0013_trial",
             ],
         )
 
@@ -163,7 +164,7 @@ class MigrationIntegrationTests(unittest.TestCase):
             seen_statuses.add(repo.get_entitlement_by_workspace(self.conn, workspace_id)["status"])
         self.assertEqual(seen_statuses, {"incomplete_expired", "unpaid"})
 
-    def test_all_twenty_four_tables_exist(self):
+    def test_all_twenty_five_tables_exist(self):
         cur = db.execute(
             self.conn,
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
@@ -179,6 +180,7 @@ class MigrationIntegrationTests(unittest.TestCase):
             "technical_budget_periods", "submit_attempts",  # D-108, 0010_commercial_guards.sql.
             "contract_files",  # D-109, 0011_contract_files.sql.
             "github_connections", "github_oauth_states", "contract_git_sources",  # D-111, 0012_github_connections.sql.
+            "trial_grants",  # D-112, 0013_trial.sql.
         }
         self.assertEqual(tables, expected)
 
@@ -799,6 +801,102 @@ class ProjectsMultiFileIntegrationTests(unittest.TestCase):
         repo.enqueue_job(self.conn, self.ws, loose, self.user_id, "quick", idempotency_key=repo.scoped_idempotency_key(self.other, "k"))
         self.assertEqual([j["id"] for j in repo.list_jobs_by_workspace(self.conn, self.ws, project_id=pid)], [in_project])
         self.assertEqual(repo.list_jobs_by_workspace(self.conn, self.other, project_id=pid), [])
+
+
+class TrialIntegrationTests(unittest.TestCase):
+    """D-112 against a REAL Postgres server: 0013's rewritten CHECK
+    constraints (plan 'trial', usage model 'trial'), one Trial per
+    normalized email under real concurrency, the Trial scan reservation and
+    its settlement, the sign-up token purpose, and that the grant record
+    survives the account."""
+
+    def setUp(self):
+        self.conn, _ = _reset_database_and_migrate()
+        self.addCleanup(self.conn.close)
+        self.user_id = repo.create_user(self.conn, "d112-%s@example.com" % repo.new_id())
+        self.email = repo.get_user(self.conn, self.user_id)["email"]
+
+    def test_grant_reserve_settle_and_constraints(self):
+        ws = repo.grant_trial(self.conn, self.email, self.user_id)
+        with self.assertRaises(repo.TrialAlreadyGrantedError):
+            repo.grant_trial(self.conn, self.email, self.user_id)
+        self.assertEqual(db.execute(self.conn, "SELECT COUNT(*) AS n FROM workspaces").fetchone()["n"], 1)
+        ent = repo.get_entitlement_by_workspace(self.conn, ws)
+        self.assertEqual((ent["plan"], ent["status"]), ("trial", "active"))
+        contract = repo.create_contract(self.conn, ws, "s3://x", "h", "n")
+        job = repo.enqueue_job_with_usage(self.conn, ws, contract, self.user_id, "quick", None, ent, 500)
+        self.assertEqual(repo.get_job_usage(self.conn, job)["usage_model"], "trial")
+        with self.assertRaises(repo.UsageLimitError) as ctx:
+            repo.enqueue_job_with_usage(self.conn, ws, repo.create_contract(self.conn, ws, "s3://y", "h", "n"), self.user_id, "quick", None, ent, 10)
+        self.assertEqual(ctx.exception.code, "trial_already_used")
+        with self.assertRaises(repo.UsageLimitError) as ctx:
+            repo.enqueue_job_with_usage(self.conn, ws, contract, self.user_id, "quick", None, ent, 501)
+        self.assertEqual(ctx.exception.code, "loc_per_scan_limit_exceeded")
+        claimed = repo.claim_next_job(self.conn, "w")
+        repo.finalize_job_attempt(self.conn, job, ws, claimed["attempt_count"], "w", "claimed", "running")
+        repo.finalize_job_attempt(self.conn, job, ws, claimed["attempt_count"], "w", "running", "succeeded",
+                                  report_storage_ref="reports/x", report_score_status="computed", report_score=90, report_risk_band="LOW")
+        grant = repo.get_trial_grant(self.conn, self.email)
+        self.assertEqual((grant["status"], str(grant["job_id"])), ("consumed", job))
+        with self.assertRaises(db.integrity_error_class(self.conn)):     # the email key is stored normalized only
+            db.execute(self.conn, "INSERT INTO trial_grants (normalized_email, workspace_id, status, granted_at, updated_at) VALUES (?, ?, 'available', now(), now())",
+                       ("Upper@Example.com", ws))
+        self.conn.rollback()
+        token = auth.request_magic_link(self.conn, "signup-%s@example.com" % repo.new_id(), "127.0.0.1", purpose="signup")
+        session = auth.consume_token_and_create_session(self.conn, token)
+        self.assertEqual(session["purpose"], "signup")
+        # The record outlives the account: the users row may go, the grant stays.
+        db.execute(self.conn, "UPDATE users SET email = ? WHERE id = ?", ("deleted-%s@invalid.example" % self.user_id, self.user_id))
+        self.conn.commit()
+        again = repo.create_user(self.conn, self.email)
+        with self.assertRaises(repo.TrialAlreadyGrantedError):
+            repo.grant_trial(self.conn, self.email, again)
+
+    def test_concurrent_trial_project_creations_yield_exactly_one(self):
+        ws = repo.grant_trial(self.conn, self.email, self.user_id)
+        results, barrier = [], threading.Barrier(6)
+
+        def attempt(i):
+            conn = db.connect_postgres(DSN)
+            try:
+                barrier.wait()
+                repo.create_project_capped(conn, ws, "P%d" % i, 1)
+                results.append("ok")
+            except repo.ProjectLimitError:
+                results.append("limit")
+            except Exception as exc:   # pragma: no cover
+                results.append(repr(exc))
+            finally:
+                conn.close()
+
+        threads = [threading.Thread(target=attempt, args=(i,)) for i in range(6)]
+        [th.start() for th in threads]
+        [th.join(30) for th in threads]
+        self.assertEqual(sorted(results), ["limit"] * 5 + ["ok"])
+        self.assertEqual(db.execute(self.conn, "SELECT COUNT(*) AS n FROM projects WHERE workspace_id = ?", (ws,)).fetchone()["n"], 1)
+
+    def test_concurrent_grants_yield_exactly_one(self):
+        results, barrier = [], threading.Barrier(6)
+
+        def attempt():
+            conn = db.connect_postgres(DSN)
+            try:
+                barrier.wait()
+                repo.grant_trial(conn, self.email, self.user_id)
+                results.append("ok")
+            except repo.TrialAlreadyGrantedError:
+                results.append("refused")
+            except Exception as exc:   # pragma: no cover
+                results.append(repr(exc))
+            finally:
+                conn.close()
+
+        threads = [threading.Thread(target=attempt) for _ in range(6)]
+        [th.start() for th in threads]
+        [th.join(30) for th in threads]
+        self.assertEqual(sorted(results), ["ok"] + ["refused"] * 5)
+        self.assertEqual(db.execute(self.conn, "SELECT COUNT(*) AS n FROM entitlements WHERE plan = 'trial'").fetchone()["n"], 1)
+        self.assertEqual(db.execute(self.conn, "SELECT COUNT(*) AS n FROM workspaces").fetchone()["n"], 1)
 
 
 class GitHubConnectionsIntegrationTests(unittest.TestCase):

@@ -68,6 +68,14 @@ Optional: with none of the four required variables set the feature is unconfigur
 | `GITHUB_TOKEN_ENCRYPTION_KEY` | Base64 of at least 32 random bytes; encrypts the stored GitHub user tokens (`backend/github_integration.TokenCipher`). Changing it makes every existing connection require a reconnect. | All four or none | **Yes** | - |
 | `GITHUB_APP_SLUG` | The App's URL slug, used only for the "Choose repositories on GitHub" link. | No | No | - |
 
+## Free Trial and sign-up (ROLE=web, D-112)
+
+| Variable | Purpose | Required? | Secret? | Default |
+|---|---|---|---|---|
+| `DISPOSABLE_EMAIL_DOMAINS_FILE` | Optional path to an operator-maintained list of disposable/temporary email domains (one per line, `#` comments), ADDED to the bundled `backend/data/disposable_email_domains.txt`. Addresses on these domains (and their subdomains) cannot sign up for, or be granted, the free Trial; paid plans and ordinary sign-in are unaffected. Unreadable file → startup error. | No | No | - |
+
+The Trial needs no other configuration: no Stripe price, no checkout, no portal. Sign-up verification links use the existing email sender (`EMAIL_SENDER_MODE`).
+
 ## Black Friday campaign (ROLE=web, Phase 7, D-086)
 
 | Variable | Purpose | Required? | Default |

@@ -133,6 +133,48 @@ PLAN_ALLOWED_MODES = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Trial (D-112): a free, NON-Stripe entitlement - never sold, never in
+# PLANS/PRICE_MODES (the paid catalog above is unchanged), never a
+# subscription or a Quick credit. Granted once per NORMALIZED EMAIL, for
+# ever (backend/trial.py, trial_grants), after email verification: one scan
+# of at most 500 effective LOC, one project, Layer 1 only, a viewable report
+# kept 7 days, no downloads, no Layer 2, no Private GitHub.
+# ---------------------------------------------------------------------------
+
+PLAN_TRIAL = "trial"
+BILLING_FREE = "free"
+USAGE_TRIAL = "trial"   # one scan per email, ever; released (not burnt) if the scan fails
+
+TRIAL: Dict[str, object] = {
+    "display_name": "Trial",
+    "billing_type": BILLING_FREE,
+    "usage_model": USAGE_TRIAL,
+    "max_loc_per_scan": 500,
+    "scans_per_purchase": None,
+    "scans_per_email": 1,
+    "monthly_loc_quota": None,
+    "max_projects": 1,
+    "max_members": None,        # not defined for the Trial
+    "queue_priority": "normal",
+    "priority_support": False,
+    "history_days": 7,
+    "report_downloads": False,
+    "layer2": False,
+}
+
+
+def plan_spec(plan_name: Optional[str]) -> Optional[Dict[str, object]]:
+    """The spec of any entitlement plan the backend admits - the three paid
+    plans or the Trial - else None."""
+    if plan_name == PLAN_TRIAL:
+        return TRIAL
+    return PLANS.get(plan_name or "")
+
+
+PLAN_ALLOWED_MODES[PLAN_TRIAL] = frozenset({"quick"})
+
+
 # Plan -> product features beyond scan limits (D-111). Private GitHub is a
 # Standard/Pro feature; Quick keeps every other input (single file,
 # multi-file, ZIP). Only features that exist are listed - GitHub Actions and
@@ -140,6 +182,7 @@ PLAN_ALLOWED_MODES = {
 # backend (backend/http_app.py), never only by the UI.
 FEATURE_PRIVATE_GITHUB = "private_github"
 PLAN_FEATURES = {
+    PLAN_TRIAL: frozenset(),    # D-112: no Private GitHub (nor API/Actions)
     PLAN_QUICK: frozenset(),
     PLAN_STANDARD: frozenset({FEATURE_PRIVATE_GITHUB}),
     PLAN_PRO: frozenset({FEATURE_PRIVATE_GITHUB}),

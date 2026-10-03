@@ -131,7 +131,10 @@ def check_rate_limit(conn: Any, email: str, ip: Optional[str]) -> None:
             raise RateLimitExceeded("too many login requests from this address - try again later")
 
 
-def request_magic_link(conn: Any, email: Any, ip: Optional[str] = None) -> str:
+TOKEN_PURPOSES = ("login", "signup")   # D-112: verifying a "signup" link is what grants the free Trial
+
+
+def request_magic_link(conn: Any, email: Any, ip: Optional[str] = None, purpose: str = "login") -> str:
     """Normalizes, rate-limits, then always creates a token row and
     returns the RAW token - regardless of whether an account with this
     email exists yet (anti-enumeration: identical work and identical
@@ -139,7 +142,13 @@ def request_magic_link(conn: Any, email: Any, ip: Optional[str] = None) -> str:
     response whether or not this raises for a bad address, never
     revealing account existence - see backend/http_app.py). The caller
     (HTTP layer) is responsible for emailing the raw token inside a
-    verify link; this function never logs or persists it anywhere."""
+    verify link; this function never logs or persists it anywhere.
+
+    purpose (D-112) is "login" (default, every existing caller) or
+    "signup"; the same per-email/per-IP limit covers both, so re-sending a
+    sign-up verification is rate limited exactly like a login link."""
+    if purpose not in TOKEN_PURPOSES:
+        raise AuthError("unknown token purpose")
     normalized = normalize_email(email)
     check_rate_limit(conn, normalized, ip)
     token = _generate_opaque_token()
@@ -148,8 +157,8 @@ def request_magic_link(conn: Any, email: Any, ip: Optional[str] = None) -> str:
     expires_at = (now + timedelta(seconds=TOKEN_TTL_SECONDS)).isoformat()
     db.execute(
         conn,
-        "INSERT INTO auth_tokens (id, email, token_hash, requested_ip, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (repo.new_id(), normalized, token_hash, ip, now.isoformat(), expires_at),
+        "INSERT INTO auth_tokens (id, email, token_hash, requested_ip, created_at, expires_at, purpose) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (repo.new_id(), normalized, token_hash, ip, now.isoformat(), expires_at, purpose),
     )
     conn.commit()
     return token
@@ -202,13 +211,17 @@ def consume_token_and_create_session(conn: Any, token: str) -> Optional[Dict[str
         if cur.rowcount == 0:
             conn.rollback()
             return None
-        cur = db.execute(conn, "SELECT email FROM auth_tokens WHERE token_hash = ?", (token_hash,))
-        email = db.normalize_row(cur.fetchone())["email"]
+        cur = db.execute(conn, "SELECT email, purpose FROM auth_tokens WHERE token_hash = ?", (token_hash,))
+        token_row = db.normalize_row(cur.fetchone())
+        email = token_row["email"]
         user = repo.get_user_by_email(conn, email)
         user_id = user["id"] if user is not None else repo.create_user(conn, email)
         repo.mark_email_verified(conn, user_id)
         session = create_session(conn, user_id)
         conn.commit()
+        # D-112: who verified and why - the HTTP layer grants the Trial for a
+        # verified "signup" link. Never the raw token.
+        session.update({"email": email, "purpose": token_row["purpose"]})
         return session
     except Exception:
         conn.rollback()

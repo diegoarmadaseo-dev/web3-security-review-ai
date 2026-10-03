@@ -72,7 +72,16 @@
     invalid_repository_id: "Choose a repository.",
     invalid_ref: "Choose a branch.",
     invalid_commit_sha: "The commit SHA is not valid.",
-    invalid_github_source: "The GitHub selection is not valid."
+    invalid_github_source: "The GitHub selection is not valid.",
+    // D-112 free Trial and sign-up
+    trial_already_used: "This email address has already used its free Trial. Choose Quick, Standard or Pro to keep scanning.",
+    trial_not_eligible: "This email address is not eligible for the free Trial.",
+    email_not_verified: "Verify your email address to start the free Trial.",
+    project_limit_reached: "Your plan's project limit is reached.",
+    trial_history_expired: "Trial results are kept for 7 days and this one is no longer available.",
+    disposable_email_not_allowed: "This email address is not eligible for the free Trial. Please use a personal or work email address.",
+    signup_rate_limited: "Too many requests. Please wait a few minutes and try again.",
+    invalid_email: "Enter a valid email address."
   };
   // Outcome word the backend appends after GitHub's authorization redirect.
   var GITHUB_CALLBACK = {
@@ -103,6 +112,7 @@
     if (body && typeof body.max_loc_per_scan === "number") { details.push("Plan limit per scan: " + formatNumber(body.max_loc_per_scan) + " effective LOC"); }
     if (body && typeof body.loc_remaining === "number") { details.push("Remaining this service month: " + formatNumber(body.loc_remaining) + " effective LOC"); }
     if (body && typeof body.max_pending_jobs === "number") { details.push("Limit: " + body.max_pending_jobs + " scans queued or running"); }
+    if (body && typeof body.max_projects === "number") { details.push("Projects included: " + body.max_projects); }
     if (body && typeof body.retry_after_seconds === "number") { details.push("Try again in " + body.retry_after_seconds + " s"); }
     return { code: code, message: message, details: details };
   }
@@ -114,6 +124,7 @@
 
   function formatMoney(cents, currency) {
     if (typeof cents !== "number") { return "-"; }
+    if (cents === 0) { return "$0"; }
     var whole = Math.floor(cents / 100), rest = String(cents % 100);
     return (currency === "usd" ? "$" : "") + formatNumber(whole) + "." + (rest.length < 2 ? "0" + rest : rest) + (currency && currency !== "usd" ? " " + currency.toUpperCase() : "");
   }
@@ -138,6 +149,13 @@
     var lines = [];
     var spec = catalogEntry || {};
     var perScan = usage && typeof usage.max_loc_per_scan === "number" ? usage.max_loc_per_scan : spec.max_loc_per_scan;
+    if (spec.usage_model === "trial" || (usage && usage.usage_model === "trial")) {
+      lines.push("1 free scan per email address (no card, no subscription)");
+      if (typeof perScan === "number") { lines.push("Up to " + formatNumber(perScan) + " effective LOC"); }
+      lines.push("1 project");
+      lines.push("Report viewable for " + (spec.history_days || (usage && usage.history_days) || 7) + " days (no downloads)");
+      return lines;
+    }
     if (spec.usage_model === "scan_credit" || (usage && usage.usage_model === "scan_credit")) {
       lines.push((spec.scans_per_purchase || 1) + " scan per purchase (one-time payment, no subscription)");
     }

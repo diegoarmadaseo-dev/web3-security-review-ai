@@ -641,7 +641,7 @@ class GitHubPlanGatingTests(_GitHubHttpCase):
 
     def test_catalog_lists_the_feature_per_plan(self):
         catalog = {p["plan"]: p["features"] for p in json.loads(self.get("/billing/plans")[2])["plans"]}
-        self.assertEqual(catalog, {"quick": [], "standard": ["private_github"], "pro": ["private_github"]})
+        self.assertEqual(catalog, {"trial": [], "quick": [], "standard": ["private_github"], "pro": ["private_github"]})
         self.assertFalse(plans.plan_has_feature("quick", plans.FEATURE_PRIVATE_GITHUB))
         self.assertTrue(plans.plan_has_feature("standard", plans.FEATURE_PRIVATE_GITHUB))
         self.assertTrue(plans.plan_has_feature("pro", plans.FEATURE_PRIVATE_GITHUB))

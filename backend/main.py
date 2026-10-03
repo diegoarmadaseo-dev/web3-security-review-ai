@@ -108,6 +108,7 @@ import backend.alerting as alerting
 import backend.billing as billing_module
 import backend.db as db
 import backend.egress_proxy as egress_proxy
+import backend.email_policy as email_policy
 import backend.email_sender as email_sender_module
 import backend.github_integration as github_integration
 import backend.http_app as http_app
@@ -375,7 +376,20 @@ def _load_web_config() -> Dict[str, Any]:
     cfg.update(_load_email_config())
     cfg.update(_load_black_friday_config())
     cfg.update(_load_github_config())
+    cfg.update(_load_trial_config())
     return cfg
+
+
+def _load_trial_config() -> Dict[str, Any]:
+    """D-112: DISPOSABLE_EMAIL_DOMAINS_FILE (optional) extends the bundled
+    denylist of disposable email domains refused for the free Trial. Loaded
+    and validated here, before anything starts."""
+    extra = os.environ.get("DISPOSABLE_EMAIL_DOMAINS_FILE", "").strip() or None
+    try:
+        policy = email_policy.load_policy(extra)
+    except OSError:
+        raise ConfigError("DISPOSABLE_EMAIL_DOMAINS_FILE cannot be read")
+    return {"disposable_policy": policy}
 
 
 # D-111 Private GitHub (GitHub App user authorization). All four or none:
@@ -646,6 +660,7 @@ def run_web() -> None:
         max_pending_jobs_per_workspace=cfg["max_pending_jobs_per_workspace"],
         submit_rate_limit_per_window=cfg["submit_rate_limit_per_minute"],
         github=_build_github(cfg["github"]),
+        disposable_policy=cfg["disposable_policy"],
     )
     sys.stderr.write("backend web process listening on %s:%d (secure_cookies=%s)\n" % (cfg["host"], cfg["port"], cfg["secure_cookies"]))
     if cfg["black_friday_enabled"]:

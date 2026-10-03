@@ -237,8 +237,9 @@ class AppApiTests(_AppCase):
         self.assertEqual((status, body["user"]["email"]), (200, "me@example.com"))
         status, _, body = self.jget("/billing/plans")
         self.assertEqual(status, 200)
-        self.assertEqual([p["plan"] for p in body["plans"]], ["quick", "standard", "pro"])
-        for p in body["plans"]:
+        self.assertEqual([p["plan"] for p in body["plans"]], ["trial", "quick", "standard", "pro"])   # D-112: the free Trial is listed first, never sold
+        self.assertEqual((body["plans"][0]["checkout"], [x["amount_cents"] for x in body["plans"][0]["prices"]]), (False, [0]))
+        for p in body["plans"][1:]:
             spec = plans.PLANS[p["plan"]]
             self.assertEqual((p["max_loc_per_scan"], p["monthly_loc_quota"], p["max_projects"], p["max_members"]),
                              (spec["max_loc_per_scan"], spec["monthly_loc_quota"], spec["max_projects"], spec["max_members"]))

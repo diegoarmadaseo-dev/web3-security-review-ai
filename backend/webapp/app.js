@@ -13,7 +13,7 @@
 (function () {
   "use strict";
   var C = window.VXCore;
-  var state = { user: null, workspaces: [], wsId: null, ws: null, catalog: null, timer: null, route: 0 };
+  var state = { user: null, workspaces: [], wsId: null, ws: null, catalog: null, timer: null, route: 0, trial: null };
   var view = document.getElementById("view");
 
   // ------------------------------------------------------------------ DOM
@@ -76,6 +76,45 @@
     if (state.catalog) { return Promise.resolve(state.catalog); }
     return api("GET", "/billing/plans").then(function (d) { state.catalog = d.plans || []; return state.catalog; });
   }
+  function loadTrial() { return api("GET", "/trial").then(function (d) { state.trial = d.trial; return d.trial; }).catch(function () { state.trial = null; return null; }); }
+  // D-112: the Trial state comes from the backend (GET /trial); this only shows it.
+  function trialPanel() {
+    var t = state.trial, msg = el("div");
+    if (!t) { return null; }
+    if (t.state === "available") {
+      return el("div", { className: "alert info" }, el("strong", { text: "Your free Trial is ready. " }),
+        "One automated security review of up to " + C.formatNumber(t.max_loc_per_scan) + " effective LOC, 1 project, no card required. ",
+        el("button", { type: "button", text: "Start my free Trial", onclick: function (ev) {
+          ev.target.disabled = true;
+          api("POST", "/trial/activate", {}).then(function (d) {
+            return Promise.all([api("GET", "/workspaces"), loadTrial()]).then(function (r) {
+              state.workspaces = r[0].workspaces || []; selectWorkspace(d.workspace_id); window.location.hash = "#/dashboard"; route();
+            });
+          }).catch(function (err) { ev.target.disabled = false; clear(msg); msg.appendChild(errorBox(err)); });
+        } }), msg);
+    }
+    if (t.state === "used") {
+      return el("div", { className: "alert info" }, el("strong", { text: "This email address has already used its free Trial. " }),
+        "Choose Quick ($29.99 one-time), Standard ($199.99/month) or Pro ($289.99/month) to keep scanning. ", el("a", { href: "#/billing", text: "See plans" }));
+    }
+    if (t.state === "verification_required") {
+      return el("div", { className: "alert info", text: "Verify your email address to start the free Trial: sign out and use the link we email you." });
+    }
+    if (t.state === "not_eligible") {
+      return el("div", { className: "alert info", text: "This email address is not eligible for the free Trial. Quick, Standard and Pro are available from Billing." });
+    }
+    return null;
+  }
+  function trialCard(ws) {
+    var t = state.trial || {}, usage = ws.usage || {};
+    return el("div", { className: "card" }, el("h3", { text: "Free Trial" }),
+      el("div", { className: "big", text: usage.scans_available > 0 ? "Active" : (usage.trial_status === "reserved" ? "Scan in progress" : "Used") }),
+      el("ul", { className: "small" }, el("li", { text: "Scan remaining: " + (usage.scans_available > 0 ? "1" : "0") }),
+        el("li", { text: "Up to " + C.formatNumber(usage.max_loc_per_scan || t.max_loc_per_scan) + " effective LOC" }),
+        el("li", { text: "Email: " + (t.email_verified ? "verified" : "not verified") }),
+        el("li", { text: "Results kept " + (usage.history_days || 7) + " days, view only" })),
+      usage.scans_available > 0 ? el("a", { className: "button", href: "#/scan/new", text: "Start your Trial scan" }) : el("a", { className: "button secondary", href: "#/billing", text: "Upgrade" }));
+  }
   function catalogEntry(plan) { return (state.catalog || []).filter(function (p) { return p.plan === plan; })[0] || null; }
   function canManage() { return state.ws && ["owner", "admin"].indexOf(state.ws.workspace.membership_role) >= 0; }
 
@@ -91,7 +130,7 @@
       window.location.hash = "#/dashboard";
       route();
     });
-    Promise.all([api("GET", "/auth/me"), api("GET", "/workspaces"), catalog().catch(function () { return []; })]).then(function (r) {
+    Promise.all([api("GET", "/auth/me"), api("GET", "/workspaces"), catalog().catch(function () { return []; }), loadTrial()]).then(function (r) {
       state.user = r[0].user;
       document.getElementById("user-email").textContent = state.user.email || "";
       state.workspaces = r[1].workspaces || [];
@@ -136,7 +175,7 @@
   function newWorkspaceView() {
     var input = el("input", { type: "text", maxlength: "200", required: true, placeholder: "Workspace name" });
     var msg = el("div");
-    render(el("h1", { text: state.workspaces.length ? "New workspace" : "Create your first workspace" }),
+    render(el("h1", { text: state.workspaces.length ? "New workspace" : "Create your first workspace" }), trialPanel(),
       el("form", { className: "inline", onsubmit: function (ev) {
         ev.preventDefault();
         api("POST", "/workspaces", { name: input.value }).then(function (d) {
@@ -155,7 +194,7 @@
     var spec = catalogEntry(ent.plan) || {};
     return el("div", { className: "card" }, el("h3", { text: "Plan" }),
       el("div", { className: "big", text: spec.display_name || C.humanize(ent.plan) }),
-      el("div", { className: "muted", text: (usage && usage.billing_type === "one_time" ? "One-time purchase" : C.humanize(ent.billing_interval || "") + " subscription") + " - " + C.humanize(ent.status) }),
+      el("div", { className: "muted", text: (usage && usage.billing_type === "free" ? "Free Trial - no card, no subscription" : usage && usage.billing_type === "one_time" ? "One-time purchase" : C.humanize(ent.billing_interval || "") + " subscription") + " - " + C.humanize(ent.status) }),
       el("ul", { className: "small" }, C.planLimitLines(usage, spec).map(function (l) { return el("li", { text: l }); })));
   }
   function usageCard(usage) {
@@ -193,9 +232,10 @@
     Promise.all([loadWs(), api("GET", wsPath("/jobs?limit=5")), api("GET", wsPath("/projects?limit=5")), catalog().catch(function () { return []; })]).then(function (r) {
       if (!current(token)) { return; }
       var ws = r[0], adm = ws.admission || {};
-      render(el("h1", { text: ws.workspace.name }),
+      var isTrial = ws.entitlement && ws.entitlement.plan === "trial";
+      render(el("h1", { text: ws.workspace.name }), isTrial ? null : trialPanel(),
         el("div", { className: "actions" }, el("a", { className: "button", href: "#/scan/new", text: "New scan" }), el("a", { className: "button secondary", href: "#/projects", text: "Projects" })),
-        el("div", { className: "cards" }, planCard(ws), usageCard(ws.usage),
+        el("div", { className: "cards" }, planCard(ws), isTrial ? trialCard(ws) : usageCard(ws.usage),
           el("div", { className: "card" }, el("h3", { text: "Active scans" }), el("div", { className: "big", text: adm.pending_jobs + " / " + adm.max_pending_jobs }), el("div", { className: "muted", text: "queued or running" }))),
         el("h2", { text: "Latest scans" }), jobsTable(r[1].jobs || [], true),
         el("h2", { text: "Projects" }), (r[2].projects || []).length ? el("ul", null, r[2].projects.map(function (p) { return el("li", null, el("a", { href: "#/projects/" + p.id, text: p.name })); })) : el("p", { className: "muted", text: "No projects yet." }));
@@ -209,7 +249,8 @@
     Promise.all([loadWs(), api("GET", wsPath("/projects?limit=100"))]).then(function (r) {
       if (!current(token)) { return; }
       var projects = r[1].projects || [];
-      render(el("h1", { text: "Projects" }), el("p", { className: "muted", text: "Unlimited projects on every plan." }),
+      var maxProjects = r[0].usage && typeof r[0].usage.max_projects === "number" ? r[0].usage.max_projects : null;
+      render(el("h1", { text: "Projects" }), el("p", { className: "muted", text: maxProjects !== null ? "Your plan includes " + maxProjects + " project." : "Unlimited projects on Quick, Standard and Pro." }),
         el("form", { className: "inline", onsubmit: function (ev) {
           ev.preventDefault();
           api("POST", wsPath("/projects"), { name: input.value }).then(function () { route(); }).catch(function (err) { clear(msg); msg.appendChild(errorBox(err)); });
@@ -487,8 +528,9 @@
           el("p", { className: "small", text: computed ? C.INDICATOR_NOTE : C.NOT_COMPUTED_NOTE }),
           computed && rep.risk_band === "LOW" ? el("p", { className: "small", text: C.LOW_NOTE }) : null)),
         d.purged ? el("div", { className: "alert error", text: "The content of this report has been removed under the retention policy; its summary is kept." }) : null,
-        el("div", { className: "actions" }, s ? el("a", { className: "button secondary", href: dl + "json", download: "", text: "Download JSON" }) : null,
-          d.markdown !== null ? el("a", { className: "button secondary", href: dl + "markdown", download: "", text: "Download Markdown" }) : null),
+        d.downloads === false ? el("p", { className: "small muted", text: "Free Trial result: viewable for 7 days. Downloads are available on Quick, Standard and Pro." }) :
+          el("div", { className: "actions" }, s ? el("a", { className: "button secondary", href: dl + "json", download: "", text: "Download JSON" }) : null,
+            d.markdown !== null ? el("a", { className: "button secondary", href: dl + "markdown", download: "", text: "Download Markdown" }) : null),
         s ? [el("h2", { text: "Findings (" + (s.findings || []).length + ")" }),
           (s.findings || []).length ? C.sortFindings(s.findings).map(findingView) : el("p", { text: C.NO_FINDINGS }),
           (s.categoryCoverage || []).length ? [el("h2", { text: "Category coverage" }), el("table", null, el("tbody", null, s.categoryCoverage.map(function (c) {
@@ -525,7 +567,7 @@
     Promise.all([loadWs(), catalog()]).then(function (r) {
       if (!current(token)) { return; }
       var ws = r[0], ent = ws.entitlement, usage = ws.usage, adm = ws.admission || {};
-      var subscription = ent && ent.plan !== "quick" && ["active", "trialing", "past_due"].indexOf(ent.status) >= 0;
+      var subscription = ent && ["standard", "pro"].indexOf(ent.plan) >= 0 && ["active", "trialing", "past_due"].indexOf(ent.status) >= 0;
       function go(promise) {
         promise.then(function (d) {
           var url = C.safeExternalUrl(d.checkout_url || d.portal_url);
@@ -533,16 +575,16 @@
         }).catch(function (err) { clear(msg); msg.appendChild(errorBox(err)); });
       }
       var current_ = ent ? kv([["Plan", (catalogEntry(ent.plan) || {}).display_name || ent.plan], ["Status", C.humanize(ent.status)],
-        ["Billing", ent.plan === "quick" ? "One-time purchase" : C.humanize(ent.billing_interval || "-") + " subscription"],
-        ent.plan !== "quick" && ent.current_period_end ? ["Renews / period ends", C.formatDate(ent.current_period_end)] : null,
+        ["Billing", ent.plan === "trial" ? "Free Trial - no card, no subscription" : ent.plan === "quick" ? "One-time purchase" : C.humanize(ent.billing_interval || "-") + " subscription"],
+        subscription && ent.current_period_end ? ["Renews / period ends", C.formatDate(ent.current_period_end)] : null,
         ent.plan === "quick" && usage ? ["Quick scan", usage.scans_available > 0 ? "Available" : (usage.scans_reserved > 0 ? "In progress" : "Used")] : null])
         : el("p", { text: "No plan yet." });
       var cards = (r[1] || []).map(function (p) {
         return el("div", { className: "card" }, el("h3", { text: p.display_name }),
           el("ul", { className: "small" }, C.planLimitLines(null, p).map(function (l) { return el("li", { text: l }); })),
           p.prices.map(function (price) {
-            var label = C.formatMoney(price.amount_cents, price.currency) + (price.interval === "one_time" ? " one-time" : price.interval === "monthly" ? " / month" : " / year");
-            return el("div", { className: "actions" }, el("span", { text: label }), canManage() && adm.billing_configured && !subscription ? el("button", { type: "button", className: "secondary", text: "Choose", onclick: function () {
+            var label = C.formatMoney(price.amount_cents, price.currency) + (price.interval === "free" ? " - free, once per email" : price.interval === "one_time" ? " one-time" : price.interval === "monthly" ? " / month" : " / year");
+            return el("div", { className: "actions" }, el("span", { text: label }), p.checkout !== false && canManage() && adm.billing_configured && !subscription ? el("button", { type: "button", className: "secondary", text: "Choose", onclick: function () {
               go(api("POST", "/billing/checkout", { workspace_id: state.wsId, plan: p.plan, interval: price.interval, success_path: "/app#/billing", cancel_path: "/app#/billing" }));
             } }) : null);
           }));
