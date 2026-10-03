@@ -47,10 +47,21 @@ what the code actually reads.
 
 | Variable | Purpose | Required? | Secret? |
 |---|---|---|---|
-| `STRIPE_SECRET_KEY` | Stripe API secret key. | Yes | **Yes** |
-| `STRIPE_WEBHOOK_SECRET` | Verifies `Stripe-Signature` on `/billing/webhook`. | Yes | **Yes** |
+| `STRIPE_MODE` | D-115: `test` (Stripe Sandbox, the default) or `live`. The secret key must belong to it (`sk_test_`/`rk_test_` vs `sk_live_`/`rk_live_`) - a mismatch is a startup error - and a signed webhook event whose `livemode` differs is refused (400). Live mode is outside D-115 (`docs/stripe-billing.md`). | No | No |
+| `STRIPE_SECRET_KEY` | Stripe API secret (or restricted) key of `STRIPE_MODE`. | Yes | **Yes** |
+| `STRIPE_WEBHOOK_SECRET` | Verifies `Stripe-Signature` on `/billing/webhook`; must look like `whsec_...`. | Yes | **Yes** |
 | `STRIPE_PRICE_STANDARD_MONTHLY` / `_ANNUAL`, `STRIPE_PRICE_PRO_MONTHLY` / `_ANNUAL` | Stripe Price IDs of the 4 subscription price modes of the Launch catalog (`backend/plans.py`, D-107: Standard $199.99/month or $1,999.90/year, Pro $289.99/month or $2,899.90/year; annual = 12 service months, usage still metered per service month). Validated at startup (`price_...` shape, no ID reused). | Yes (all 4) | No |
 | `STRIPE_PRICE_QUICK_ONETIME` | Stripe Price ID of Quick ($29.99, one-time payment - Checkout `mode=payment`, never a subscription - exactly 1 scan of up to 3,000 effective LOC). Same validation as the other four. The retired D-086 variables `STRIPE_PRICE_QUICK_MONTHLY` / `_ANNUAL` are a startup error if set. | Yes | No |
+
+Webhook endpoint (D-115): register `https://<host>/billing/webhook` in the
+Stripe Dashboard of the same mode with exactly these 9 events -
+`checkout.session.completed`, `checkout.session.async_payment_succeeded`,
+`checkout.session.async_payment_failed`, `checkout.session.expired`,
+`customer.subscription.created`, `customer.subscription.updated`,
+`customer.subscription.deleted`, `invoice.paid`, `invoice.payment_failed` -
+and use that endpoint's signing secret as `STRIPE_WEBHOOK_SECRET`. The
+Customer Portal must only offer the 4 subscription Prices. Model, outcomes
+and webhook diagnosis: `docs/stripe-billing.md`.
 
 Business decisions confirmed in D-086 (prices, billing interval, Black
 Friday) are no longer open - see that entry. Still NOT in code: currency,

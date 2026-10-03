@@ -73,6 +73,28 @@ SDK (stripe==12.5.1) rather than assumed:
     authoritative path for entitlement status either way, so a skipped
     invoice event never leaves entitlements stale on its own.
 
+D-115 (Stripe billing, Sandbox-verified design - docs/stripe-billing.md):
+  * MODE: StripeBilling is built for ONE Stripe mode, "test" (Sandbox,
+    the default) or "live". The secret key must belong to that mode
+    (sk_test_/rk_test_ vs sk_live_/rk_live_) and the webhook secret must
+    look like whsec_...; a signed event whose `livemode` does not match
+    is rejected (WebhookModeMismatchError) - a Sandbox deployment never
+    acts on a live event, nor the reverse.
+  * AUTHORITATIVE STATE: webhook events are only a TRIGGER for
+    subscription state. Stripe emits several events for one change
+    within the same second, delivers them at least once and in any
+    order, and an event's `created` has one-second resolution, so it
+    cannot order them. backend/http_app.py re-reads the subscription with
+    retrieve_subscription() and applies THAT. A Quick payment is verified
+    against what was actually paid (checkout_session_line_items()).
+  * BINDING: find_checkout_session_for_subscription() returns the
+    Checkout Session that created a subscription, so a subscription is
+    only bound to the workspace whose (locally recorded) checkout created
+    it; expire_checkout_session() closes a workspace's previous open
+    session before a new one is created (no two payable Checkouts at once).
+  * The client uses a bounded network timeout (STRIPE_HTTP_TIMEOUT_SECONDS)
+    and a couple of SDK retries; Stripe API errors propagate unchanged.
+
 Stripe SDK is imported lazily/optionally, same pattern as backend/db.py's
 psycopg import - an environment that never configures billing (e.g. the
 existing test suite, or a deployment that hasn't enabled billing yet)
@@ -81,7 +103,7 @@ never needs it installed.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import stripe
@@ -93,6 +115,28 @@ import re
 import backend.plans as plans
 
 _PRICE_ID_RE = re.compile(r"^price_[A-Za-z0-9_]+$")
+
+MODE_TEST = "test"     # Stripe Sandbox / test mode - D-115's only verified mode
+MODE_LIVE = "live"
+MODES = (MODE_TEST, MODE_LIVE)
+_KEY_PREFIXES = {MODE_TEST: ("sk_test_", "rk_test_"), MODE_LIVE: ("sk_live_", "rk_live_")}
+STRIPE_HTTP_TIMEOUT_SECONDS = 20
+STRIPE_MAX_NETWORK_RETRIES = 2
+
+
+def key_mode(secret_key: Any) -> Optional[str]:
+    """"test" / "live" from a Stripe secret or restricted key's prefix, or
+    None when it is neither (never inspects more than the prefix)."""
+    if not isinstance(secret_key, str):
+        return None
+    for mode, prefixes in _KEY_PREFIXES.items():
+        if secret_key.startswith(prefixes):
+            return mode
+    return None
+
+
+def is_valid_webhook_secret(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith("whsec_") and len(value) > len("whsec_")
 
 
 def price_key(plan: str, interval: str) -> Optional[str]:
@@ -130,6 +174,11 @@ class WebhookVerificationError(BillingError):
     """The webhook payload's signature did not verify, or the payload/
     signature header was malformed - the caller (backend/http_app.py)
     must turn this into a clean 400, never process the payload."""
+
+
+class WebhookModeMismatchError(WebhookVerificationError):
+    """D-115: a correctly signed event from the other Stripe mode (a live
+    event reaching a Sandbox deployment, or the reverse). Never processed."""
 
 
 def _require_stripe() -> None:
@@ -190,6 +239,30 @@ def subscription_price_id(subscription: Dict[str, Any]) -> Optional[str]:
     return price if isinstance(price, str) and price else None
 
 
+def _object_id(value: Any) -> Optional[str]:
+    """An id field that Stripe sends either as a string or, when expanded,
+    as an object carrying `id`."""
+    if isinstance(value, dict):
+        value = value.get("id")
+    return value if isinstance(value, str) and value else None
+
+
+def subscription_customer_id(subscription: Dict[str, Any]) -> Optional[str]:
+    return _object_id(subscription.get("customer"))
+
+
+def invoice_subscription_id(invoice: Dict[str, Any]) -> Optional[str]:
+    """The subscription an invoice belongs to: top-level `subscription`
+    (older API versions; an id or an expanded object) or
+    parent.subscription_details.subscription (newer ones). None for an
+    invoice that is not a subscription invoice."""
+    value = _object_id(invoice.get("subscription"))
+    if value is None:
+        parent = invoice.get("parent") or {}
+        value = _object_id((parent.get("subscription_details") or invoice.get("subscription_details") or {}).get("subscription"))
+    return value
+
+
 def invoice_workspace_id(invoice: Dict[str, Any]) -> Optional[str]:
     """Public for the same reason as subscription_period_end() above. See
     module docstring on invoice metadata inheritance uncertainty across
@@ -208,14 +281,27 @@ class StripeBilling:
     a long-lived variable and pass into backend.http_app.make_handler()
     the same way email_sender/host_allowlist already are."""
 
-    def __init__(self, secret_key: str, webhook_secret: str, price_allowlist: Dict[str, str]) -> None:
+    def __init__(self, secret_key: str, webhook_secret: str, price_allowlist: Dict[str, str], mode: str = MODE_TEST) -> None:
         _require_stripe()
+        if mode not in MODES:
+            raise BillingError("mode must be one of %s" % (MODES,))
         if not isinstance(secret_key, str) or not secret_key:
             raise BillingError("secret_key is required")
+        # D-115: the key must belong to the configured mode. The message
+        # names only the expected prefixes - never any part of the key.
+        if key_mode(secret_key) != mode:
+            raise BillingError("the Stripe secret key does not belong to %s mode (expected a %s key)" % (mode, " or ".join(_KEY_PREFIXES[mode])))
         if not isinstance(webhook_secret, str) or not webhook_secret:
             raise BillingError("webhook_secret is required")
+        if not is_valid_webhook_secret(webhook_secret):
+            raise BillingError("the Stripe webhook secret must look like whsec_...")
         self._price_allowlist: Dict[str, str] = validate_price_allowlist(price_allowlist)
-        self._client = stripe.StripeClient(secret_key)
+        self.mode = mode
+        self._client = stripe.StripeClient(
+            secret_key,
+            max_network_retries=STRIPE_MAX_NETWORK_RETRIES,
+            http_client=stripe.new_default_http_client(timeout=STRIPE_HTTP_TIMEOUT_SECONDS),
+        )
         self._webhook_secret = webhook_secret
 
     def resolve_price_id(self, plan: str, interval: str) -> str:
@@ -301,6 +387,47 @@ class StripeBilling:
     def create_portal_session(self, customer_id: str, return_url: str) -> Dict[str, Any]:
         return self._client.billing_portal.sessions.create({"customer": customer_id, "return_url": return_url})
 
+    # -- D-115: authoritative reads (see module docstring) ---------------
+
+    def retrieve_subscription(self, subscription_id: str) -> Dict[str, Any]:
+        """The subscription's CURRENT state in Stripe. API errors propagate,
+        so the webhook answers 500 and Stripe redelivers the event."""
+        return self._client.subscriptions.retrieve(subscription_id)
+
+    def checkout_session_line_items(self, session_id: str) -> Optional[List[Tuple[Optional[str], Any]]]:
+        """[(price_id, quantity), ...] actually sold by a Checkout Session,
+        or None when Stripe reports more than one page (never the case for
+        this catalog's one-item sessions; the caller grants nothing)."""
+        listing = self._client.checkout.sessions.line_items.list(session_id, {"limit": 10})
+        if listing.get("has_more"):
+            return None
+        return [(_object_id(item.get("price")), item.get("quantity")) for item in (listing.get("data") or [])]
+
+    def find_checkout_session_for_subscription(self, subscription_id: str) -> Optional[str]:
+        """The id of the Checkout Session that created `subscription_id`, or
+        None (a subscription created any other way)."""
+        listing = self._client.checkout.sessions.list({"subscription": subscription_id, "limit": 1})
+        for session in listing.get("data") or []:
+            session_id = _object_id(session)
+            if session_id:
+                return session_id
+        return None
+
+    def expire_checkout_session(self, session_id: str) -> str:
+        """Makes sure `session_id` can no longer be paid and returns its
+        final Stripe status: "expired" (it was open and is now closed, or
+        had already expired) or "complete" (it was already paid/finished -
+        the caller must not start another checkout)."""
+        session = self._client.checkout.sessions.retrieve(session_id)
+        if session.get("status") == "open":
+            try:
+                session = self._client.checkout.sessions.expire(session_id)
+            except stripe.InvalidRequestError:
+                # Completed (or expired) between the two calls: re-read.
+                session = self._client.checkout.sessions.retrieve(session_id)
+        status = session.get("status")
+        return "complete" if status == "complete" else "expired" if status == "expired" else str(status)
+
     def verify_and_parse_webhook(self, payload: bytes, sig_header: str) -> Dict[str, Any]:
         """Verifies `payload` (the UNTOUCHED raw request body - see
         backend/http_app.py's webhook handler) against `sig_header` (the
@@ -312,9 +439,14 @@ class StripeBilling:
         if not sig_header:
             raise WebhookVerificationError("missing Stripe-Signature header")
         try:
-            return stripe.Webhook.construct_event(payload, sig_header, self._webhook_secret)
+            event = stripe.Webhook.construct_event(payload, sig_header, self._webhook_secret)
         except (ValueError, stripe.SignatureVerificationError) as exc:
             raise WebhookVerificationError(str(exc)) from exc
+        # D-115: only after the signature verified. A missing livemode is
+        # treated as a mismatch too - every real Stripe event carries it.
+        if event.get("livemode") is not (self.mode == MODE_LIVE):
+            raise WebhookModeMismatchError("event livemode does not match the configured %s mode" % self.mode)
+        return event
 
 
 def validate_price_allowlist(price_allowlist: Dict[str, str]) -> Dict[str, str]:

@@ -624,15 +624,17 @@ class TrialBillingTests(_TrialHttpCase):
         self.assertEqual(status, 200, body)                                       # an unused Trial is not an unused Quick scan
         status, _, body = self.jpost("/billing/checkout", cookie, {"workspace_id": ws, "plan": "standard", "interval": "monthly"})
         self.assertEqual(status, 200, body)
-        # Quick paid on the Trial workspace -> Quick entitlement + 1 credit.
-        http_app._apply_quick_payment(conn, {"id": "cs_test_conv", "client_reference_id": ws, "customer": "cus_conv", "metadata": {"plan": "quick", "workspace_id": ws}}, None)
+        # Quick paid on the Trial workspace -> Quick entitlement + 1 credit
+        # (D-115: what the verified Quick webhook applies).
+        self.assertEqual(repo.apply_quick_purchase(conn, ws, "cs_test_conv", "cus_conv"), "granted")
         self.assertEqual(repo.get_entitlement_by_workspace(conn, ws)["plan"], "quick")
         status, _, body = self.submit(cookie, ws, {"source": _sol(2000)})
         self.assertEqual(status, 200, body)                                       # Quick's 3,000 LOC now apply
         self.assertEqual(repo.get_job_usage(conn, body["job_id"])["usage_model"], "scan_credit")
         self.assertEqual(self.jget("/trial", cookie)[2]["trial"]["state"], "used")   # the email's Trial is gone for good
-        # A subscription event converts it again (Standard).
-        http_app._upsert_entitlement(conn, ws, "standard", "active", "cus_conv", "sub_conv", None, None, interval="monthly")
+        # A subscription converts it again (Standard) - D-115's authoritative state write.
+        self.assertEqual(repo.apply_subscription_state(conn, ws, "standard", "monthly", "active", "cus_conv", "sub_conv", None, None), "updated")
+        conn.commit()
         self.assertEqual(repo.get_entitlement_by_workspace(conn, ws)["plan"], "standard")
         self.assertEqual(self.jpost("/workspaces/%s/projects" % ws, cookie, {"name": "P1"})[0], 200)
         self.assertEqual(self.jpost("/workspaces/%s/projects" % ws, cookie, {"name": "P2"})[0], 200)   # unlimited again

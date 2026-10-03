@@ -360,6 +360,9 @@ def _load_web_config() -> Dict[str, Any]:
         "s3_region": _require_env("S3_REGION"),
         "stripe_secret_key": _require_env("STRIPE_SECRET_KEY"),
         "stripe_webhook_secret": _require_env("STRIPE_WEBHOOK_SECRET"),
+        # D-115: "test" (Stripe Sandbox, the default) or "live"; the secret
+        # key must belong to it - checked in _load_stripe_mode().
+        "stripe_mode": _load_stripe_mode(),
         # D-107: the Launch catalog's 5 price modes (backend/plans.py) ->
         # Stripe Price IDs, one required STRIPE_PRICE_* variable each.
         "stripe_price_allowlist": _load_stripe_price_allowlist(),
@@ -414,6 +417,24 @@ def _load_github_config() -> Dict[str, Any]:
         raise ConfigError(str(exc))
     return {"github": {"client_id": os.environ["GITHUB_APP_CLIENT_ID"].strip(), "client_secret": os.environ["GITHUB_APP_CLIENT_SECRET"].strip(),
                        "redirect_uri": redirect_uri, "token_key": token_key, "app_slug": os.environ.get("GITHUB_APP_SLUG", "").strip() or None}}
+
+
+def _load_stripe_mode() -> str:
+    """D-115: STRIPE_MODE (default "test" = Stripe Sandbox). The secret key
+    must belong to that mode (sk_test_/rk_test_ vs sk_live_/rk_live_) and
+    the webhook secret must look like whsec_... - a Sandbox deployment can
+    never start with a live key by mistake. Error messages never contain
+    any part of a key."""
+    mode = os.environ.get("STRIPE_MODE", billing_module.MODE_TEST).strip().lower() or billing_module.MODE_TEST
+    if mode not in billing_module.MODES:
+        raise ConfigError("STRIPE_MODE must be one of %s" % ", ".join(billing_module.MODES))
+    key = os.environ.get("STRIPE_SECRET_KEY", "")
+    if key and billing_module.key_mode(key) != mode:
+        raise ConfigError("STRIPE_SECRET_KEY does not belong to STRIPE_MODE=%s (a %s key is required)" % (mode, "test (sk_test_/rk_test_)" if mode == billing_module.MODE_TEST else "live (sk_live_/rk_live_)"))
+    secret = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+    if secret and not billing_module.is_valid_webhook_secret(secret):
+        raise ConfigError("STRIPE_WEBHOOK_SECRET must look like whsec_...")
+    return mode
 
 
 def _load_stripe_price_allowlist() -> Dict[str, str]:
@@ -576,8 +597,8 @@ def _build_github(github_cfg: Optional[Dict[str, Any]]) -> Optional[github_integ
     return github_integration.GitHubIntegration(github_integration.GitHubConfig(**github_cfg))
 
 
-def _build_billing(secret_key: str, webhook_secret: str, price_allowlist: Dict[str, str]) -> billing_module.StripeBilling:
-    return billing_module.StripeBilling(secret_key=secret_key, webhook_secret=webhook_secret, price_allowlist=price_allowlist)
+def _build_billing(secret_key: str, webhook_secret: str, price_allowlist: Dict[str, str], mode: str = billing_module.MODE_TEST) -> billing_module.StripeBilling:
+    return billing_module.StripeBilling(secret_key=secret_key, webhook_secret=webhook_secret, price_allowlist=price_allowlist, mode=mode)
 
 
 def _install_shutdown_signal_handlers(shutdown_event: threading.Event) -> None:
@@ -639,7 +660,7 @@ def _serve_until_shutdown(httpd: Any, shutdown_event: threading.Event, grace_sec
 def run_web() -> None:
     cfg = _load_web_config()
     storage = _build_storage(cfg["s3_bucket"], cfg["s3_region"])
-    billing = _build_billing(cfg["stripe_secret_key"], cfg["stripe_webhook_secret"], cfg["stripe_price_allowlist"])
+    billing = _build_billing(cfg["stripe_secret_key"], cfg["stripe_webhook_secret"], cfg["stripe_price_allowlist"], cfg["stripe_mode"])
     sender = _build_email_sender(cfg["email_sender_mode"], cfg["smtp_config"])
     alert_sender = _build_alert_sender(cfg["alert_sender_mode"], cfg["alert_webhook_url"])
 

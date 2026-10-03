@@ -151,6 +151,26 @@ class WebRoleFailFastTests(unittest.TestCase):
             with self.subTest(var=var):
                 self._assert_missing_var_fails_fast(var)
 
+    def test_stripe_mode_defaults_to_sandbox_and_rejects_a_mismatched_key(self):
+        # D-115: STRIPE_MODE=test (default) refuses a live key, and the reverse;
+        # the error never contains any part of the key.
+        with patch.dict(os.environ, _FAKE_WEB_ENV, clear=True):
+            self.assertEqual(main._load_web_config()["stripe_mode"], "test")
+        live_key = "sk_live_" + "x" * 24
+        for overrides in ({"STRIPE_SECRET_KEY": live_key}, {"STRIPE_SECRET_KEY": "rk_live_" + "y" * 24},
+                          {"STRIPE_MODE": "live"}, {"STRIPE_MODE": "production"}, {"STRIPE_SECRET_KEY": "pk_test_publishable"},
+                          {"STRIPE_WEBHOOK_SECRET": "not-a-webhook-secret"}):
+            with self.subTest(overrides=sorted(overrides)):
+                with patch.dict(os.environ, dict(_FAKE_WEB_ENV, **overrides), clear=True):
+                    with self.assertRaises(main.ConfigError) as ctx:
+                        main._load_web_config()
+                    self.assertNotIn("x" * 24, str(ctx.exception))
+                    self.assertNotIn("y" * 24, str(ctx.exception))
+        with patch.dict(os.environ, dict(_FAKE_WEB_ENV, STRIPE_SECRET_KEY="rk_test_restricted"), clear=True):
+            self.assertEqual(main._load_web_config()["stripe_mode"], "test")       # restricted Sandbox keys are fine
+        with patch.dict(os.environ, dict(_FAKE_WEB_ENV, STRIPE_MODE="live", STRIPE_SECRET_KEY=live_key), clear=True):
+            self.assertEqual(main._load_web_config()["stripe_mode"], "live")       # only with an explicit STRIPE_MODE=live
+
     def test_all_five_price_modes_are_loaded(self):
         with patch.dict(os.environ, _FAKE_WEB_ENV, clear=True):
             cfg = main._load_web_config()

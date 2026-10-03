@@ -200,7 +200,10 @@ CREATE TABLE webhook_events (
     event_type          TEXT NOT NULL,
     received_at         TEXT NOT NULL,
     processed_at        TEXT,
-    processing_error    TEXT
+    processing_error    TEXT,
+    -- D-115 (backend/migrations/0016_billing_checkout_sessions.sql's mirror):
+    -- applied / ignored / rejected + reason code, diagnostics only.
+    outcome             TEXT CHECK (outcome IS NULL OR length(outcome) <= 120)
 );
 
 -- Phase 2 (backend/migrations/0002_auth_tokens.sql's mirror - see that
@@ -426,3 +429,23 @@ CREATE TABLE contract_ci_sources (
     CHECK ((event = 'pull_request') = (pull_request_number IS NOT NULL))
 );
 CREATE INDEX idx_contract_ci_sources_workspace ON contract_ci_sources(workspace_id);
+
+-- D-115 (backend/migrations/0016_billing_checkout_sessions.sql's mirror) - every
+-- Stripe Checkout Session this backend created, bound to its workspace/user.
+CREATE TABLE billing_checkout_sessions (
+    id                      TEXT PRIMARY KEY CHECK (substr(id, 1, 3) = 'cs_'),
+    workspace_id            TEXT NOT NULL REFERENCES workspaces(id),
+    user_id                 TEXT NOT NULL REFERENCES users(id),
+    plan                    TEXT NOT NULL CHECK (plan IN ('quick', 'standard', 'pro')),
+    billing_interval        TEXT NOT NULL CHECK (billing_interval IN ('one_time', 'monthly', 'annual')),
+    price_id                TEXT NOT NULL CHECK (substr(price_id, 1, 6) = 'price_'),
+    checkout_mode           TEXT NOT NULL CHECK (checkout_mode IN ('payment', 'subscription')),
+    stripe_customer_id      TEXT,
+    stripe_subscription_id  TEXT UNIQUE,
+    status                  TEXT NOT NULL CHECK (status IN ('open', 'awaiting_payment', 'completed', 'payment_failed', 'expired')),
+    created_at              TEXT NOT NULL,
+    updated_at              TEXT NOT NULL,
+    CHECK ((checkout_mode = 'payment') = (plan = 'quick')),
+    CHECK ((billing_interval = 'one_time') = (plan = 'quick'))
+);
+CREATE INDEX idx_billing_checkout_sessions_workspace ON billing_checkout_sessions(workspace_id, status);

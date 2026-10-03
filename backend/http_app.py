@@ -82,15 +82,18 @@ docstring). A failure never poisons the connection for the recovery
 write that records it either - see the conn.rollback() call in
 _handle_billing_webhook() below and repository.mark_webhook_event_
 processed()'s docstring for the real, empirically-confirmed Postgres bug
-this closes. Separately, every entitlement update carries the triggering
-Stripe Event's own `created` timestamp through to repository.
-update_entitlement_status()/create_entitlement(), which reject a stale
-or tied update rather than blindly applying it - Stripe explicitly
-documents webhook delivery as at-least-once and NOT guaranteed in order,
-so without this an old, out-of-order event could both wrongly revoke an
-active subscriber's access and, worse, wrongly RESTORE access after a
-real cancellation (both confirmed reproducible before this fix - see
-that same audit).
+this closes. Separately, ordering: Stripe documents webhook delivery as
+at-least-once and NOT guaranteed in order. Phase 3 ordered entitlement
+updates by the event's own `created` (stale or tied = rejected); D-115
+replaced that, because Stripe emits several events for one change within
+the SAME second (a paid subscription could stay "incomplete"): every
+subscription-related event is now only a trigger to re-read the
+subscription from Stripe and apply its current state under a
+per-workspace lock (_sync_subscription()), so the newest state always
+wins whatever the delivery order, and a Quick credit is keyed by its
+Checkout Session id. Checkout webhooks only act on sessions this backend
+created for that workspace (billing_checkout_sessions); see
+docs/stripe-billing.md for the full model.
 
 SCANNER/PREFETCH SAFETY: GET /auth/verify is read-only (backend.auth.
 peek_token, never consumes) and renders a confirmation page requiring an
@@ -198,7 +201,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import cookies as http_cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -418,6 +421,8 @@ def _read_webapp_file(name: str) -> Optional[bytes]:
 # to Postgres, where a non-UUID literal would raise instead of matching
 # nothing.
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+# D-115: the shape of a real Stripe Event id (deduplication key of webhook_events).
+_STRIPE_EVENT_ID_RE = re.compile(r"^evt_[A-Za-z0-9_]{1,250}$")
 
 _MAX_WORKSPACE_NAME_LENGTH = 200
 _MAX_WORKSPACES_PER_USER = 50  # abuse-safety cap on POST /workspaces - generous for any legitimate account.
@@ -749,191 +754,218 @@ def _parse_limit_offset(qs: Dict[str, List[str]]) -> Tuple[int, int, Optional[st
     return limit, offset, None
 
 _SUBSCRIPTION_EVENT_TYPES = ("customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted")
+_INVOICE_EVENT_TYPES = ("invoice.paid", "invoice.payment_failed")
+_CHECKOUT_EVENT_TYPES = ("checkout.session.completed", "checkout.session.async_payment_succeeded",
+                         "checkout.session.async_payment_failed", "checkout.session.expired")
+# Every Stripe event type this backend acts on (docs/stripe-billing.md). Any
+# other type is recorded and answered 200 with outcome ignored:unhandled_event_type.
+HANDLED_STRIPE_EVENT_TYPES = _CHECKOUT_EVENT_TYPES + _SUBSCRIPTION_EVENT_TYPES + _INVOICE_EVENT_TYPES
 _SUBSCRIPTION_PLANS = tuple(name for name, spec in plans.PLANS.items() if spec["billing_type"] == plans.BILLING_SUBSCRIPTION)
+# D-115: for this long after a Checkout Session completed, a new checkout is
+# refused until that purchase is visible on the workspace (its webhooks
+# usually arrive within seconds) - so a customer who clicks "buy" again
+# before the first payment is applied cannot pay twice. Bounded, so a
+# purchase that was rejected (and alerted) never blocks the workspace.
+CHECKOUT_APPLY_GRACE_SECONDS = 600
+# A subscription in one of these statuses still exists in Stripe and bills:
+# checkout refuses a second one (fix the payment in the portal instead).
+_CHECKOUT_BLOCKING_STATUSES = ("active", "trialing", "past_due", "unpaid")
 
 
-def _upsert_entitlement(
-    conn: Any,
-    workspace_id: Optional[str],
-    plan: Optional[str],
-    status: str,
-    stripe_customer_id: Optional[str],
-    stripe_subscription_id: Optional[str],
-    current_period_end: Optional[str],
-    event_created_at: Optional[str],
-    interval: Optional[str] = None,
-    current_period_start: Optional[str] = None,
-) -> None:
-    """Shared by every branch of _apply_webhook_event() below that carries
-    an authoritative subscription status. Checks existence FIRST (rather
-    than branching on update_entitlement_status()'s return value, as a
-    pre-Phase-3-hardening version of this function did) because that
-    return value is now ambiguous between "no row exists yet" (must
-    create) and "a row exists but this event is stale/tied and was
-    correctly ignored" (must do nothing) - see that function's own
-    docstring on the ordering rule. Creating one on whichever event
-    happens to arrive FIRST for a given workspace also establishes this
-    row's OWN ordering baseline (event_created_at is stamped on create
-    too, not left NULL) - see module docstring on billing's "never
-    assume webhook delivery order". A plan-less event with no existing
-    row to update (should never happen for a session/subscription this
-    backend itself created, since billing.StripeBilling.
-    create_checkout_session() always stamps workspace_id/plan into
-    metadata) is silently skipped rather than guessed at.
-
-    interval (D-086) is validated here - not just plan - before ever
-    reaching repository.py: an unrecognized/missing value is passed
-    through as None (repository.py's own CHECK constraint would reject
-    anything else at the CREATE path anyway; validating here keeps a
-    malformed metadata value from ever reaching that far).
-
-    D-107: a subscription event now also UPDATES plan (resolved from the
-    subscription's own Price ID by the caller), the subscription/customer
-    ids and current_period_start (service-month anchor) on an existing
-    row, so a portal upgrade/downgrade or monthly<->annual switch is
-    reflected; only subscription plans are accepted here."""
-    if not workspace_id:
-        return
-    if interval not in ("monthly", "annual"):
-        interval = None
-    if plan not in _SUBSCRIPTION_PLANS:
-        plan = None
-    if repo.get_entitlement_by_workspace(conn, workspace_id) is None:
-        if plan is not None:
-            repo.create_entitlement(conn, workspace_id, plan, status, stripe_customer_id, stripe_subscription_id, current_period_end, event_created_at,
-                                    billing_interval=interval, current_period_start=current_period_start)
-        return
-    repo.update_entitlement_status(conn, workspace_id, status, current_period_end, event_created_at, billing_interval=interval, plan=plan,
-                                   current_period_start=current_period_start, stripe_customer_id=stripe_customer_id,
-                                   stripe_subscription_id=stripe_subscription_id)
+def _ignored(reason: str) -> str:
+    return "ignored:" + reason
 
 
-def _apply_quick_payment(conn: Any, obj: Dict[str, Any], event_created_at: Optional[str]) -> None:
-    """A PAID Quick Checkout Session (D-107): grants exactly one scan credit
-    (keyed by the session id - a redelivered event never grants twice) and
-    makes the workspace's entitlement quick/active. Never touches a
-    workspace whose current entitlement is a live subscription (checkout
-    refuses to sell Quick to one; this is defense in depth)."""
-    metadata = obj.get("metadata") or {}
-    workspace_id = obj.get("client_reference_id") or metadata.get("workspace_id")
-    session_id = obj.get("id")
-    if not workspace_id or not isinstance(session_id, str) or not session_id or metadata.get("plan") != plans.PLAN_QUICK:
-        return
+def _rejected(reason: str) -> str:
+    return "rejected:" + reason
+
+
+def _sync_subscription(conn: Any, billing: "billing_module.StripeBilling", subscription_id: Optional[str],
+                       workspace_hint: Optional[str]) -> str:
+    """D-115: applies a subscription's CURRENT state, re-read from Stripe,
+    to its workspace's entitlement - the event that triggered this is only
+    a pointer (backend/billing.py's module docstring: Stripe sends several
+    events per change in the same second, at least once, in any order).
+    Returns the webhook outcome. Checks, in order:
+      * workspace: the server-stamped subscription metadata must name an
+        existing workspace and agree with the hint the event carried;
+      * plan/interval: ONLY from the subscription's Price, which must be
+        one of the 4 configured subscription Prices;
+      * binding: a subscription the workspace does not already hold must
+        come from a Checkout Session THIS backend created for THIS
+        workspace (billing_checkout_sessions, found by subscription id or
+        through Stripe's list of sessions for the subscription);
+      * customer: must match the customer the workspace / checkout uses;
+      * duplicates: a second live subscription while the stored one is
+        still live in Stripe is refused (an operator must refund one).
+    Everything after the first read runs under the per-workspace billing
+    lock, re-reading the subscription inside it, so concurrent deliveries
+    apply Stripe's states in read order. Stripe API errors propagate: the
+    webhook answers 500 and Stripe redelivers the event."""
+    if not isinstance(subscription_id, str) or not subscription_id:
+        return _ignored("no_subscription")
+    first = billing.retrieve_subscription(subscription_id)
+    workspace_id = (first.get("metadata") or {}).get("workspace_id")
+    if not isinstance(workspace_id, str) or not workspace_id:
+        return _ignored("subscription_without_workspace")
+    if workspace_hint and workspace_hint != workspace_id:
+        return _rejected("workspace_mismatch")
+    if not _UUID_RE.match(workspace_id) or repo.get_workspace(conn, workspace_id) is None:
+        return _rejected("unknown_workspace")
+    repo.lock_workspace_billing(conn, workspace_id)
+    try:
+        subscription = billing.retrieve_subscription(subscription_id)   # the newest state, read under the lock
+        outcome = _check_and_apply_subscription(conn, billing, subscription, subscription_id, workspace_id)
+        if outcome.startswith("applied:"):
+            conn.commit()
+        else:
+            conn.rollback()
+        return outcome
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _check_and_apply_subscription(conn: Any, billing: "billing_module.StripeBilling", subscription: Dict[str, Any],
+                                  subscription_id: str, workspace_id: str) -> str:
+    """The body of _sync_subscription() that runs under the lock."""
+    if (subscription.get("metadata") or {}).get("workspace_id") != workspace_id or subscription.get("id") not in (None, subscription_id):
+        return _rejected("workspace_mismatch")
+    status = repo.normalize_subscription_status(subscription.get("status"))
+    if status is None:
+        return _ignored("unknown_subscription_status")
+    resolved = billing.plan_for_price_id(billing_module.subscription_price_id(subscription))
+    if resolved is None or resolved["plan"] not in _SUBSCRIPTION_PLANS:
+        return _rejected("unknown_price")
+    customer_id = billing_module.subscription_customer_id(subscription)
     existing = repo.get_entitlement_by_workspace(conn, workspace_id)
-    if existing is not None and existing["plan"] in _SUBSCRIPTION_PLANS and existing["status"] in ("active", "trialing", "past_due"):
-        return
-    repo.grant_scan_credit(conn, session_id, workspace_id)
-    if existing is None:
-        repo.create_entitlement(conn, workspace_id, plans.PLAN_QUICK, "active", stripe_customer_id=obj.get("customer"), stripe_event_created_at=event_created_at)
-    else:
-        repo.update_entitlement_status(conn, workspace_id, "active", stripe_event_created_at=event_created_at, plan=plans.PLAN_QUICK,
-                                       stripe_customer_id=obj.get("customer"))
+    stored_subscription = existing.get("stripe_subscription_id") if existing is not None else None
+    # Binding: the workspace's own subscription, or one its own checkout created.
+    checkout = repo.get_checkout_session_by_subscription(conn, subscription_id)
+    if checkout is None and stored_subscription != subscription_id:
+        session_id = billing.find_checkout_session_for_subscription(subscription_id)
+        checkout = repo.get_checkout_session(conn, session_id)
+        if checkout is None:
+            return _rejected("unbound_subscription")
+        if checkout["stripe_subscription_id"] not in (None, subscription_id):
+            return _rejected("subscription_mismatch")
+    if checkout is not None:
+        if checkout["workspace_id"] != workspace_id or checkout["checkout_mode"] != "subscription":
+            return _rejected("workspace_mismatch")
+        if checkout["stripe_customer_id"] and customer_id and checkout["stripe_customer_id"] != customer_id:
+            return _rejected("customer_mismatch")
+    if existing is not None and existing.get("stripe_customer_id") and customer_id and existing["stripe_customer_id"] != customer_id:
+        return _rejected("customer_mismatch")
+    # A different subscription while the stored one is still live: only if
+    # Stripe confirms the stored one is no longer live.
+    if (stored_subscription and stored_subscription != subscription_id and status in repo.LIVE_SUBSCRIPTION_STATUSES
+            and existing["plan"] in _SUBSCRIPTION_PLANS and existing["status"] in repo.LIVE_SUBSCRIPTION_STATUSES):
+        stored_status = repo.normalize_subscription_status(billing.retrieve_subscription(stored_subscription).get("status"))
+        if stored_status in repo.LIVE_SUBSCRIPTION_STATUSES:
+            return _rejected("duplicate_subscription")
+    if checkout is not None and checkout["stripe_subscription_id"] is None:
+        repo.transition_checkout_session(conn, checkout["id"], "completed", stripe_subscription_id=subscription_id)
+    result = repo.apply_subscription_state(
+        conn, workspace_id, resolved["plan"], resolved["interval"], status, customer_id, subscription_id,
+        billing_module.subscription_period_start(subscription), billing_module.subscription_period_end(subscription),
+    )
+    if result == "ignored":
+        return _ignored("stale_subscription")
+    return "applied:subscription_%s" % status
 
 
-def _apply_webhook_event(conn: Any, event_type: str, obj: Dict[str, Any], event_created_at: Optional[str],
-                         billing: Optional["billing_module.StripeBilling"] = None) -> None:
-    """Dispatches one of the 5 handled Stripe event types
-    (backend/billing.py's module docstring lists them) to an
-    entitlements update. event_created_at is the ENCLOSING Stripe
-    Event's own `created` timestamp (already converted to an ISO string
-    by the caller, _handle_billing_webhook) - the ordering signal every
-    branch below threads through to repository.py's update_entitlement_
-    status()/create_entitlement(), per docs/decisiones.md D-077's Phase 3
-    webhook-hardening follow-up: Stripe explicitly documents webhook
-    delivery as at-least-once and NOT guaranteed in order, so a stale
-    event must never regress (or, after a cancellation, incorrectly
-    restore) a newer entitlement state - see update_entitlement_status()'s
-    own docstring for the exact deterministic rule, including its tie-
-    break. Any OTHER event type Stripe might deliver (there are dozens)
-    is a deliberate silent no-op here, never an error -
-    _handle_billing_webhook() still records via record_webhook_event()/
-    mark_webhook_event_processed() that it was received, so nothing is
-    lost, but this backend only ACTS on the 5 types this phase is scoped
-    to."""
-    if event_type in ("checkout.session.completed", "checkout.session.async_payment_succeeded") and obj.get("mode") == "payment":
-        # D-107 Quick: one-time payment. Only a PAID session grants the
-        # scan; an asynchronous payment method completes later with
-        # checkout.session.async_payment_succeeded (handled here too).
-        if obj.get("payment_status") == "paid":
-            _apply_quick_payment(conn, obj, event_created_at)
-        return
-    if event_type == "checkout.session.async_payment_succeeded":
-        return
-    if event_type == "checkout.session.completed":
-        # Deliberately NOT _upsert_entitlement(): this event's own object
-        # carries no real subscription status (a Checkout Session's
-        # status is about the CHECKOUT, not the subscription it created),
-        # so this handler only ever CREATES a row that does not exist yet
-        # - using 'incomplete' as an honest placeholder pending the
-        # authoritative status a customer.subscription.* event carries -
-        # and never touches status OR event_created_at on a row that
-        # already exists, at any timestamp: an existing row, by
-        # definition, was already established by a MORE authoritative
-        # event (a subscription event carries a real status; this one
-        # never does), so this event is never "newer" in the sense that
-        # matters here, regardless of what its own `created` says.
-        # Without this asymmetry, a customer.subscription.updated event
-        # that happens to arrive FIRST (setting a real status like
-        # 'active') would be silently regressed back to 'incomplete' by
-        # this event arriving second - exactly the delivery-order
-        # assumption this phase was explicitly scoped to never make.
-        metadata = obj.get("metadata") or {}
-        workspace_id = obj.get("client_reference_id")
-        plan = metadata.get("plan")
-        interval = metadata.get("interval")
-        if interval not in ("monthly", "annual"):
-            interval = None
-        if workspace_id and plan in _SUBSCRIPTION_PLANS and repo.get_entitlement_by_workspace(conn, workspace_id) is None:
-            repo.create_entitlement(
-                conn,
-                workspace_id,
-                plan,
-                status="incomplete",
-                stripe_customer_id=obj.get("customer"),
-                stripe_subscription_id=obj.get("subscription"),
-                stripe_event_created_at=event_created_at,
-                billing_interval=interval,
-            )
-    elif event_type in _SUBSCRIPTION_EVENT_TYPES:
-        # A canceled subscription's own status is already 'canceled' on
-        # the object customer.subscription.deleted carries - confirmed
-        # Stripe behavior, so both event types share this one branch.
-        metadata = obj.get("metadata") or {}
-        status = obj.get("status")
-        if not isinstance(status, str):
-            return
-        # D-107: the subscription's own Price ID decides plan/interval.
-        # A Price ID outside the configured catalog (a retired D-086
-        # price, a foreign price) is ignored entirely - never mapped to a
-        # plan. Only an object carrying no price at all falls back to the
-        # server-stamped metadata.
-        plan, interval = metadata.get("plan"), metadata.get("interval")
-        price_id = billing_module.subscription_price_id(obj)
-        if price_id is not None:
-            resolved = billing.plan_for_price_id(price_id) if billing is not None else None
-            if resolved is None or resolved["plan"] not in _SUBSCRIPTION_PLANS:
-                return
-            plan, interval = resolved["plan"], resolved["interval"]
-        _upsert_entitlement(
-            conn,
-            workspace_id=metadata.get("workspace_id"),
-            plan=plan,
-            status=status,
-            stripe_customer_id=obj.get("customer"),
-            stripe_subscription_id=obj.get("id"),
-            current_period_end=billing_module.subscription_period_end(obj),
-            event_created_at=event_created_at,
-            interval=interval,
-            current_period_start=billing_module.subscription_period_start(obj),
-        )
-    elif event_type == "invoice.paid":
-        workspace_id = billing_module.invoice_workspace_id(obj)
-        if workspace_id:
-            repo.update_entitlement_status(conn, workspace_id, "active", stripe_event_created_at=event_created_at)
-    elif event_type == "invoice.payment_failed":
-        workspace_id = billing_module.invoice_workspace_id(obj)
-        if workspace_id:
-            repo.update_entitlement_status(conn, workspace_id, "past_due", stripe_event_created_at=event_created_at)
+def _apply_checkout_event(conn: Any, billing: "billing_module.StripeBilling", event_type: str, obj: Dict[str, Any]) -> str:
+    """checkout.session.* for a session THIS backend created (ledger row):
+    the workspace, mode and customer the event names must match the row.
+      * completed / async_payment_succeeded, payment mode (Quick): a PAID
+        session whose line items Stripe reports as exactly one unit of the
+        Quick Price grants one scan credit (repository.apply_quick_purchase);
+        completed but unpaid (asynchronous method) -> awaiting_payment.
+      * completed, subscription mode: records the subscription the session
+        created and applies its state (_sync_subscription).
+      * async_payment_failed -> payment_failed; expired -> expired. Neither
+        grants anything; status only moves forward (replays are no-ops)."""
+    session_id = obj.get("id")
+    checkout = repo.get_checkout_session(conn, session_id)
+    if checkout is None:
+        return _ignored("unknown_checkout_session")
+    workspace_id = checkout["workspace_id"]
+    if any(value and value != workspace_id for value in (obj.get("client_reference_id"), (obj.get("metadata") or {}).get("workspace_id"))):
+        return _rejected("workspace_mismatch")
+    if obj.get("mode") != checkout["checkout_mode"]:
+        return _rejected("mode_mismatch")
+    customer_id = billing_module._object_id(obj.get("customer"))
+    if checkout["stripe_customer_id"] and customer_id and checkout["stripe_customer_id"] != customer_id:
+        return _rejected("customer_mismatch")
+
+    def move(to_status: str, applied: str) -> str:
+        moved = repo.transition_checkout_session(conn, session_id, to_status)
+        conn.commit()
+        return ("applied:" + applied) if moved else _ignored("checkout_already_" + checkout["status"])
+
+    if event_type == "checkout.session.expired":
+        return move("expired", "checkout_expired")
+    if event_type == "checkout.session.async_payment_failed":
+        return move("payment_failed", "payment_failed")
+    if checkout["checkout_mode"] == "payment":
+        if obj.get("payment_status") != "paid":
+            if event_type == "checkout.session.completed":
+                return move("awaiting_payment", "awaiting_payment")
+            return _ignored("payment_not_paid")
+        quick_price = billing.resolve_price_id(plans.PLAN_QUICK, plans.INTERVAL_ONE_TIME)
+        if checkout["price_id"] != quick_price or billing.checkout_session_line_items(session_id) != [(quick_price, 1)]:
+            move("completed", "")          # paid in Stripe, so closed here too - but nothing is granted
+            return _rejected("line_items_mismatch")
+        result = repo.apply_quick_purchase(conn, workspace_id, session_id, customer_id)
+        if result == "live_subscription":
+            move("completed", "")
+            return _rejected("quick_with_live_subscription")
+        return "applied:quick_credit_" + result
+    if event_type != "checkout.session.completed":
+        return _ignored("not_applicable_to_subscription_checkout")
+    subscription_id = billing_module._object_id(obj.get("subscription"))
+    if subscription_id is None:
+        return _ignored("no_subscription")
+    if checkout["stripe_subscription_id"] not in (None, subscription_id):
+        return _rejected("subscription_mismatch")
+    other = repo.get_checkout_session_by_subscription(conn, subscription_id)
+    if other is not None and other["id"] != session_id:
+        return _rejected("subscription_mismatch")
+    repo.transition_checkout_session(conn, session_id, "completed", stripe_subscription_id=subscription_id)
+    conn.commit()
+    return _sync_subscription(conn, billing, subscription_id, workspace_id)
+
+
+def _apply_webhook_event(conn: Any, billing: "billing_module.StripeBilling", event_type: str, obj: Dict[str, Any]) -> str:
+    """Dispatches one VERIFIED Stripe event (signature and livemode already
+    checked by billing.verify_and_parse_webhook()) and returns its outcome:
+    "applied:<what>", "ignored:<reason>" (nothing to do - unknown session,
+    replay, unhandled type) or "rejected:<reason>" (the event conflicts
+    with the local binding - wrong workspace, customer, subscription,
+    Price; nothing is changed and an operator is alerted). Every handled
+    type is listed in HANDLED_STRIPE_EVENT_TYPES:
+      * checkout.session.* -> _apply_checkout_event();
+      * customer.subscription.* and invoice.paid / invoice.payment_failed
+        are TRIGGERS: the subscription's current state is re-read from
+        Stripe and applied (_sync_subscription) - activation, renewal (new
+        current_period_start = new service month), plan/interval change,
+        payment failure (past_due / unpaid: no scan access) and
+        cancellation (canceled) all come from Stripe's own status. Only the
+        invoice's OWN subscription is re-read, never "the workspace's".
+    An exception propagates: the caller answers 500 and the event stays
+    retryable (record_webhook_event())."""
+    if not isinstance(obj, dict):
+        return _ignored("malformed_object")
+    if event_type in _CHECKOUT_EVENT_TYPES:
+        return _apply_checkout_event(conn, billing, event_type, obj)
+    if event_type in _SUBSCRIPTION_EVENT_TYPES:
+        return _sync_subscription(conn, billing, billing_module._object_id(obj.get("id")), (obj.get("metadata") or {}).get("workspace_id"))
+    if event_type in _INVOICE_EVENT_TYPES:
+        subscription_id = billing_module.invoice_subscription_id(obj)
+        if subscription_id is None:
+            return _ignored("not_a_subscription_invoice")
+        return _sync_subscription(conn, billing, subscription_id, billing_module.invoice_workspace_id(obj))
+    return _ignored("unhandled_event_type")
 
 
 def make_handler(
@@ -2249,6 +2281,17 @@ def make_handler(
             }
             operations[operation]()
 
+        def _log_webhook(self, event_id: Optional[str], event_type: Optional[str], outcome: str, status: int) -> None:
+            """D-115: one structured line per Stripe webhook delivery - event
+            id/type, outcome and HTTP status only. Never the payload, the
+            signature header, a secret or any customer data."""
+            record = {"event": "stripe_webhook", "ts": datetime.now(timezone.utc).isoformat(), "event_id": event_id,
+                      "event_type": event_type, "outcome": outcome, "status": status}
+            try:
+                sys.stderr.write(json.dumps(record, ensure_ascii=True) + "\n")
+            except Exception:
+                pass
+
         def _log_api_request(self, method: str, path: str) -> None:
             """One structured line per /api/v1 request: identifiers and
             outcome only - never the Authorization header, the key, a body,
@@ -3243,7 +3286,9 @@ def make_handler(
                     self._send_json(403, {"ok": False, "error": "forbidden"})
                     return
                 existing = repo.get_entitlement_by_workspace(conn, workspace_id)
-                if existing is not None and existing["plan"] in _SUBSCRIPTION_PLANS and existing["status"] in ("active", "trialing"):
+                # D-115: a past_due/unpaid subscription still exists in Stripe -
+                # fix the payment in the portal instead of buying a second one.
+                if existing is not None and existing["plan"] in _SUBSCRIPTION_PLANS and existing["status"] in _CHECKOUT_BLOCKING_STATUSES:
                     self._send_json(409, {"ok": False, "error": "this workspace already has an active subscription"})
                     return
                 if plan == plans.PLAN_QUICK and existing is not None and existing["plan"] == plans.PLAN_QUICK and (repo.usage_summary(conn, workspace_id, existing) or {}).get("scans_available", 0) > 0:
@@ -3262,16 +3307,9 @@ def make_handler(
                     interval, datetime.now(timezone.utc),
                     black_friday_enabled, black_friday_start, black_friday_end, black_friday_promotion_code_id,
                 )
+                customer_id = existing["stripe_customer_id"] if existing is not None else None
                 try:
-                    session = billing.create_checkout_session(
-                        plan=plan,
-                        interval=interval,
-                        workspace_id=workspace_id,
-                        success_url="%s://%s%s" % (scheme, host, success_path),
-                        cancel_url="%s://%s%s" % (scheme, host, cancel_path),
-                        customer_id=existing["stripe_customer_id"] if existing is not None else None,
-                        black_friday_promotion_code_id=promotion_code_id,
-                    )
+                    price_id = billing.resolve_price_id(plan, interval)
                 except billing_module.PriceNotAllowedError:
                     self._send_json(400, {"ok": False, "error": "unknown plan or billing interval"})
                     return
@@ -3280,6 +3318,49 @@ def make_handler(
                     # (defensive - startup validation requires all five).
                     self._send_json(503, {"ok": False, "error": "billing_not_configured", "detail": "this plan cannot be purchased yet"})
                     return
+                # D-115: one payable Checkout per workspace at a time, under
+                # the per-workspace billing lock: the workspace's previous
+                # open session is expired in Stripe first (two tabs can never
+                # both be paid - e.g. two subscriptions); a session already
+                # paid, or a payment still settling, refuses a new checkout.
+                repo.lock_workspace_billing(conn, workspace_id)
+                try:
+                    since = (datetime.now(timezone.utc) - timedelta(seconds=CHECKOUT_APPLY_GRACE_SECONDS)).isoformat()
+                    if repo.checkout_pending_application(conn, workspace_id, since):
+                        conn.rollback()
+                        self._send_json(409, {"ok": False, "error": "checkout_already_completed",
+                                              "detail": "a checkout for this workspace was just completed; it is being applied"})
+                        return
+                    for pending in repo.list_pending_checkout_sessions(conn, workspace_id):
+                        if pending["status"] == "awaiting_payment":
+                            conn.rollback()
+                            self._send_json(409, {"ok": False, "error": "checkout_payment_pending",
+                                                  "detail": "a payment for this workspace is still being confirmed"})
+                            return
+                        if billing.expire_checkout_session(pending["id"]) == "complete":
+                            # Paid before its webhook arrived: closed here too
+                            # (its webhook still applies it), and refused now.
+                            repo.transition_checkout_session(conn, pending["id"], "completed")
+                            conn.commit()
+                            self._send_json(409, {"ok": False, "error": "checkout_already_completed",
+                                                  "detail": "a checkout for this workspace was just completed; it is being applied"})
+                            return
+                        repo.transition_checkout_session(conn, pending["id"], "expired")
+                    session = billing.create_checkout_session(
+                        plan=plan,
+                        interval=interval,
+                        workspace_id=workspace_id,
+                        success_url="%s://%s%s" % (scheme, host, success_path),
+                        cancel_url="%s://%s%s" % (scheme, host, cancel_path),
+                        customer_id=customer_id,
+                        black_friday_promotion_code_id=promotion_code_id,
+                    )
+                    repo.record_checkout_session(conn, session.get("id"), workspace_id, current_user_id, plan, interval, price_id,
+                                                 plans.PRICE_MODES[billing_module.price_key(plan, interval)]["checkout_mode"], customer_id)
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
                 self._send_json(200, {"ok": True, "checkout_url": session.get("url")})
             except Exception:
                 self._send_json(500, {"ok": False, "error": "internal error"})
@@ -3356,18 +3437,26 @@ def make_handler(
             sig_header = self.headers.get("Stripe-Signature", "")
             try:
                 event = billing.verify_and_parse_webhook(raw, sig_header)
+            except billing_module.WebhookModeMismatchError:
+                # D-115: correctly signed, but from the other Stripe mode
+                # (e.g. a live event reaching a Sandbox deployment).
+                self._log_webhook(None, None, "rejected:livemode_mismatch", 400)
+                self._send_json(400, {"ok": False, "error": "livemode mismatch"})
+                return
             except billing_module.WebhookVerificationError:
                 # The body was already fully read above (unlike
                 # _reject_if_cross_origin()'s rejections), so there is no
                 # unread-body reason to force close_connection here.
+                self._log_webhook(None, None, "rejected:invalid_signature", 400)
                 self._send_json(400, {"ok": False, "error": "invalid signature"})
                 return
             event_id = event.get("id")
             event_type = event.get("type")
-            if not isinstance(event_id, str) or not event_id or not isinstance(event_type, str) or not event_type:
+            if (not isinstance(event_id, str) or not _STRIPE_EVENT_ID_RE.match(event_id)
+                    or not isinstance(event_type, str) or not event_type or len(event_type) > 100):
+                self._log_webhook(None, None, "rejected:malformed_event", 400)
                 self._send_json(400, {"ok": False, "error": "malformed event"})
                 return
-            event_created_at = billing_module.stripe_timestamp_to_iso(event.get("created"))
             conn = connect_fn()
             try:
                 # True here means "(re)process it now" - a fresh event.id,
@@ -3377,13 +3466,23 @@ def make_handler(
                 # webhook hardening, docs/decisiones.md D-077 follow-up).
                 should_process = repo.record_webhook_event(conn, event_id, event_type)
                 if not should_process:
+                    self._log_webhook(event_id, event_type, "ignored:duplicate", 200)
                     self._send_json(200, {"ok": True, "duplicate": True})
                     return
-                obj = ((event.get("data") or {}).get("object")) or {}
+                data = event.get("data")
+                obj = data.get("object") if isinstance(data, dict) else None
                 try:
-                    _apply_webhook_event(conn, event_type, obj, event_created_at, billing)
-                    repo.mark_webhook_event_processed(conn, event_id)
-                    self._send_json(200, {"ok": True})
+                    outcome = _apply_webhook_event(conn, billing, event_type, obj)
+                    repo.mark_webhook_event_processed(conn, event_id, outcome=outcome)
+                    if outcome.startswith("rejected:"):
+                        # D-115: the event conflicts with the local binding
+                        # (workspace, customer, subscription, Price). Nothing
+                        # changed; a retry would decide the same, so 200 -
+                        # but an operator must look (e.g. a refund).
+                        alerting.emit_safe(alert_sender, alerting.EVENT_STRIPE_WEBHOOK_FAILURE, "warning",
+                                           {"event_type": event_type, "error_type": outcome})
+                    self._log_webhook(event_id, event_type, outcome, 200)
+                    self._send_json(200, {"ok": True, "outcome": outcome})
                 except Exception as exc:
                     # On Postgres, the exception above already aborted the
                     # whole transaction (unlike SQLite) - rollback() ends
@@ -3399,8 +3498,9 @@ def make_handler(
                     # no-op on SQLite, which never aborts a transaction on
                     # error in the first place.
                     conn.rollback()
-                    repo.mark_webhook_event_processed(conn, event_id, error=str(exc))
+                    repo.mark_webhook_event_processed(conn, event_id, error=type(exc).__name__)
                     alerting.emit_safe(alert_sender, alerting.EVENT_STRIPE_WEBHOOK_FAILURE, "error", {"event_type": event_type, "error_type": type(exc).__name__})
+                    self._log_webhook(event_id, event_type, "error:" + type(exc).__name__, 500)
                     self._send_json(500, {"ok": False, "error": "internal error processing webhook"})
             finally:
                 conn.close()

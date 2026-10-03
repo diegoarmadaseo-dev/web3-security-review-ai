@@ -42,7 +42,8 @@ for the full detail on each.
 - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` - **DIEGO** (or an IAM role, if the staging host supports one - then omit both).
 
 ### Stripe (TEST mode)
-- `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET` - **DIEGO**: from Stripe's TEST mode dashboard.
+- `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET` - **DIEGO**: from Stripe's TEST mode dashboard (`sk_test_`/`rk_test_`; `whsec_` of the staging endpoint registered with the 9 events listed in `docs/production-config.md`). `STRIPE_MODE` stays unset (= `test`): a live key is a startup error (D-115).
+- Before staging, the Sandbox flow can be verified from any machine with `python -m tests.stripe_sandbox_e2e --plan all --env-file <file outside the repo>` (D-115, `docs/stripe-billing.md`).
 - Launch catalog (D-107, `backend/plans.py`): 3 Products, 5 Prices. TEST-mode IDs supplied by Diego (Price IDs are not secrets):
 
   | Variable | Price mode | Product | TEST-mode Price ID |

@@ -306,9 +306,8 @@ def update_entitlement_status(
     first) OR - Phase 3 webhook hardening, docs/decisiones.md D-077
     follow-up - the incoming stripe_event_created_at is stale/tied
     against the row's own stored value and was correctly ignored. Both
-    "no row" and "stale, ignored" report False on purpose: a caller like
-    backend/http_app.py's _upsert_entitlement() that needs to tell them
-    apart (to decide whether to fall back to create_entitlement()) must
+    "no row" and "stale, ignored" report False on purpose: a caller that
+    needs to tell them apart (to decide whether to fall back to create_entitlement()) must
     check existence itself first via get_entitlement_by_workspace() -
     this function alone cannot and should not guess which case applies.
 
@@ -336,7 +335,12 @@ def update_entitlement_status(
     carries the plan resolved from its own Price ID (a portal upgrade,
     downgrade or monthly<->annual switch changes it) and its period start
     (the service-month anchor); a status-only event leaves them as they
-    are."""
+    are.
+
+    D-115: Stripe webhooks no longer call this - they apply a subscription's
+    authoritative state with apply_subscription_state() and a Quick purchase
+    with apply_quick_purchase(); the ordering rule above stays for any
+    other caller."""
     if plan is not None and plan not in plans.PLANS:
         raise RepositoryError("plan must be one of %s, got %r" % (sorted(plans.PLANS), plan))
     sets = ("status = ?, current_period_end = COALESCE(?, current_period_end), billing_interval = COALESCE(?, billing_interval), "
@@ -2107,6 +2111,239 @@ def append_audit_event(
     return event_id
 
 
+# ---------------------------------------------------------------------------
+# Stripe billing state (docs/decisiones.md D-115, docs/stripe-billing.md).
+# Checkout Sessions this backend created (billing_checkout_sessions), the
+# per-workspace billing lock, and the two writes webhooks make: a
+# subscription's authoritative state and a paid Quick purchase.
+# ---------------------------------------------------------------------------
+
+# Subscription statuses that keep (or will keep) the subscription alive.
+# Scan ACCESS is narrower (active/trialing - http_app); past_due counts as
+# live here because the subscription still exists and still bills.
+LIVE_SUBSCRIPTION_STATUSES = ("active", "trialing", "past_due")
+# Stripe's "paused" is not an entitlements status: stored as "unpaid"
+# (no access, recoverable when Stripe resumes it).
+_STRIPE_STATUS_ALIASES = {"paused": "unpaid"}
+ENTITLEMENT_STATUSES = ("active", "trialing", "past_due", "canceled", "incomplete", "incomplete_expired", "unpaid")
+CHECKOUT_SESSION_STATUSES = ("open", "awaiting_payment", "completed", "payment_failed", "expired")
+# The only status moves a Checkout Session row may make (to: allowed from).
+_CHECKOUT_TRANSITIONS = {
+    "awaiting_payment": ("open",),
+    "completed": ("open", "awaiting_payment"),
+    "payment_failed": ("open", "awaiting_payment"),
+    "expired": ("open",),
+}
+
+
+def normalize_subscription_status(status: Any) -> Optional[str]:
+    """A Stripe Subscription status as an entitlements status, or None for
+    a value Stripe never sends (the caller ignores the event)."""
+    if not isinstance(status, str):
+        return None
+    status = _STRIPE_STATUS_ALIASES.get(status, status)
+    return status if status in ENTITLEMENT_STATUSES else None
+
+
+def record_checkout_session(
+    conn: Any,
+    session_id: str,
+    workspace_id: str,
+    user_id: str,
+    plan: str,
+    billing_interval: str,
+    price_id: str,
+    checkout_mode: str,
+    stripe_customer_id: Optional[str],
+) -> None:
+    """Stores a Checkout Session the backend just created (status open).
+    Does not commit: the caller commits it with the rest of its
+    transaction."""
+    now = utcnow_iso()
+    db.execute(
+        conn,
+        "INSERT INTO billing_checkout_sessions (id, workspace_id, user_id, plan, billing_interval, price_id, checkout_mode, stripe_customer_id, "
+        "stripe_subscription_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'open', ?, ?)",
+        (session_id, workspace_id, user_id, plan, billing_interval, price_id, checkout_mode, stripe_customer_id, now, now),
+    )
+
+
+def get_checkout_session(conn: Any, session_id: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    cur = db.execute(conn, "SELECT * FROM billing_checkout_sessions WHERE id = ?", (session_id,))
+    return db.normalize_row(cur.fetchone())
+
+
+def get_checkout_session_by_subscription(conn: Any, subscription_id: str) -> Optional[Dict[str, Any]]:
+    cur = db.execute(conn, "SELECT * FROM billing_checkout_sessions WHERE stripe_subscription_id = ?", (subscription_id,))
+    return db.normalize_row(cur.fetchone())
+
+
+def list_pending_checkout_sessions(conn: Any, workspace_id: str) -> List[Dict[str, Any]]:
+    """The workspace's Checkout Sessions that could still be paid (open) or
+    whose payment is still settling (awaiting_payment), oldest first."""
+    cur = db.execute(
+        conn,
+        "SELECT * FROM billing_checkout_sessions WHERE workspace_id = ? AND status IN ('open', 'awaiting_payment') ORDER BY created_at, id",
+        (workspace_id,),
+    )
+    return [db.normalize_row(row) for row in cur.fetchall()]
+
+
+def checkout_pending_application(conn: Any, workspace_id: str, since_iso: str) -> bool:
+    """True while a Checkout Session of this workspace completed at or after
+    `since_iso` but its effect is not on the workspace yet: a subscription
+    checkout whose subscription is not the entitlement's, or a Quick
+    checkout without its scan credit (http_app refuses a new checkout
+    meanwhile - see CHECKOUT_APPLY_GRACE_SECONDS)."""
+    cur = db.execute(
+        conn,
+        "SELECT id, checkout_mode, stripe_subscription_id FROM billing_checkout_sessions "
+        "WHERE workspace_id = ? AND status = 'completed' AND updated_at >= ?",
+        (workspace_id, since_iso),
+    )
+    rows = [db.normalize_row(row) for row in cur.fetchall()]
+    if not rows:
+        return False
+    entitlement = get_entitlement_by_workspace(conn, workspace_id)
+    for row in rows:
+        if row["checkout_mode"] == "subscription":
+            if not row["stripe_subscription_id"] or entitlement is None or entitlement.get("stripe_subscription_id") != row["stripe_subscription_id"]:
+                return True
+        elif db.execute(conn, "SELECT id FROM scan_credits WHERE id = ?", (row["id"],)).fetchone() is None:
+            return True
+    return False
+
+
+def transition_checkout_session(conn: Any, session_id: str, to_status: str, stripe_subscription_id: Optional[str] = None) -> bool:
+    """Moves a Checkout Session row forward along _CHECKOUT_TRANSITIONS
+    (and, for a subscription checkout that completes, records the
+    subscription it created). Returns False - changing nothing - for a move
+    the row's current status does not allow (a replayed or out-of-order
+    event). Does not commit."""
+    if to_status not in _CHECKOUT_TRANSITIONS:
+        raise RepositoryError("invalid checkout session status %r" % (to_status,))
+    allowed = _CHECKOUT_TRANSITIONS[to_status]
+    cur = db.execute(
+        conn,
+        "UPDATE billing_checkout_sessions SET status = ?, stripe_subscription_id = COALESCE(?, stripe_subscription_id), updated_at = ? "
+        "WHERE id = ? AND status IN (%s)" % ", ".join("?" for _ in allowed),
+        (to_status, stripe_subscription_id, utcnow_iso(), session_id) + tuple(allowed),
+    )
+    return cur.rowcount > 0
+
+
+def lock_workspace_billing(conn: Any, workspace_id: str) -> None:
+    """Serializes the billing state changes of ONE workspace for the rest of
+    the current transaction (the same per-workspace lock admission uses,
+    _lock_workspace_admission()): two webhook deliveries - or a delivery
+    and a checkout - for the same workspace read Stripe and write one after
+    the other, so the later writer always applies the later read. Commits
+    any open transaction first, so the lock is really taken. Released by
+    the caller's commit/rollback."""
+    conn.commit()
+    _lock_workspace_admission(conn, workspace_id)
+
+
+def apply_subscription_state(
+    conn: Any,
+    workspace_id: str,
+    plan: str,
+    billing_interval: Optional[str],
+    status: str,
+    stripe_customer_id: Optional[str],
+    stripe_subscription_id: str,
+    current_period_start: Optional[str],
+    current_period_end: Optional[str],
+) -> str:
+    """Writes a subscription's AUTHORITATIVE current state (re-read from
+    Stripe by the caller, under lock_workspace_billing()) onto the
+    workspace's entitlement. Does not commit. No event-timestamp
+    comparison: this is the newest state Stripe has, and the lock orders
+    concurrent writers. A subscription that is not the one stored for the
+    workspace only takes over when it is live (a new purchase): a
+    canceled/expired OTHER subscription - a late event about an old one -
+    never replaces the current subscription, a Quick purchase or a Trial.
+    (A second LIVE subscription while the stored one is still live is the
+    caller's call - http_app refuses it as duplicate_subscription.)
+    Returns "created", "updated" or "ignored"."""
+    if plans.PLANS.get(plan, {}).get("billing_type") != plans.BILLING_SUBSCRIPTION:
+        raise RepositoryError("plan must be a subscription plan, got %r" % (plan,))
+    if status not in ENTITLEMENT_STATUSES:
+        raise RepositoryError("invalid entitlement status %r" % (status,))
+    if billing_interval not in ("monthly", "annual"):
+        billing_interval = None
+    now = utcnow_iso()
+    existing = get_entitlement_by_workspace(conn, workspace_id)
+    if existing is None:
+        db.execute(
+            conn,
+            "INSERT INTO entitlements (id, workspace_id, plan, status, stripe_customer_id, stripe_subscription_id, current_period_end, "
+            "billing_interval, current_period_start, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (new_id(), workspace_id, plan, status, stripe_customer_id, stripe_subscription_id, current_period_end, billing_interval,
+             current_period_start, now, now),
+        )
+        return "created"
+    if existing.get("stripe_subscription_id") != stripe_subscription_id and status not in LIVE_SUBSCRIPTION_STATUSES:
+        return "ignored"
+    db.execute(
+        conn,
+        "UPDATE entitlements SET plan = ?, status = ?, billing_interval = COALESCE(?, billing_interval), "
+        "current_period_start = COALESCE(?, current_period_start), current_period_end = COALESCE(?, current_period_end), "
+        "stripe_customer_id = COALESCE(?, stripe_customer_id), stripe_subscription_id = ?, updated_at = ? WHERE workspace_id = ?",
+        (plan, status, billing_interval, current_period_start, current_period_end, stripe_customer_id, stripe_subscription_id, now, workspace_id),
+    )
+    return "updated"
+
+
+def apply_quick_purchase(conn: Any, workspace_id: str, session_id: str, stripe_customer_id: Optional[str]) -> str:
+    """A verified, paid Quick Checkout Session -> exactly one scan credit
+    (keyed by the session id: ON CONFLICT DO NOTHING, so any number of
+    deliveries grant one) and a quick/active entitlement, with the session
+    row marked completed - all in ONE transaction under
+    lock_workspace_billing(), so concurrent deliveries never race. Commits.
+    A workspace with a live subscription gets nothing ("live_subscription":
+    checkout never sells Quick to one; the caller alerts an operator).
+    Switching to Quick forgets the old (dead) subscription id, so a late
+    event about it can never overwrite the Quick entitlement. Returns
+    "granted", "already_granted" or "live_subscription"."""
+    lock_workspace_billing(conn, workspace_id)
+    try:
+        existing = get_entitlement_by_workspace(conn, workspace_id)
+        if (existing is not None and plans.PLANS.get(existing["plan"], {}).get("billing_type") == plans.BILLING_SUBSCRIPTION
+                and existing["status"] in LIVE_SUBSCRIPTION_STATUSES):
+            conn.rollback()
+            return "live_subscription"
+        now = utcnow_iso()
+        cur = db.execute(
+            conn,
+            "INSERT INTO scan_credits (id, workspace_id, status, job_id, granted_at, updated_at) VALUES (?, ?, 'available', NULL, ?, ?) "
+            "ON CONFLICT (id) DO NOTHING",
+            (session_id, workspace_id, now, now),
+        )
+        granted = cur.rowcount > 0
+        if existing is None:
+            db.execute(
+                conn,
+                "INSERT INTO entitlements (id, workspace_id, plan, status, stripe_customer_id, created_at, updated_at) VALUES (?, ?, ?, 'active', ?, ?, ?)",
+                (new_id(), workspace_id, plans.PLAN_QUICK, stripe_customer_id, now, now),
+            )
+        elif granted or existing["plan"] != plans.PLAN_QUICK:
+            db.execute(
+                conn,
+                "UPDATE entitlements SET plan = ?, status = 'active', billing_interval = NULL, stripe_subscription_id = NULL, "
+                "stripe_customer_id = COALESCE(?, stripe_customer_id), updated_at = ? WHERE workspace_id = ?",
+                (plans.PLAN_QUICK, stripe_customer_id, now, workspace_id),
+            )
+        transition_checkout_session(conn, session_id, "completed")
+        conn.commit()
+        return "granted" if granted else "already_granted"
+    except Exception:
+        conn.rollback()
+        raise
+
+
 def record_webhook_event(conn: Any, event_id: str, event_type: str) -> bool:
     """Returns True if the caller should (re)process event_id now, False
     if it must be skipped. Three cases, in order (Phase 3 webhook
@@ -2154,7 +2391,7 @@ def record_webhook_event(conn: Any, event_id: str, event_type: str) -> bool:
     return cur.rowcount > 0
 
 
-def mark_webhook_event_processed(conn: Any, event_id: str, error: Optional[str] = None) -> None:
+def mark_webhook_event_processed(conn: Any, event_id: str, error: Optional[str] = None, outcome: Optional[str] = None) -> None:
     """Records the outcome of processing a webhook event this call site
     already confirmed (via record_webhook_event() returning True) it
     owns. error=None for success: sets processed_at, the ONLY thing that
@@ -2181,9 +2418,14 @@ def mark_webhook_event_processed(conn: Any, event_id: str, error: Optional[str] 
     involves the database) - an unconditional rollback here would be
     correct on Postgres but silently discard an unrelated, still-good
     write on SQLite, so the caller (which knows exactly what failed and
-    why) owns that decision."""
+    why) owns that decision.
+
+    outcome (D-115) is what a SUCCESSFUL processing decided -
+    "applied:<what>", "ignored:<reason>" or "rejected:<reason>" - kept for
+    diagnostics (docs/stripe-billing.md); never a secret or a payload."""
     if error is None:
-        db.execute(conn, "UPDATE webhook_events SET processed_at = ?, processing_error = NULL WHERE id = ?", (utcnow_iso(), event_id))
+        db.execute(conn, "UPDATE webhook_events SET processed_at = ?, processing_error = NULL, outcome = ? WHERE id = ?",
+                   (utcnow_iso(), outcome[:120] if outcome else None, event_id))
     else:
         db.execute(conn, "UPDATE webhook_events SET processing_error = ? WHERE id = ?", (error, event_id))
     conn.commit()

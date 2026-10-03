@@ -46,6 +46,7 @@ import backend.db as db
 import backend.http_app as http_app
 import backend.migrate as migrate
 import backend.object_storage as object_storage
+import backend.plans as plans_module
 import backend.repository as repo
 import backend.tenant_scope as tenant_scope
 import backend.verify_restore as verify_restore
@@ -122,7 +123,7 @@ class MigrationIntegrationTests(unittest.TestCase):
         self.conn, self.applied = _reset_database_and_migrate()
         self.addCleanup(self.conn.close)
 
-    def test_fresh_database_applies_all_fifteen_migrations_in_order(self):
+    def test_fresh_database_applies_all_sixteen_migrations_in_order(self):
         # 0002_auth_tokens.sql (Phase 2), 0003_entitlement_status_expand.sql
         # and 0004_entitlement_event_provenance.sql (Phase 3),
         # 0005_job_queue_hardening.sql (Phase 4, D-079),
@@ -133,7 +134,8 @@ class MigrationIntegrationTests(unittest.TestCase):
         # 0009_commercial_usage.sql (D-107), 0010_commercial_guards.sql
         # (D-108), 0011_contract_files.sql (D-109) and
         # 0012_github_connections.sql (D-111), 0013_trial.sql (D-112),
-        # 0014_api_keys.sql (D-113) and 0015_ci_sources.sql (D-114) added alongside
+        # 0014_api_keys.sql (D-113), 0015_ci_sources.sql (D-114) and
+        # 0016_billing_checkout_sessions.sql (D-115) added alongside
         # 0001_initial_schema.sql (Phase 1).
         self.assertEqual(
             self.applied,
@@ -142,7 +144,7 @@ class MigrationIntegrationTests(unittest.TestCase):
                 "0004_entitlement_event_provenance", "0005_job_queue_hardening", "0006_retention_purge",
                 "0007_billing_interval", "0008_queue_fairness", "0009_commercial_usage",
                 "0010_commercial_guards", "0011_contract_files", "0012_github_connections", "0013_trial",
-                "0014_api_keys", "0015_ci_sources",
+                "0014_api_keys", "0015_ci_sources", "0016_billing_checkout_sessions",
             ],
         )
 
@@ -165,7 +167,7 @@ class MigrationIntegrationTests(unittest.TestCase):
             seen_statuses.add(repo.get_entitlement_by_workspace(self.conn, workspace_id)["status"])
         self.assertEqual(seen_statuses, {"incomplete_expired", "unpaid"})
 
-    def test_all_twenty_seven_tables_exist(self):
+    def test_all_twenty_eight_tables_exist(self):
         cur = db.execute(
             self.conn,
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
@@ -184,6 +186,7 @@ class MigrationIntegrationTests(unittest.TestCase):
             "trial_grants",  # D-112, 0013_trial.sql.
             "api_keys",  # D-113, 0014_api_keys.sql.
             "contract_ci_sources",  # D-114, 0015_ci_sources.sql.
+            "billing_checkout_sessions",  # D-115, 0016_billing_checkout_sessions.sql.
         }
         self.assertEqual(tables, expected)
 
@@ -1081,7 +1084,16 @@ class WebhookHardeningIntegrationTests(unittest.TestCase):
         self.conn, _ = _reset_database_and_migrate()
         self.addCleanup(self.conn.close)
 
-    def _process_once(self, event_id, event_type, obj):
+    DOOMED_WORKSPACE = "00000000-0000-0000-0000-000000000000"
+
+    def _apply(self, workspace_id):
+        # The write a subscription webhook ends with (D-115). For a workspace
+        # that does not exist it raises a REAL ForeignKeyViolation inside the
+        # transaction - the exact failure class that triggered the original bug.
+        repo.apply_subscription_state(self.conn, workspace_id, "standard", "monthly", "active", "cus_pg_1", "sub_pg_1", None, None)
+        self.conn.commit()
+
+    def _process_once(self, event_id, event_type, workspace_id):
         """Mirrors backend/http_app.py's _handle_billing_webhook() logic
         exactly (claim -> apply -> commit-or-rollback+record) without the
         HTTP layer, which is irrelevant to this transaction-level bug -
@@ -1090,42 +1102,30 @@ class WebhookHardeningIntegrationTests(unittest.TestCase):
         if not should_process:
             return "skipped-duplicate"
         try:
-            http_app._apply_webhook_event(self.conn, event_type, obj, None)
-            repo.mark_webhook_event_processed(self.conn, event_id)
+            self._apply(workspace_id)
+            repo.mark_webhook_event_processed(self.conn, event_id, outcome="applied:subscription_active")
             return "succeeded"
         except Exception as exc:
             self.conn.rollback()
-            repo.mark_webhook_event_processed(self.conn, event_id, error=str(exc))
+            repo.mark_webhook_event_processed(self.conn, event_id, error=type(exc).__name__)
             return "failed: %s" % exc
-
-    def _doomed_event(self):
-        # References a workspace that does not exist -> a real
-        # ForeignKeyViolation from inside create_entitlement(), the exact
-        # failure class that triggered the original bug.
-        return {
-            "id": "sub_pg_1", "customer": "cus_pg_1", "status": "active",
-            "metadata": {"workspace_id": "00000000-0000-0000-0000-000000000000", "plan": "standard"},
-            "items": {"data": []},
-        }
 
     def test_processing_failure_leaves_event_retryable_and_a_later_retry_succeeds(self):
         event_id, event_type = "evt_pg_retry_1", "customer.subscription.updated"
-        first = self._process_once(event_id, event_type, self._doomed_event())
+        first = self._process_once(event_id, event_type, self.DOOMED_WORKSPACE)
         self.assertTrue(first.startswith("failed:"), first)
 
         owner = repo.create_user(self.conn, "pg-retry-owner@example.com")
         workspace_id = repo.create_workspace(self.conn, "PG Retry WS", owner)
         self.conn.commit()
-        fixed_event = dict(self._doomed_event())
-        fixed_event["metadata"] = {"workspace_id": workspace_id, "plan": "standard"}
 
-        second = self._process_once(event_id, event_type, fixed_event)
+        second = self._process_once(event_id, event_type, workspace_id)
         self.assertEqual(second, "succeeded")
         self.assertEqual(repo.get_entitlement_by_workspace(self.conn, workspace_id)["status"], "active")
 
     def test_first_attempt_failure_does_not_mark_event_successfully_processed(self):
         event_id, event_type = "evt_pg_retry_2", "customer.subscription.updated"
-        self._process_once(event_id, event_type, self._doomed_event())
+        self._process_once(event_id, event_type, self.DOOMED_WORKSPACE)
         cur = db.execute(self.conn, "SELECT processed_at, processing_error FROM webhook_events WHERE id = %s", (event_id,))
         row = db.normalize_row(cur.fetchone())
         self.assertIsNone(row["processed_at"])
@@ -1139,7 +1139,7 @@ class WebhookHardeningIntegrationTests(unittest.TestCase):
         should_process = repo.record_webhook_event(self.conn, "evt_pg_retry_3", "customer.subscription.updated")
         self.assertTrue(should_process)
         with self.assertRaises(Exception):
-            http_app._apply_webhook_event(self.conn, "customer.subscription.updated", self._doomed_event(), None)
+            self._apply(self.DOOMED_WORKSPACE)
         with self.assertRaises(psycopg.errors.InFailedSqlTransaction):
             repo.mark_webhook_event_processed(self.conn, "evt_pg_retry_3", error="without rollback, this itself fails")
         self.conn.rollback()  # the actual fix backend/http_app.py applies before this same call.
@@ -1149,13 +1149,7 @@ class WebhookHardeningIntegrationTests(unittest.TestCase):
 
     def test_concurrent_retry_of_the_same_previously_failed_event_is_single_success(self):
         event_id, event_type = "evt_pg_retry_4", "customer.subscription.updated"
-        self._process_once(event_id, event_type, self._doomed_event())  # first attempt fails, leaves it retryable.
-
-        owner = repo.create_user(self.conn, "pg-retry-concurrent-owner@example.com")
-        workspace_id = repo.create_workspace(self.conn, "PG Retry Concurrent WS", owner)
-        self.conn.commit()
-        fixed_event = dict(self._doomed_event())
-        fixed_event["metadata"] = {"workspace_id": workspace_id, "plan": "standard"}
+        self._process_once(event_id, event_type, self.DOOMED_WORKSPACE)  # first attempt fails, leaves it retryable.
 
         barrier = threading.Barrier(2)
         results = {}
@@ -1556,6 +1550,99 @@ class GitHubActionsIntegrationTests(unittest.TestCase):
             with self.assertRaises(db.integrity_error_class(self.conn)):
                 db.execute(self.conn, "UPDATE contract_ci_sources SET %s = ? WHERE contract_id = ?" % column, (value, contract))
             self.conn.rollback()
+
+
+class StripeBillingIntegrationTests(unittest.TestCase):
+    """D-115 against a REAL Postgres server: the per-workspace billing lock is
+    a row lock here (not SQLite's database lock), so these prove that
+    concurrent webhook deliveries - Stripe's same-second burst, redelivered
+    Quick events - serialize per workspace and end in exactly one correct
+    state, and that 0016's constraints hold."""
+
+    def setUp(self):
+        import tests.stripe_simulator as stripe_simulator
+        import backend.billing as billing_module
+        self.conn, _ = _reset_database_and_migrate()
+        self.addCleanup(self.conn.close)
+        self.prices = {key: "price_pg_%s" % key for key in plans_module.PRICE_MODES}
+        self.billing = billing_module.StripeBilling("sk_test_pg", "whsec_pg_test", dict(self.prices))
+        self.stripe = stripe_simulator.StripeSimulator(dict(self.prices))
+        self.billing._client = self.stripe
+        self.owner = repo.create_user(self.conn, "pg-stripe-%s@example.com" % repo.new_id())
+        self.conn.commit()
+
+    def _checkout(self, plan, interval):
+        ws = repo.create_workspace(self.conn, "PG Stripe WS", self.owner)
+        session = self.billing.create_checkout_session(plan, interval, ws, "https://a/ok", "https://a/no")
+        repo.record_checkout_session(self.conn, session["id"], ws, self.owner, plan, interval, self.billing.resolve_price_id(plan, interval),
+                                     "payment" if plan == "quick" else "subscription", None)
+        self.conn.commit()
+        return ws, session["id"]
+
+    def _deliver(self, event):
+        conn = db.connect_postgres(DSN)
+        try:
+            if not repo.record_webhook_event(conn, event["id"], event["type"]):
+                return "duplicate"
+            try:
+                outcome = http_app._apply_webhook_event(conn, self.billing, event["type"], event["data"]["object"])
+                repo.mark_webhook_event_processed(conn, event["id"], outcome=outcome)
+                return outcome
+            except Exception as exc:
+                conn.rollback()
+                repo.mark_webhook_event_processed(conn, event["id"], error=type(exc).__name__)
+                return "failed: %r" % exc
+        finally:
+            conn.close()
+
+    def _concurrently(self, events):
+        results, barrier = [], threading.Barrier(len(events))
+
+        def go(event):
+            barrier.wait(timeout=10)
+            results.append(self._deliver(event))
+
+        threads = [threading.Thread(target=go, args=(e,)) for e in events]
+        [t.start() for t in threads]
+        [t.join(60) for t in threads]
+        return results
+
+    def test_concurrent_same_second_burst_and_redeliveries_end_active(self):
+        ws, session_id = self._checkout("pro", "monthly")
+        burst = self.stripe.pay_checkout(session_id)
+        copies = [dict(e, id="%s_copy%d" % (e["id"], i)) for i in range(3) for e in burst]   # each event redelivered under new ids too
+        results = self._concurrently(burst + copies + [burst[0]] * 3)                        # ... and the same id concurrently
+        self.assertFalse([r for r in results if r.startswith("failed")], results)
+        ent = repo.get_entitlement_by_workspace(self.conn, ws)
+        self.assertEqual((ent["plan"], ent["status"], ent["billing_interval"]), ("pro", "active", "monthly"))
+        self.assertEqual(ent["stripe_subscription_id"], self.stripe.sessions[session_id]["subscription"])
+        self.assertEqual(db.execute(self.conn, "SELECT COUNT(*) AS n FROM entitlements").fetchone()["n"], 1)
+
+    def test_concurrent_quick_deliveries_grant_one_credit(self):
+        ws, session_id = self._checkout("quick", "one_time")
+        event = self.stripe.pay_checkout(session_id)[0]
+        events = [dict(event, id="evt_pg_q%d" % i, type="checkout.session.completed" if i % 2 else "checkout.session.async_payment_succeeded")
+                  for i in range(8)]
+        results = self._concurrently(events)
+        self.assertFalse([r for r in results if r.startswith("failed")], results)
+        self.assertEqual(sorted(results).count("applied:quick_credit_granted"), 1)
+        self.assertEqual(db.execute(self.conn, "SELECT COUNT(*) AS n FROM scan_credits WHERE workspace_id = ?", (ws,)).fetchone()["n"], 1)
+        self.assertEqual(repo.get_entitlement_by_workspace(self.conn, ws)["plan"], "quick")
+        self.assertEqual(repo.get_checkout_session(self.conn, session_id)["status"], "completed")
+
+    def test_0016_constraints(self):
+        ws, session_id = self._checkout("standard", "annual")
+        for column, value in (("status", "paid"), ("plan", "trial"), ("checkout_mode", "payment"), ("billing_interval", "one_time"), ("price_id", "evil")):
+            with self.subTest(column=column):
+                with self.assertRaises(psycopg.errors.CheckViolation):
+                    db.execute(self.conn, "UPDATE billing_checkout_sessions SET %s = ? WHERE id = ?" % column, (value, session_id))
+                self.conn.rollback()
+        with self.assertRaises(psycopg.errors.CheckViolation):
+            repo.record_checkout_session(self.conn, "not_a_session", ws, self.owner, "quick", "one_time", "price_x", "payment", None)
+        self.conn.rollback()
+        with self.assertRaises(psycopg.errors.CheckViolation):
+            db.execute(self.conn, "INSERT INTO webhook_events (id, event_type, received_at, outcome) VALUES ('evt_x', 't', now(), ?)", ("x" * 121,))
+        self.conn.rollback()
 
 
 class RestoreVerificationIntegrationTests(unittest.TestCase):

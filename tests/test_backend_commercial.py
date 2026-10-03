@@ -503,57 +503,77 @@ class IdempotencyTests(_LedgerCase):
 # ---------------------------------------------------------------------------
 
 class WebhookEntitlementTests(_LedgerCase):
+    """D-115 webhook -> entitlement with the Sandbox Price IDs, driven by
+    the Stripe simulator (tests/stripe_simulator.py): every session is a
+    real ledger row created through the backend's own checkout call, and
+    every event is what Stripe would emit for it."""
+
     def setUp(self):
         super().setUp()
         self.billing = billing.StripeBilling("sk_test_fake", "whsec_fake", dict(SANDBOX_PRICE_IDS))
+        self.billing._client = billing_tests._FakeStripeClient(SANDBOX_PRICE_IDS)   # no network
+        self.stripe = self.billing._client
         self.ws = repo.create_workspace(self.conn, "Hook WS", self.user)
 
-    def apply(self, event_type, obj, created=1_800_000_000):
-        http_app._apply_webhook_event(self.conn, event_type, obj, billing.stripe_timestamp_to_iso(created), self.billing)
+    def checkout(self, plan, interval):
+        session = self.billing.create_checkout_session(plan, interval, self.ws, "https://app.test/ok", "https://app.test/cancel")
+        repo.record_checkout_session(self.conn, session["id"], self.ws, self.user, plan, interval, self.billing.resolve_price_id(plan, interval),
+                                     plans.PRICE_MODES[plans.price_mode_key(plan, interval)]["checkout_mode"], None)
+        self.conn.commit()
+        return session["id"]
 
-    def quick_session(self, session_id="cs_q1", payment_status="paid"):
-        return {"id": session_id, "mode": "payment", "payment_status": payment_status, "client_reference_id": self.ws, "customer": "cus_q",
-                "metadata": {"workspace_id": self.ws, "plan": "quick", "interval": "one_time"}}
+    def deliver(self, events):
+        return [http_app._apply_webhook_event(self.conn, self.billing, e["type"], e["data"]["object"]) for e in events]
 
-    def subscription(self, price_id, status="active", start=1_800_000_000, plan_meta="standard"):
-        return {"id": "sub_1", "customer": "cus_s", "status": status, "metadata": {"workspace_id": self.ws, "plan": plan_meta, "interval": "monthly"},
-                "items": {"data": [{"price": {"id": price_id}, "current_period_start": start, "current_period_end": start + 86400 * 365}]}}
+    def entitlement(self):
+        return repo.get_entitlement_by_workspace(self.conn, self.ws)
 
     def test_quick_payment_grants_one_scan_idempotently(self):
-        self.apply("checkout.session.completed", self.quick_session(payment_status="unpaid"))
-        self.assertIsNone(repo.get_entitlement_by_workspace(self.conn, self.ws))             # not paid yet: nothing granted
-        self.apply("checkout.session.async_payment_succeeded", self.quick_session())
-        self.apply("checkout.session.completed", self.quick_session())                        # duplicate delivery
-        ent = repo.get_entitlement_by_workspace(self.conn, self.ws)
+        session_id = self.checkout("quick", "one_time")
+        outcomes = self.deliver(self.stripe.pay_checkout(session_id, async_payment=True))
+        self.assertEqual(outcomes, ["applied:awaiting_payment"])
+        self.assertIsNone(self.entitlement())                                                 # not paid yet: nothing granted
+        settled = self.stripe.settle_async_payment(session_id)
+        self.assertEqual(self.deliver(settled), ["applied:quick_credit_granted"])
+        self.assertEqual(self.deliver(settled), ["applied:quick_credit_already_granted"])     # duplicate delivery
+        ent = self.entitlement()
         self.assertEqual((ent["plan"], ent["status"], ent["stripe_subscription_id"], ent["billing_interval"]), ("quick", "active", None, None))
         self.assertEqual(repo.usage_summary(self.conn, self.ws, ent)["scans_available"], 1)
+        self.assertEqual(repo.get_checkout_session(self.conn, session_id)["status"], "completed")
 
     def test_subscription_plan_comes_from_the_price_id(self):
-        self.apply("customer.subscription.created", self.subscription(SANDBOX_PRICE_IDS["vericexa_standard_annual"]), created=1_800_000_000)
-        ent = repo.get_entitlement_by_workspace(self.conn, self.ws)
+        session_id = self.checkout("standard", "annual")
+        self.deliver(self.stripe.pay_checkout(session_id))
+        ent = self.entitlement()
+        sub_id = ent["stripe_subscription_id"]
         self.assertEqual((ent["plan"], ent["billing_interval"], ent["status"]), ("standard", "annual", "active"))
-        self.assertEqual(ent["current_period_start"], billing.stripe_timestamp_to_iso(1_800_000_000))
-        self.apply("customer.subscription.updated", self.subscription(SANDBOX_PRICE_IDS["vericexa_pro_monthly"], plan_meta="standard"), created=1_800_000_100)
-        ent = repo.get_entitlement_by_workspace(self.conn, self.ws)
-        self.assertEqual((ent["plan"], ent["billing_interval"]), ("pro", "monthly"))          # portal upgrade: price wins over stale metadata
-        self.apply("invoice.payment_failed", {"metadata": {"workspace_id": self.ws}}, created=1_800_000_200)
-        self.assertEqual(repo.get_entitlement_by_workspace(self.conn, self.ws)["status"], "past_due")
-        self.apply("invoice.paid", {"metadata": {"workspace_id": self.ws}}, created=1_800_000_300)
-        self.assertEqual(repo.get_entitlement_by_workspace(self.conn, self.ws)["status"], "active")
-        self.apply("customer.subscription.deleted", self.subscription(SANDBOX_PRICE_IDS["vericexa_pro_monthly"], status="canceled"), created=1_800_000_400)
-        self.assertEqual(repo.get_entitlement_by_workspace(self.conn, self.ws)["status"], "canceled")
+        self.assertEqual(ent["current_period_start"], billing.stripe_timestamp_to_iso(self.stripe.now))
+        self.deliver(self.stripe.change_price(sub_id, SANDBOX_PRICE_IDS["vericexa_pro_monthly"]))
+        ent = self.entitlement()
+        self.assertEqual((ent["plan"], ent["billing_interval"]), ("pro", "monthly"))         # portal upgrade: the Price decides, not metadata
+        self.deliver(self.stripe.renew(sub_id, paid=False))
+        self.assertEqual(self.entitlement()["status"], "past_due")
+        self.deliver(self.stripe.renew(sub_id, paid=True))
+        self.assertEqual(self.entitlement()["status"], "active")
+        self.deliver(self.stripe.cancel(sub_id))
+        self.assertEqual(self.entitlement()["status"], "canceled")
 
     def test_unknown_or_legacy_price_never_grants(self):
-        self.apply("customer.subscription.created", self.subscription("price_old_d086_quick_monthly", plan_meta="quick"))
-        self.assertIsNone(repo.get_entitlement_by_workspace(self.conn, self.ws))
-        self.apply("customer.subscription.created", self.subscription(SANDBOX_PRICE_IDS["vericexa_quick_onetime"], plan_meta="quick"))   # the Quick price is not a subscription
-        self.assertIsNone(repo.get_entitlement_by_workspace(self.conn, self.ws))
+        for price in ("price_old_d086_quick_monthly", SANDBOX_PRICE_IDS["vericexa_quick_onetime"]):   # retired / not a subscription price
+            ws = repo.create_workspace(self.conn, "Legacy WS", self.user)
+            self.ws = ws
+            session_id = self.checkout("standard", "monthly")
+            events = self.stripe.pay_checkout(session_id)
+            sub_id = self.stripe.sessions[session_id]["subscription"]
+            self.stripe.subscriptions_store[sub_id]["items"]["data"][0]["price"] = {"id": price}
+            self.assertEqual(set(self.deliver(events)), {"rejected:unknown_price"})
+            self.assertIsNone(self.entitlement())
 
     def test_quick_payment_never_overrides_a_live_subscription(self):
-        self.apply("customer.subscription.created", self.subscription(SANDBOX_PRICE_IDS["vericexa_standard_monthly"]))
-        self.apply("checkout.session.completed", self.quick_session())
-        ent = repo.get_entitlement_by_workspace(self.conn, self.ws)
-        self.assertEqual(ent["plan"], "standard")
+        self.deliver(self.stripe.pay_checkout(self.checkout("standard", "monthly")))
+        quick = self.checkout("quick", "one_time")            # (checkout refuses this over HTTP; defense in depth)
+        self.assertEqual(self.deliver(self.stripe.pay_checkout(quick)), ["rejected:quick_with_live_subscription"])
+        self.assertEqual(self.entitlement()["plan"], "standard")
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM scan_credits").fetchone()[0], 0)
 
 
@@ -662,21 +682,22 @@ class QuickCheckoutAndPortalHttpTests(billing_tests._BillingHttpTestCase):
         self.assertEqual((status, json.loads(body)["error"]), (409, "this workspace has no subscription to manage"))
 
     def test_signed_quick_webhook_grants_exactly_one_credit(self):
-        ws = self._create_workspace("Quick Hook WS")
-        session = {"id": "cs_test_quick_hook", "mode": "payment", "payment_status": "paid", "client_reference_id": ws, "customer": "cus_qh",
-                   "metadata": {"workspace_id": ws, "plan": "quick", "interval": "one_time"}}
-        first = billing_tests._event("checkout.session.completed", "evt_quick_1", session, created=1_800_000_000)
+        cookie, ws, _ = self._login_and_own_workspace("quick-hook@example.com")
+        self.assertEqual(self.post_json("/billing/checkout", {"workspace_id": ws, "plan": "quick"}, headers={"Cookie": cookie})[0], 200)
+        session_id = list(self.billing._client.sessions)[-1]                                           # the session the checkout created
+        first = self.billing._client.pay_checkout(session_id)[0]
         self.assertEqual(self.post_webhook(first)[0], 200)
         status, _, body = self.post_webhook(first)                                                     # same event.id redelivered
         self.assertEqual((status, json.loads(body).get("duplicate")), (200, True))
-        retry = billing_tests._event("checkout.session.async_payment_succeeded", "evt_quick_2", session, created=1_800_000_100)
-        self.assertEqual(self.post_webhook(retry)[0], 200)                                             # new event, same session
+        retry = dict(first, id="evt_quick_retry", type="checkout.session.async_payment_succeeded")
+        status, _, body = self.post_webhook(retry)                                                     # new event, same session
+        self.assertEqual((status, json.loads(body)["outcome"]), (200, "applied:quick_credit_already_granted"))
         conn = repo.connect(self.db_path)
         ent = repo.get_entitlement_by_workspace(conn, ws)
         credits = conn.execute("SELECT id, status FROM scan_credits WHERE workspace_id = ?", (ws,)).fetchall()
         conn.close()
         self.assertEqual((ent["plan"], ent["status"], ent["stripe_subscription_id"]), ("quick", "active", None))
-        self.assertEqual([tuple(c) for c in credits], [("cs_test_quick_hook", "available")])
+        self.assertEqual([tuple(c) for c in credits], [(session_id, "available")])
 
     def test_portal_for_every_subscription_mode(self):
         for plan, interval in (("standard", "monthly"), ("standard", "annual"), ("pro", "monthly"), ("pro", "annual")):
