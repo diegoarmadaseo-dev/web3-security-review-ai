@@ -33,6 +33,8 @@ what the code actually reads.
 | `SECURE_COOKIES` | `Secure` cookie flag. Set `false` only for plain-HTTP local/staging. | No | No | `true` |
 | `HTTP_HOST` / `HTTP_PORT` | Bind address for the HTTP server. | No | No | `0.0.0.0` / `8080` |
 | `SHUTDOWN_GRACE_SECONDS` | Seconds `_serve_until_shutdown()` waits for in-flight requests to finish after SIGTERM/SIGINT before closing anyway. | No | No | `30` |
+| `MAX_PENDING_JOBS_PER_WORKSPACE` | D-108: queued + claimed + running scans allowed per workspace; the next submission gets `429 too_many_pending_jobs`. Positive integer. | No | No | `5` |
+| `SUBMIT_RATE_LIMIT_PER_MINUTE` | D-108: scan-submission requests (`POST /workspaces/<id>/jobs`) per user per 60 s; the next one gets `429 submit_rate_limited` with `Retry-After`. Every request from an identified member counts, including ones that end in 402/413 and retries with the same `idempotency_key`; only a request refused by this limit is not counted. Abuse protection only, independent of the LOC allowance. Positive integer. | No | No | `10` |
 
 ## Object storage (both roles)
 

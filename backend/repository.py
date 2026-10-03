@@ -35,6 +35,7 @@ backend/db.py.
 """
 from __future__ import annotations
 
+import math
 import os
 import sqlite3
 import uuid
@@ -462,25 +463,32 @@ def enqueue_job(
     return job_id
 
 
-def _insert_job(conn: Any, workspace_id: str, contract_id: str, requested_by_user_id: str, mode: str, idempotency_key: Optional[str]) -> str:
-    """enqueue_job()'s two statements without the commit, so
-    enqueue_job_with_usage() can put the usage reservation in the SAME
-    transaction."""
-    if mode not in ("quick", "standard", "pro"):
-        raise RepositoryError("mode must be one of quick/standard/pro, got %r" % mode)
-    job_id = new_id()
-    now = utcnow_iso()
+def _ensure_queue_state(conn: Any, workspace_id: str) -> None:
     db.execute(
         conn,
         "INSERT INTO workspace_queue_state (workspace_id, created_at, last_claimed_at) VALUES (?, ?, NULL) "
         "ON CONFLICT (workspace_id) DO NOTHING",
-        (workspace_id, now),
+        (workspace_id, utcnow_iso()),
     )
+
+
+def _insert_job(conn: Any, workspace_id: str, contract_id: str, requested_by_user_id: str, mode: str, idempotency_key: Optional[str], priority: int = 0) -> str:
+    """enqueue_job()'s two statements without the commit, so
+    enqueue_job_with_usage() can put the usage reservation in the SAME
+    transaction. priority (D-108) is 1 only for a job admitted under a
+    priority plan - see claim_next_job()."""
+    if mode not in ("quick", "standard", "pro"):
+        raise RepositoryError("mode must be one of quick/standard/pro, got %r" % mode)
+    if priority not in (0, 1):
+        raise RepositoryError("priority must be 0 or 1, got %r" % (priority,))
+    job_id = new_id()
+    now = utcnow_iso()
+    _ensure_queue_state(conn, workspace_id)
     db.execute(
         conn,
-        "INSERT INTO analysis_jobs (id, workspace_id, contract_id, requested_by_user_id, mode, idempotency_key, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (job_id, workspace_id, contract_id, requested_by_user_id, mode, idempotency_key, now),
+        "INSERT INTO analysis_jobs (id, workspace_id, contract_id, requested_by_user_id, mode, idempotency_key, created_at, priority) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (job_id, workspace_id, contract_id, requested_by_user_id, mode, idempotency_key, now, priority),
     )
     return job_id
 
@@ -560,6 +568,20 @@ QUEUE_FAIRNESS_BACKOFF_BASE_SECONDS = 5
 QUEUE_FAIRNESS_BACKOFF_MAX_SECONDS = 60
 
 
+# PRO QUEUE PRIORITY (docs/decisiones.md D-108): a job admitted under a
+# priority plan (analysis_jobs.priority = 1, Pro) makes its workspace compete
+# in claim_next_job() as if that workspace had last been served this many
+# seconds EARLIER than it really was. Preference, never exclusivity: every
+# claim moves the served workspace's own last_claimed_at forward, so a
+# waiting Standard/Quick workspace is served as soon as its own last claim
+# is older than the busiest priority workspace's last claim minus this bonus
+# - its wait is bounded (about one bonus window plus one round of the
+# priority workspaces), never starved. Per-workspace fairness and isolation
+# are unchanged: the key is still per workspace, and nothing reads another
+# workspace's data.
+QUEUE_PRIORITY_BONUS_SECONDS = 300
+
+
 def _compute_next_eligible_at(now: datetime, attempt_count_before_requeue: int) -> str:
     backoff = min(
         QUEUE_FAIRNESS_BACKOFF_BASE_SECONDS * (2 ** attempt_count_before_requeue),
@@ -599,7 +621,14 @@ def claim_next_job(conn: Any, worker_id: str) -> Optional[Dict[str, Any]]:
     collision - never relying on timestamp resolution alone. Budget
     (workspace_budgets) and plan/entitlement are NEVER inputs to this
     ordering - fairness here is completely independent of both, by
-    design (see the read-only design audit for why)."""
+    design (see the read-only design audit for why).
+
+    D-108 PRO PRIORITY: the workspace key is last_claimed_at minus
+    QUEUE_PRIORITY_BONUS_SECONDS for a priority job (analysis_jobs.priority,
+    fixed at admission - the entitlement itself is still never read here),
+    and among never-served workspaces (NULL key) a priority job sorts first.
+    Everything else in the chain above is unchanged; a job with priority 0
+    orders exactly as before."""
     if db.is_postgres(conn):
         return _claim_next_job_postgres(conn, worker_id)
     return _claim_next_job_sqlite(conn, worker_id)
@@ -609,8 +638,14 @@ def _lease_expiry(now: datetime) -> str:
     return (now + timedelta(seconds=LEASE_DURATION_SECONDS)).isoformat()
 
 
+# A priority-0 job keeps the exact stored last_claimed_at text as its key
+# (no float conversion, so microsecond-apart claims still order exactly); a
+# priority job's key is the same instant shifted back by the bonus, in the
+# same lexicographically comparable UTC form. NULL stays NULL, so a
+# never-served workspace still sorts first (SQLite's ASC puts NULL first).
 _CLAIM_CANDIDATE_ORDER_SQL = (
-    "s.last_claimed_at ASC, s.created_at ASC, j.created_at ASC, j.id ASC"
+    "CASE WHEN j.priority = 1 THEN strftime('%Y-%m-%dT%H:%M:%f', s.last_claimed_at, ?) ELSE s.last_claimed_at END ASC, "
+    "j.priority DESC, s.created_at ASC, j.created_at ASC, j.id ASC"
 )
 
 
@@ -652,7 +687,7 @@ def _claim_next_job_sqlite(conn: Any, worker_id: str) -> Optional[Dict[str, Any]
             "JOIN workspace_queue_state s ON s.workspace_id = j.workspace_id "
             "WHERE j.status = 'queued' AND (j.next_eligible_at IS NULL OR j.next_eligible_at <= ?) "
             "ORDER BY " + _CLAIM_CANDIDATE_ORDER_SQL + " LIMIT 1",
-            (now_iso,),
+            (now_iso, "-%d seconds" % QUEUE_PRIORITY_BONUS_SECONDS),
         )
         row = cur.fetchone()
         if row is None:
@@ -716,13 +751,14 @@ def _claim_next_job_postgres(conn: Any, worker_id: str) -> Optional[Dict[str, An
         "  SELECT j.id, j.workspace_id FROM analysis_jobs j "
         "  JOIN workspace_queue_state s ON s.workspace_id = j.workspace_id "
         "  WHERE j.status = 'queued' AND (j.next_eligible_at IS NULL OR j.next_eligible_at <= ?) "
-        "  ORDER BY s.last_claimed_at ASC NULLS FIRST, s.created_at ASC, j.created_at ASC, j.id ASC "
+        "  ORDER BY (s.last_claimed_at - j.priority * ? * INTERVAL '1 second') ASC NULLS FIRST, j.priority DESC, "
+        "  s.created_at ASC, j.created_at ASC, j.id ASC "
         "  FOR UPDATE OF s, j SKIP LOCKED LIMIT 1"
         ") "
         "UPDATE analysis_jobs SET status = 'claimed', claimed_by = ?, claimed_at = ?, lease_expires_at = ? "
         "FROM candidate WHERE analysis_jobs.id = candidate.id "
         "RETURNING analysis_jobs.*",
-        (now_iso, worker_id, now_iso, _lease_expiry(now)),
+        (now_iso, QUEUE_PRIORITY_BONUS_SECONDS, worker_id, now_iso, _lease_expiry(now)),
     )
     row = cur.fetchone()
     if row is not None:
@@ -867,7 +903,11 @@ def reap_expired_jobs(conn: Any, max_attempts: int = _MAX_JOB_ATTEMPTS) -> Dict[
             conn.rollback()  # another reaper (or the job's own real completion) already won this exact row.
             continue
         try:
-            if job["status"] == "running":
+            # D-108: a job admitted with a usage ledger row reserved its
+            # technical budget at admission (technical_budget_periods), never
+            # in workspace_budgets - only a ledger-less job's legacy
+            # claim-time reservation is released here.
+            if job["status"] == "running" and get_job_usage(conn, job["id"]) is None:
                 # Same statement release_workspace_budget() itself runs -
                 # inlined, never that function, so this stays in the ONE
                 # transaction the job UPDATE above already opened (see
@@ -913,12 +953,13 @@ PLAN_ALLOWED_MODES = plans.PLAN_ALLOWED_MODES   # D-107: the catalog is the sing
 # Stripe/entitlements remain Phase 3 and are untouched by this section)
 # ---------------------------------------------------------------------------
 
-# An INTERNAL cost/abuse safeguard only - never a commercial monthly
-# allowance, never advertised as one (docs/decisiones.md D-086 reconfirms
-# this explicitly). Flat across every plan and never reset on any cycle -
-# a relative per-mode cost against one shared ceiling per workspace, not
-# tied to any real dollar figure or to the (now confirmed, D-086) plan
-# prices at all.
+# LEGACY (D-108): this never-resetting 100-unit ceiling now applies ONLY to
+# a job enqueued without a usage ledger row (enqueue_job(): internal/test
+# paths, or jobs admitted before D-107). Every job admitted through
+# POST /workspaces/<id>/jobs (enqueue_job_with_usage()) is guarded instead by
+# the per-service-month technical budget below (technical_budget_periods),
+# reserved at admission - so a scan the commercial contract accepted is never
+# failed later by this ceiling. Never a commercial allowance either way.
 DEFAULT_BUDGET_LIMIT_UNITS = 100
 JOB_MODE_BUDGET_COST = {"quick": 1, "standard": 2, "pro": 4}
 
@@ -1193,7 +1234,49 @@ def finalize_job_attempt(
 # finalization can never consume or release twice. A reservation made in
 # one service month is settled against that month even if the job ends
 # in the next one.
+#
+# D-108 adds, in the SAME admission transaction:
+#   - the pending-jobs cap (queued + claimed + running per workspace),
+#     counted under a per-workspace lock so concurrent submissions can never
+#     overshoot it; it frees itself the moment a job leaves those statuses
+#     (succeeded, failed, canceled, reaped to failed) - nothing to release;
+#   - the TECHNICAL budget for Standard/Pro (technical_budget_periods): a
+#     runaway-cost guard, never a second commercial quota. Reserved with the
+#     LOC, per service month (so it resets with it), settled with the job:
+#     succeeded -> consumed; failed after the engine actually ran
+#     (started_at set) -> consumed too, because compute was spent - this is
+#     what stops an endless loop of failing scans, whose LOC is given back;
+#     failed before running / canceled -> released; requeued -> reserved.
+#     Quick has no technical budget: its scan credit already bounds it to
+#     one job per purchase, so no hidden second limit exists there.
 # ---------------------------------------------------------------------------
+
+DEFAULT_MAX_PENDING_JOBS_PER_WORKSPACE = 5
+PENDING_JOB_STATUSES = ("queued", "claimed", "running")
+
+# The technical ceiling is a TECHNICAL HEURISTIC, derived rather than
+# hand-picked per plan: (monthly LOC quota / TECHNICAL_GUARD_MIN_LOC_PER_SCAN)
+# x the cost of the most expensive mode the plan may run (JOB_MODE_BUDGET_COST)
+# - Standard 20,000 / 20 x 2 = 2,000 units; Pro 60,000 / 20 x 4 = 12,000.
+# A unit is a relative per-job compute weight (quick 1, standard 2, pro 4),
+# NOT a LOC equivalent: no number of units maps to a number of LOC, and the
+# units are never sold, shown as an allowance, or used to bill. The derivation
+# only guarantees that a workspace whose scans succeed and average at least
+# 20 effective LOC exhausts its commercial LOC allowance first, so the guard
+# can only trip on runaway patterns (hundreds of tiny scans, or scans that
+# keep reaching the engine and failing). It is refused at admission, in the
+# same transaction as the LOC reservation - never after a scan was admitted.
+TECHNICAL_GUARD_MIN_LOC_PER_SCAN = 20
+
+
+def technical_budget_limit_units(plan_name: str) -> Optional[int]:
+    """The per-service-month technical ceiling for plan_name, or None when
+    the plan has none (Quick: bounded by its scan credit)."""
+    spec = plans.PLANS.get(plan_name)
+    if spec is None or spec["usage_model"] != plans.USAGE_SERVICE_MONTH:
+        return None
+    max_cost = max(JOB_MODE_BUDGET_COST[m] for m in plans.PLAN_ALLOWED_MODES[plan_name])
+    return (spec["monthly_loc_quota"] // TECHNICAL_GUARD_MIN_LOC_PER_SCAN) * max_cost
 
 class UsageLimitError(RepositoryError):
     """A submission refused by the commercial contract. `code` is a
@@ -1276,6 +1359,7 @@ def enqueue_job_with_usage(
     entitlement: Dict[str, Any],
     effective_loc: int,
     now: Optional[datetime] = None,
+    max_pending_jobs: int = DEFAULT_MAX_PENDING_JOBS_PER_WORKSPACE,
 ) -> str:
     """Admission control for one submission: checks the plan's per-scan
     ceiling, then enqueues the job AND reserves its usage in ONE
@@ -1284,7 +1368,15 @@ def enqueue_job_with_usage(
     rolling back: no job, no reservation) when the plan does not allow it;
     no overage is ever granted. An IntegrityError from the job INSERT (a
     concurrent duplicate idempotency_key) propagates unchanged for the
-    caller's existing duplicate handling, before any reservation exists."""
+    caller's existing duplicate handling, before any reservation exists.
+
+    D-108: the whole transaction holds a per-workspace admission lock
+    (_lock_workspace_admission()), then refuses with too_many_pending_jobs
+    when max_pending_jobs jobs are already queued/claimed/running, and for
+    Standard/Pro also reserves the job's technical units
+    (technical_budget_exhausted when the safety ceiling is reached). The job
+    carries priority 1 when the plan's catalog queue_priority is
+    "priority"."""
     plan_name = entitlement.get("plan")
     if plan_name not in plans.PLANS:
         raise UsageLimitError("plan_unknown", "the workspace entitlement has no known plan")
@@ -1296,7 +1388,23 @@ def enqueue_job_with_usage(
             "loc_per_scan_limit_exceeded",
             "the submission has %d effective LOC; the %s plan allows at most %d per scan" % (effective_loc, spec["display_name"], spec["max_loc_per_scan"]),
         )
-    job_id = _insert_job(conn, workspace_id, contract_id, requested_by_user_id, mode, idempotency_key)
+    if not isinstance(max_pending_jobs, int) or max_pending_jobs < 1:
+        raise RepositoryError("max_pending_jobs must be a positive integer, got %r" % (max_pending_jobs,))
+    try:
+        _lock_workspace_admission(conn, workspace_id)
+        if _count_pending_jobs(conn, workspace_id) >= max_pending_jobs:
+            conn.rollback()
+            raise UsageLimitError(
+                "too_many_pending_jobs",
+                "this workspace already has %d scans queued or running; wait for one to finish" % max_pending_jobs,
+            )
+        priority = 1 if spec["queue_priority"] == "priority" else 0
+        job_id = _insert_job(conn, workspace_id, contract_id, requested_by_user_id, mode, idempotency_key, priority)
+    except UsageLimitError:
+        raise
+    except Exception:
+        conn.rollback()
+        raise
     try:
         now_iso = utcnow_iso()
         if spec["usage_model"] == plans.USAGE_SCAN_CREDIT:
@@ -1331,11 +1439,31 @@ def enqueue_job_with_usage(
                     "loc_quota_exceeded",
                     "the submission has %d effective LOC, more than what is left of this service month's %d effective LOC allowance" % (effective_loc, limit),
                 )
+            tech_units = JOB_MODE_BUDGET_COST[mode]
+            tech_limit = technical_budget_limit_units(plan_name)
             db.execute(
                 conn,
-                "INSERT INTO job_usage (job_id, workspace_id, plan, usage_model, effective_loc, period_start, credit_id, status, created_at, updated_at) "
-                "VALUES (?, ?, ?, 'service_month', ?, ?, NULL, 'reserved', ?, ?)",
-                (job_id, workspace_id, plan_name, effective_loc, period_start, now_iso, now_iso),
+                "INSERT INTO technical_budget_periods (workspace_id, period_start, period_end, limit_units, reserved_units, consumed_units, updated_at) "
+                "VALUES (?, ?, ?, ?, 0, 0, ?) ON CONFLICT (workspace_id, period_start) DO NOTHING",
+                (workspace_id, period_start, period_end, tech_limit, now_iso),
+            )
+            cur = db.execute(
+                conn,
+                "UPDATE technical_budget_periods SET reserved_units = reserved_units + ?, limit_units = ?, updated_at = ? "
+                "WHERE workspace_id = ? AND period_start = ? AND reserved_units + consumed_units + ? <= ?",
+                (tech_units, tech_limit, now_iso, workspace_id, period_start, tech_units, tech_limit),
+            )
+            if cur.rowcount == 0:
+                conn.rollback()
+                raise UsageLimitError(
+                    "technical_budget_exhausted",
+                    "this workspace reached its technical safety limit for the current service month; contact support",
+                )
+            db.execute(
+                conn,
+                "INSERT INTO job_usage (job_id, workspace_id, plan, usage_model, effective_loc, period_start, credit_id, status, created_at, updated_at, tech_units) "
+                "VALUES (?, ?, ?, 'service_month', ?, ?, NULL, 'reserved', ?, ?, ?)",
+                (job_id, workspace_id, plan_name, effective_loc, period_start, now_iso, now_iso, tech_units),
             )
         conn.commit()
     except UsageLimitError:
@@ -1344,6 +1472,37 @@ def enqueue_job_with_usage(
         conn.rollback()
         raise
     return job_id
+
+
+def _lock_workspace_admission(conn: Any, workspace_id: str) -> None:
+    """Serializes admissions of ONE workspace for the rest of the current
+    transaction, so the pending-jobs count below cannot be raced. Postgres:
+    a row lock on the workspace's own workspace_queue_state row (created
+    first if needed) - other workspaces never contend, and claim_next_job()
+    simply SKIP LOCKs this workspace for the instant it is held. SQLite (no
+    row locks): BEGIN IMMEDIATE takes the database write lock up front."""
+    if db.is_postgres(conn):
+        _ensure_queue_state(conn, workspace_id)
+        db.execute(conn, "SELECT workspace_id FROM workspace_queue_state WHERE workspace_id = ? FOR UPDATE", (workspace_id,))
+    else:
+        if not conn.in_transaction:
+            db.execute(conn, "BEGIN IMMEDIATE")
+        _ensure_queue_state(conn, workspace_id)
+
+
+def _count_pending_jobs(conn: Any, workspace_id: str) -> int:
+    cur = db.execute(
+        conn,
+        "SELECT COUNT(*) AS n FROM analysis_jobs WHERE workspace_id = ? AND status IN (?, ?, ?)",
+        (workspace_id,) + PENDING_JOB_STATUSES,
+    )
+    return int(db.normalize_row(cur.fetchone())["n"])
+
+
+def count_pending_jobs(conn: Any, workspace_id: str) -> int:
+    """Non-binding read for the HTTP pre-check; the binding check is the
+    locked one inside enqueue_job_with_usage()."""
+    return _count_pending_jobs(conn, workspace_id)
 
 
 def _settle_job_usage(conn: Any, job_id: str, action: str) -> bool:
@@ -1380,6 +1539,28 @@ def _settle_job_usage(conn: Any, job_id: str, action: str) -> bool:
             "UPDATE usage_periods SET reserved_loc = reserved_loc - ?, updated_at = ? WHERE workspace_id = ? AND period_start = ?",
             (row["effective_loc"], now, row["workspace_id"], row["period_start"]),
         )
+    tech_units = int(row.get("tech_units") or 0)
+    if tech_units > 0 and row["period_start"] is not None:
+        # Technical units follow the COMPUTE, not the commercial outcome: a
+        # job that reached the engine (started_at set, on this attempt or an
+        # earlier reaped one) spent it even when it failed.
+        spent = action == "consume"
+        if not spent:
+            started = db.normalize_row(db.execute(conn, "SELECT started_at FROM analysis_jobs WHERE id = ?", (job_id,)).fetchone())
+            spent = started is not None and started["started_at"] is not None
+        if spent:
+            db.execute(
+                conn,
+                "UPDATE technical_budget_periods SET reserved_units = reserved_units - ?, consumed_units = consumed_units + ?, updated_at = ? "
+                "WHERE workspace_id = ? AND period_start = ?",
+                (tech_units, tech_units, now, row["workspace_id"], row["period_start"]),
+            )
+        else:
+            db.execute(
+                conn,
+                "UPDATE technical_budget_periods SET reserved_units = reserved_units - ?, updated_at = ? WHERE workspace_id = ? AND period_start = ?",
+                (tech_units, now, row["workspace_id"], row["period_start"]),
+            )
     return True
 
 
@@ -1393,6 +1574,96 @@ def _settle_for_transition(conn: Any, job_id: str, to_status: str) -> None:
 def get_job_usage(conn: Any, job_id: str) -> Optional[Dict[str, Any]]:
     cur = db.execute(conn, "SELECT * FROM job_usage WHERE job_id = ?", (job_id,))
     return db.normalize_row(cur.fetchone())
+
+
+def technical_budget_summary(conn: Any, workspace_id: str, entitlement: Optional[Dict[str, Any]], now: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
+    """The technical safety guard's state for the current service month
+    (GET /workspaces/<id> "budget"), or None when the plan has none."""
+    if entitlement is None:
+        return None
+    limit = technical_budget_limit_units(entitlement.get("plan"))
+    if limit is None:
+        return None
+    period_start, period_end = usage_period_for_entitlement(entitlement, now)
+    cur = db.execute(
+        conn,
+        "SELECT reserved_units, consumed_units FROM technical_budget_periods WHERE workspace_id = ? AND period_start = ?",
+        (workspace_id, period_start),
+    )
+    row = db.normalize_row(cur.fetchone()) or {"reserved_units": 0, "consumed_units": 0}
+    return {"period_start": period_start, "period_end": period_end, "limit_units": limit,
+            "reserved_units": row["reserved_units"], "consumed_units": row["consumed_units"]}
+
+
+# ---------------------------------------------------------------------------
+# Submit rate limit (D-108) - abuse protection for POST /workspaces/<id>/jobs,
+# per user across all their workspaces. Independent of (and never a
+# substitute for) the LOC allowance: it limits how OFTEN a user may submit,
+# not how much.
+#
+# ONE SEMANTIC: every submit request from an identified workspace member is
+# one attempt, counted before its body is read - whatever happens to it
+# afterwards (200, duplicate 200 for a reused idempotency_key, 400, 402, 413,
+# 422, 429 too_many_pending_jobs / technical_budget_exhausted). Idempotency
+# prevents a second job or a second reservation; it never exempts a request
+# from this HTTP protection. The only request that does NOT become an attempt
+# is one refused by this rate limit itself (429 submit_rate_limited +
+# Retry-After). Requests refused before the caller is identified (cross-
+# origin, job execution not configured, declared Content-Length too large,
+# 401, 403 non-member) cannot be attributed to a user and are not counted.
+# ---------------------------------------------------------------------------
+
+SUBMIT_RATE_LIMIT_WINDOW_SECONDS = 60
+DEFAULT_SUBMIT_RATE_LIMIT_PER_WINDOW = 10
+
+
+def check_submit_rate_limit(
+    conn: Any,
+    user_id: str,
+    workspace_id: str,
+    max_per_window: int = DEFAULT_SUBMIT_RATE_LIMIT_PER_WINDOW,
+    window_seconds: int = SUBMIT_RATE_LIMIT_WINDOW_SECONDS,
+    now: Optional[datetime] = None,
+) -> int:
+    """Records one submission attempt and returns 0 when it is within the
+    sliding window, else the whole seconds until the oldest counted attempt
+    leaves the window (the Retry-After value, 1..window_seconds). The count
+    and the insert run under a per-USER lock (Postgres: the users row FOR
+    UPDATE; SQLite: BEGIN IMMEDIATE), so a burst of concurrent attempts is
+    admitted exactly up to the limit - never over it, and never refused
+    wholesale. A refused attempt records nothing, so hammering never extends
+    the caller's own wait. Rows older than the window are pruned."""
+    if not isinstance(max_per_window, int) or max_per_window < 1:
+        raise RepositoryError("max_per_window must be a positive integer, got %r" % (max_per_window,))
+    now = now or datetime.now(timezone.utc)
+    cutoff = (now - timedelta(seconds=window_seconds)).isoformat()
+    try:
+        if db.is_postgres(conn):
+            db.execute(conn, "SELECT id FROM users WHERE id = ? FOR UPDATE", (user_id,))
+        elif not conn.in_transaction:
+            db.execute(conn, "BEGIN IMMEDIATE")
+        db.execute(conn, "DELETE FROM submit_attempts WHERE user_id = ? AND created_at < ?", (user_id, cutoff))
+        cur = db.execute(
+            conn,
+            "SELECT COUNT(*) AS n, MIN(created_at) AS oldest FROM submit_attempts WHERE user_id = ?",
+            (user_id,),
+        )
+        row = db.normalize_row(cur.fetchone())
+        if int(row["n"]) >= max_per_window:
+            conn.commit()   # keeps the prune
+            oldest = _parse_iso(row["oldest"]) or now
+            remaining = window_seconds - (now - oldest).total_seconds()
+            return max(1, min(window_seconds, int(math.ceil(remaining))))
+        db.execute(
+            conn,
+            "INSERT INTO submit_attempts (id, user_id, workspace_id, created_at) VALUES (?, ?, ?, ?)",
+            (new_id(), user_id, workspace_id, now.isoformat()),
+        )
+        conn.commit()
+        return 0
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def usage_summary(conn: Any, workspace_id: str, entitlement: Optional[Dict[str, Any]], now: Optional[datetime] = None) -> Optional[Dict[str, Any]]:

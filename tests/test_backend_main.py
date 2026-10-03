@@ -157,6 +157,21 @@ class WebRoleFailFastTests(unittest.TestCase):
         self.assertEqual(cfg["stripe_price_allowlist"]["vericexa_quick_onetime"], "price_quick_onetime")
         self.assertEqual(len(cfg["stripe_price_allowlist"]), 5)
 
+    def test_admission_guards_default_and_are_configurable(self):
+        # D-108: pending-jobs cap and submit rate limit.
+        with patch.dict(os.environ, _FAKE_WEB_ENV, clear=True):
+            cfg = main._load_web_config()
+        self.assertEqual((cfg["max_pending_jobs_per_workspace"], cfg["submit_rate_limit_per_minute"]), (5, 10))
+        env = dict(_FAKE_WEB_ENV, MAX_PENDING_JOBS_PER_WORKSPACE="3", SUBMIT_RATE_LIMIT_PER_MINUTE="20")
+        with patch.dict(os.environ, env, clear=True):
+            cfg = main._load_web_config()
+        self.assertEqual((cfg["max_pending_jobs_per_workspace"], cfg["submit_rate_limit_per_minute"]), (3, 20))
+        for var in ("MAX_PENDING_JOBS_PER_WORKSPACE", "SUBMIT_RATE_LIMIT_PER_MINUTE"):
+            for bad in ("0", "-1", "abc"):
+                with self.subTest(var=var, value=bad), patch.dict(os.environ, dict(_FAKE_WEB_ENV, **{var: bad}), clear=True):
+                    with self.assertRaises(main.ConfigError):
+                        main._load_web_config()
+
     def test_retired_d086_quick_subscription_variables_are_rejected(self):
         for var in ("STRIPE_PRICE_QUICK_MONTHLY", "STRIPE_PRICE_QUICK_ANNUAL"):
             env = dict(_FAKE_WEB_ENV, **{var: "price_old_quick"})

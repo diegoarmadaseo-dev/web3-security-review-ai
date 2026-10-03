@@ -35,6 +35,7 @@ for the full detail on each.
 - `SECURE_COOKIES` - **SUPPLIED** (defaults `true`; set `false` only if staging is plain HTTP with no TLS terminator in front of it).
 - `HTTP_HOST` / `HTTP_PORT` - **SUPPLIED** (defaults are fine behind any reverse proxy/load balancer).
 - `SHUTDOWN_GRACE_SECONDS` - **SUPPLIED** (default 30).
+- `MAX_PENDING_JOBS_PER_WORKSPACE` / `SUBMIT_RATE_LIMIT_PER_MINUTE` - **SUPPLIED** (defaults 5 and 10, D-108).
 
 ### Object storage
 - `S3_BUCKET` / `S3_REGION` - **DIEGO**: a disposable staging bucket.

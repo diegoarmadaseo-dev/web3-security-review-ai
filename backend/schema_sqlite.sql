@@ -147,7 +147,11 @@ CREATE TABLE analysis_jobs (
     -- ever sets it, as a retry-backoff gate - see that function's own
     -- docstring. Purely a WHERE-clause eligibility filter, never an
     -- ORDER BY key - created_at remains the sole FIFO/audit timestamp.
-    next_eligible_at        TEXT
+    next_eligible_at        TEXT,
+    -- D-108 (backend/migrations/0010_commercial_guards.sql's mirror): 1 for
+    -- a job admitted under a priority plan (Pro), read only by
+    -- claim_next_job()'s ordering.
+    priority                INTEGER NOT NULL DEFAULT 0 CHECK (priority IN (0, 1))
 );
 CREATE INDEX idx_analysis_jobs_workspace ON analysis_jobs(workspace_id);
 CREATE INDEX idx_analysis_jobs_claim_queue ON analysis_jobs(status, next_eligible_at, created_at);
@@ -272,9 +276,33 @@ CREATE TABLE job_usage (
     status         TEXT NOT NULL CHECK (status IN ('reserved', 'consumed', 'released')),
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL,
+    tech_units     INTEGER NOT NULL DEFAULT 0 CHECK (tech_units >= 0),   -- D-108
     CHECK (
         (usage_model = 'scan_credit' AND credit_id IS NOT NULL AND period_start IS NULL)
         OR (usage_model = 'service_month' AND period_start IS NOT NULL AND credit_id IS NULL)
     )
 );
 CREATE INDEX idx_job_usage_workspace ON job_usage(workspace_id, status);
+
+-- D-108 (backend/migrations/0010_commercial_guards.sql's mirror) - see that
+-- migration's header for what each table is for.
+CREATE TABLE technical_budget_periods (
+    workspace_id    TEXT NOT NULL REFERENCES workspaces(id),
+    period_start    TEXT NOT NULL,
+    period_end      TEXT NOT NULL,
+    limit_units     INTEGER NOT NULL,
+    reserved_units  INTEGER NOT NULL DEFAULT 0,
+    consumed_units  INTEGER NOT NULL DEFAULT 0,
+    updated_at      TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, period_start),
+    CHECK (reserved_units >= 0 AND consumed_units >= 0 AND limit_units >= 0),
+    CHECK (period_end > period_start)
+);
+
+CREATE TABLE submit_attempts (
+    id            TEXT PRIMARY KEY,
+    user_id       TEXT NOT NULL REFERENCES users(id),
+    workspace_id  TEXT NOT NULL REFERENCES workspaces(id),
+    created_at    TEXT NOT NULL
+);
+CREATE INDEX idx_submit_attempts_user_created ON submit_attempts(user_id, created_at);

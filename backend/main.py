@@ -364,6 +364,11 @@ def _load_web_config() -> Dict[str, Any]:
         # Phase 6A: bounded grace period for _serve_until_shutdown() below
         # - "shutdown timeout is configurable" per that phase's own spec.
         "shutdown_grace_seconds": _int_env("SHUTDOWN_GRACE_SECONDS", 30),
+        # D-108 admission guards for POST /workspaces/<id>/jobs: queued +
+        # claimed + running jobs per workspace, and scan submissions per
+        # user per repository.SUBMIT_RATE_LIMIT_WINDOW_SECONDS (60 s).
+        "max_pending_jobs_per_workspace": _positive_int_env("MAX_PENDING_JOBS_PER_WORKSPACE", repo.DEFAULT_MAX_PENDING_JOBS_PER_WORKSPACE),
+        "submit_rate_limit_per_minute": _positive_int_env("SUBMIT_RATE_LIMIT_PER_MINUTE", repo.DEFAULT_SUBMIT_RATE_LIMIT_PER_WINDOW),
     }
     cfg.update(_load_alert_config())
     cfg.update(_load_email_config())
@@ -606,6 +611,8 @@ def run_web() -> None:
         black_friday_start=cfg["black_friday_start"],
         black_friday_end=cfg["black_friday_end"],
         black_friday_promotion_code_id=cfg["black_friday_promotion_code_id"],
+        max_pending_jobs_per_workspace=cfg["max_pending_jobs_per_workspace"],
+        submit_rate_limit_per_window=cfg["submit_rate_limit_per_minute"],
     )
     sys.stderr.write("backend web process listening on %s:%d (secure_cookies=%s)\n" % (cfg["host"], cfg["port"], cfg["secure_cookies"]))
     if cfg["black_friday_enabled"]:

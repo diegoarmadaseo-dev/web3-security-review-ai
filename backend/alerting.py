@@ -81,6 +81,7 @@ EVENT_STORAGE_FAILURE = "storage.failure"
 EVENT_AUTH_RATE_LIMIT = "auth.rate_limit_exceeded"
 EVENT_READINESS_FAILURE = "readiness.failure"
 EVENT_RETENTION_PURGE = "retention.purge"  # Phase 6B - informational only (severity "info"), emitted only when a scheduled purge actually deleted something.
+EVENT_TECHNICAL_BUDGET_EXHAUSTED = "usage.technical_budget_exhausted"  # D-108 - a workspace hit its per-service-month runaway-cost guard (repository.technical_budget_limit_units()); an operator should look, since normal use reaches the LOC allowance first.
 EVENT_EMAIL_DELIVERY_FAILURE = "email.delivery_failure"  # Phase 6B email hardening (D-083) - emitted when email_sender.send() raises; the request-link HTTP response is unchanged either way, see backend/http_app.py's _handle_request_link().
 
 

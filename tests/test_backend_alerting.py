@@ -49,6 +49,7 @@ class EmitSafeTests(unittest.TestCase):
             alerting.EVENT_STRIPE_WEBHOOK_FAILURE, alerting.EVENT_STORAGE_FAILURE,
             alerting.EVENT_AUTH_RATE_LIMIT, alerting.EVENT_READINESS_FAILURE,
             alerting.EVENT_RETENTION_PURGE, alerting.EVENT_EMAIL_DELIVERY_FAILURE,
+            alerting.EVENT_TECHNICAL_BUDGET_EXHAUSTED,
         ]
         self.assertEqual(len(values), len(set(values)))
         self.assertTrue(all(isinstance(v, str) and v for v in values))

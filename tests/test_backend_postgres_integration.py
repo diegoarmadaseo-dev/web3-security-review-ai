@@ -121,7 +121,7 @@ class MigrationIntegrationTests(unittest.TestCase):
         self.conn, self.applied = _reset_database_and_migrate()
         self.addCleanup(self.conn.close)
 
-    def test_fresh_database_applies_all_nine_migrations_in_order(self):
+    def test_fresh_database_applies_all_ten_migrations_in_order(self):
         # 0002_auth_tokens.sql (Phase 2), 0003_entitlement_status_expand.sql
         # and 0004_entitlement_event_provenance.sql (Phase 3),
         # 0005_job_queue_hardening.sql (Phase 4, D-079),
@@ -129,14 +129,15 @@ class MigrationIntegrationTests(unittest.TestCase):
         # 0007_billing_interval.sql (Phase 7, D-086), and
         # 0008_queue_fairness.sql (admission control / queue fairness,
         # post reap-atomicity-fix and worker-fencing hardening) and
-        # 0009_commercial_usage.sql (D-107) added alongside
-        # 0001_initial_schema.sql (Phase 1).
+        # 0009_commercial_usage.sql (D-107) and 0010_commercial_guards.sql
+        # (D-108) added alongside 0001_initial_schema.sql (Phase 1).
         self.assertEqual(
             self.applied,
             [
                 "0001_initial_schema", "0002_auth_tokens", "0003_entitlement_status_expand",
                 "0004_entitlement_event_provenance", "0005_job_queue_hardening", "0006_retention_purge",
                 "0007_billing_interval", "0008_queue_fairness", "0009_commercial_usage",
+                "0010_commercial_guards",
             ],
         )
 
@@ -159,7 +160,7 @@ class MigrationIntegrationTests(unittest.TestCase):
             seen_statuses.add(repo.get_entitlement_by_workspace(self.conn, workspace_id)["status"])
         self.assertEqual(seen_statuses, {"incomplete_expired", "unpaid"})
 
-    def test_all_eighteen_tables_exist(self):
+    def test_all_twenty_tables_exist(self):
         cur = db.execute(
             self.conn,
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
@@ -172,6 +173,7 @@ class MigrationIntegrationTests(unittest.TestCase):
             "workspace_budgets",  # Phase 4, 0005_job_queue_hardening.sql (D-079).
             "workspace_queue_state",  # Admission control / queue fairness, 0008_queue_fairness.sql.
             "scan_credits", "usage_periods", "job_usage",  # D-107, 0009_commercial_usage.sql.
+            "technical_budget_periods", "submit_attempts",  # D-108, 0010_commercial_guards.sql.
         }
         self.assertEqual(tables, expected)
 
@@ -636,6 +638,118 @@ class BudgetContentionIntegrationTests(unittest.TestCase):
         self.assertEqual(final["reserved_units"] + final["consumed_units"], final["limit_units"])  # exactly at the ceiling, never over.
 
 
+class CommercialGuardsIntegrationTests(unittest.TestCase):
+    """D-108 against a REAL Postgres server with REAL concurrent
+    connections: the pending-jobs cap (per-workspace row lock), the
+    technical budget reservation, the submit rate limit and the Pro
+    priority ordering expression (timestamptz arithmetic, Postgres-only
+    SQL). tests/test_backend_commercial_guards.py covers the same rules on
+    SQLite."""
+
+    def setUp(self):
+        self.conn, _ = _reset_database_and_migrate()
+        self.addCleanup(self.conn.close)
+        self.user_id = repo.create_user(self.conn, "guards-%s@example.com" % repo.new_id())
+
+    def _workspace(self, plan):
+        ws = repo.create_workspace(self.conn, "Guards WS", self.user_id)
+        repo.create_entitlement(self.conn, ws, plan, "active", billing_interval="monthly")
+        return ws
+
+    def _submit(self, conn, ws, loc=10, mode="quick", max_pending=repo.DEFAULT_MAX_PENDING_JOBS_PER_WORKSPACE):
+        contract = repo.create_contract(conn, ws, "s3://guards/%s" % repo.new_id(), "hash", "G.sol")
+        ent = repo.get_entitlement_by_workspace(conn, ws)
+        return repo.enqueue_job_with_usage(conn, ws, contract, self.user_id, mode, None, ent, loc, max_pending_jobs=max_pending)
+
+    def _race(self, n, fn):
+        results, errors, lock = [], [], threading.Lock()
+        barrier = threading.Barrier(n)
+
+        def run():
+            conn = db.connect_postgres(DSN)
+            try:
+                barrier.wait(timeout=10)
+                outcome = fn(conn)
+            except repo.UsageLimitError as exc:
+                outcome = exc.code
+            except Exception as exc:  # pragma: no cover - a deadlock/CHECK violation would land here.
+                errors.append(exc)
+                return
+            finally:
+                conn.close()
+            with lock:
+                results.append(outcome)
+
+        threads = [threading.Thread(target=run) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        self.assertEqual(errors, [])
+        return results
+
+    def test_concurrent_submissions_never_exceed_the_pending_cap(self):
+        ws = self._workspace("pro")
+        results = self._race(10, lambda conn: self._submit(conn, ws, max_pending=3) and "ok")
+        self.assertEqual(sorted(results), ["ok"] * 3 + ["too_many_pending_jobs"] * 7)
+        self.assertEqual(repo.count_pending_jobs(self.conn, ws), 3)
+        usage = repo.usage_summary(self.conn, ws, repo.get_entitlement_by_workspace(self.conn, ws))
+        self.assertEqual(usage["loc_reserved"], 30)
+
+    def test_pending_cap_frees_on_terminal_transitions(self):
+        ws = self._workspace("standard")
+        job = self._submit(self.conn, ws, max_pending=1)
+        with self.assertRaises(repo.UsageLimitError):
+            self._submit(self.conn, ws, max_pending=1)
+        self.assertTrue(repo.transition_job_status(self.conn, job, "queued", "canceled"))
+        self._submit(self.conn, ws, max_pending=1)
+
+    def test_concurrent_admissions_never_overshoot_the_technical_budget(self):
+        ws = self._workspace("standard")
+        first = self._submit(self.conn, ws, mode="standard")
+        self.assertTrue(repo.transition_job_status(self.conn, first, "queued", "canceled"))
+        db.execute(self.conn, "UPDATE technical_budget_periods SET consumed_units = limit_units - 6 WHERE workspace_id = ?", (ws,))
+        self.conn.commit()
+        results = self._race(8, lambda conn: self._submit(conn, ws, mode="standard", max_pending=100) and "ok")
+        self.assertEqual(sorted(results), ["ok"] * 3 + ["technical_budget_exhausted"] * 5)
+        tech = repo.technical_budget_summary(self.conn, ws, repo.get_entitlement_by_workspace(self.conn, ws))
+        self.assertEqual(tech["reserved_units"] + tech["consumed_units"], tech["limit_units"])
+
+    def test_technical_units_settle_with_the_job(self):
+        ws = self._workspace("pro")
+        job = self._submit(self.conn, ws, mode="pro")
+        self.assertIsNotNone(repo.claim_next_job(self.conn, "w1"))
+        self.assertTrue(repo.transition_job_status(self.conn, job, "claimed", "running"))
+        self.assertTrue(repo.transition_job_status(self.conn, job, "running", "failed"))
+        tech = repo.technical_budget_summary(self.conn, ws, repo.get_entitlement_by_workspace(self.conn, ws))
+        self.assertEqual((tech["reserved_units"], tech["consumed_units"]), (0, 4))   # ran -> compute spent
+        self.assertEqual(repo.get_job(self.conn, job)["priority"], 1)
+
+    def test_concurrent_rate_limit_attempts_never_exceed_the_limit(self):
+        ws = self._workspace("standard")
+        results = self._race(12, lambda conn: repo.check_submit_rate_limit(conn, self.user_id, ws, 4))
+        self.assertEqual(results.count(0), 4)                                             # exact: per-user lock, no burst over- or under-shoot
+        self.assertTrue(all(1 <= r <= repo.SUBMIT_RATE_LIMIT_WINDOW_SECONDS for r in results if r))
+        n = db.execute(self.conn, "SELECT COUNT(*) AS n FROM submit_attempts WHERE user_id = ?", (self.user_id,)).fetchone()["n"]
+        self.assertEqual(n, 4)
+
+    def test_pro_priority_ordering_and_bonus_boundary(self):
+        std = self._workspace("standard")
+        pro = self._workspace("pro")
+        s1 = self._submit(self.conn, std)
+        p1 = self._submit(self.conn, pro)
+        self.assertEqual(repo.claim_next_job(self.conn, "w1")["id"], p1)                  # both never served: priority first
+        self.assertTrue(repo.transition_job_status(self.conn, p1, "claimed", "queued"))
+        bonus = repo.QUEUE_PRIORITY_BONUS_SECONDS
+        for std_age, expected in ((bonus - 1, p1), (bonus + 1, s1)):
+            db.execute(self.conn, "UPDATE workspace_queue_state SET last_claimed_at = now() WHERE workspace_id = ?", (pro,))
+            db.execute(self.conn, "UPDATE workspace_queue_state SET last_claimed_at = now() - make_interval(secs => ?) WHERE workspace_id = ?", (std_age, std))
+            self.conn.commit()
+            claimed = repo.claim_next_job(self.conn, "w2")
+            self.assertEqual(claimed["id"], expected)
+            self.assertTrue(repo.transition_job_status(self.conn, claimed["id"], "claimed", "queued"))
+
+
 class AuthTokenIntegrationTests(unittest.TestCase):
     """Phase 2 identity/access (docs/decisiones.md D-077/D-078 follow-up):
     backend/auth.py against real PostgreSQL - UUID/TIMESTAMPTZ
@@ -881,6 +995,11 @@ class HttpJobSubmitConcurrencyIntegrationTests(unittest.TestCase):
             port=0,
             secure_cookies=False,
             storage=self.storage,
+            # D-108: this class races ONE user's identical submissions (3
+            # rounds x 10) to prove idempotency - the per-user submit rate
+            # limit is raised so it never decides the outcome here; it has
+            # its own tests in CommercialGuardsIntegrationTests.
+            submit_rate_limit_per_window=100,
         )
         self.port = self.httpd.server_address[1]
         self.host_header = "%s:%d" % (host, self.port)

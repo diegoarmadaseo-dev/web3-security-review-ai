@@ -860,11 +860,13 @@ class WorkspaceReadTests(_HttpAppTestCase):
         self.assertEqual(result["workspace"]["membership_role"], "owner")
         self.assertEqual(result["entitlement"]["plan"], "standard")
         self.assertEqual(result["entitlement"]["status"], "active")
-        # No job has ever been submitted for this brand-new workspace -
-        # workspace_budgets is lazily created on first spend (see
-        # repository._ensure_workspace_budget_row's own docstring), so
-        # there is genuinely nothing to report yet.
-        self.assertIsNone(result["budget"])
+        # D-108: "budget" is the Standard/Pro per-service-month technical
+        # safety guard - nothing reserved or consumed yet for a brand-new
+        # workspace, limit derived from the plan.
+        budget = result["budget"]
+        self.assertEqual((budget["limit_units"], budget["reserved_units"], budget["consumed_units"]),
+                         (repo.technical_budget_limit_units("standard"), 0, 0))
+        self.assertEqual(budget["period_start"], result["usage"]["period_start"])
 
     def test_get_without_entitlement_has_null_entitlement_and_limits(self):
         cookie = self.request_and_confirm_login("owner-i@example.com")

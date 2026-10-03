@@ -88,7 +88,7 @@ PLANS: Dict[str, Dict[str, object]] = {
         "monthly_loc_quota": 60000,
         "max_projects": None,
         "max_members": 5,
-        "queue_priority": "priority",   # catalog fact; claim ordering does not use it yet (D-107)
+        "queue_priority": "priority",   # read at admission: Pro jobs get analysis_jobs.priority = 1 (D-108, repository.claim_next_job())
         "priority_support": True,
     },
 }

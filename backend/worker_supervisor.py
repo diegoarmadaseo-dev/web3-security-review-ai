@@ -348,18 +348,29 @@ def claim_and_run_one_job(
     after claim_next_job() returns, is what actually distinguishes them.
     Every finalize_job_attempt() call below threads that SAME pair
     through unchanged - never re-read from the job row later, which
-    could already reflect a newer attempt."""
+    could already reflect a newer attempt.
+
+    D-108: a job admitted with a usage ledger row (every job submitted
+    through the HTTP API) already reserved its technical budget at
+    admission, in the same transaction as its LOC/credit, and settles it
+    with that ledger row on its terminal transition - so this function
+    reserves nothing in the legacy workspace_budgets ledger for it and can
+    never fail an admitted scan for "budget exhausted". Only a ledger-less
+    job (enqueue_job()) keeps the legacy claim-time reservation."""
     job = repo.claim_next_job(conn, worker_id)
     if job is None:
         return None
     job_id = job["id"]
     workspace_id = job["workspace_id"]
     mode = job["mode"]
-    units = repo.JOB_MODE_BUDGET_COST.get(mode, 1)
+    legacy_budget = repo.get_job_usage(conn, job_id) is None
+    units = repo.JOB_MODE_BUDGET_COST.get(mode, 1) if legacy_budget else None
+    release_action = "release" if legacy_budget else None
+    consume_action = "consume" if legacy_budget else None
     attempt_count = job["attempt_count"]
     claimed_by = job["claimed_by"]
 
-    if not repo.reserve_workspace_budget(conn, workspace_id, units):
+    if legacy_budget and not repo.reserve_workspace_budget(conn, workspace_id, units):
         repo.finalize_job_attempt(
             conn, job_id, workspace_id, attempt_count, claimed_by,
             from_status="claimed", to_status="failed", error="workspace budget exhausted",
@@ -380,7 +391,8 @@ def claim_and_run_one_job(
         # (not fenced - nothing else could legitimately touch this exact
         # reservation) is correct regardless of ordering against whatever
         # the job's NEXT attempt goes on to reserve for itself.
-        repo.release_workspace_budget(conn, workspace_id, units)
+        if legacy_budget:
+            repo.release_workspace_budget(conn, workspace_id, units)
         return job_id
 
     contract = repo.get_contract(conn, job["contract_id"])
@@ -392,7 +404,7 @@ def claim_and_run_one_job(
             conn, job_id, workspace_id, attempt_count, claimed_by,
             from_status="running", to_status="failed",
             error="object storage error fetching source: %s" % type(exc).__name__,
-            budget_units=units, budget_action="release",
+            budget_units=units, budget_action=release_action,
         )
         return job_id
 
@@ -411,14 +423,14 @@ def claim_and_run_one_job(
                 conn, job_id, workspace_id, attempt_count, claimed_by,
                 from_status="running", to_status="failed",
                 error="object storage error storing report: %s" % type(exc).__name__,
-                budget_units=units, budget_action="release",
+                budget_units=units, budget_action=release_action,
             )
             return job_id
         risk_indicator = result.get("risk_indicator") or {}
         finalized = repo.finalize_job_attempt(
             conn, job_id, workspace_id, attempt_count, claimed_by,
             from_status="running", to_status="succeeded",
-            budget_units=units, budget_action="consume",
+            budget_units=units, budget_action=consume_action,
             report_storage_ref=report_key,
             report_score_status="computed" if risk_indicator.get("score") is not None else "not_computed",
             report_score=risk_indicator.get("score"), report_risk_band=risk_indicator.get("band"),
@@ -431,7 +443,7 @@ def claim_and_run_one_job(
             conn, job_id, workspace_id, attempt_count, claimed_by,
             from_status="running", to_status="failed",
             error=str(result.get("error", "unknown worker failure"))[:500],
-            budget_units=units, budget_action="release",
+            budget_units=units, budget_action=release_action,
         )
     return job_id
 

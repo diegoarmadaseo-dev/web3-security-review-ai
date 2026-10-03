@@ -252,11 +252,11 @@ class _LedgerCase(unittest.TestCase):
             self.conn.commit()
         return ws
 
-    def submit(self, ws, loc, now=None, conn=None, key=None):
+    def submit(self, ws, loc, now=None, conn=None, key=None, mode="quick", max_pending=repo.DEFAULT_MAX_PENDING_JOBS_PER_WORKSPACE):
         conn = conn or self.conn
         contract = repo.create_contract(conn, ws, "ref-%s" % repo.new_id(), "h", "contract.sol")
         ent = repo.get_entitlement_by_workspace(conn, ws)
-        return repo.enqueue_job_with_usage(conn, ws, contract, self.user, "quick", key, ent, loc, now=now)
+        return repo.enqueue_job_with_usage(conn, ws, contract, self.user, mode, key, ent, loc, now=now, max_pending_jobs=max_pending)
 
     def finish(self, job_id, to_status="succeeded"):
         self.assertTrue(repo.transition_job_status(self.conn, job_id, "queued", "claimed"))
@@ -430,7 +430,7 @@ class IdempotencyTests(_LedgerCase):
             conn = repo.connect(self.db_path)
             conn.execute("PRAGMA busy_timeout = 10000")
             try:
-                self.submit(ws, 3000, conn=conn)
+                self.submit(ws, 3000, conn=conn, max_pending=100)   # isolates the LOC race from the pending-jobs cap
                 outcome = "ok"
             except repo.UsageLimitError as exc:
                 outcome = exc.code

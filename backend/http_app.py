@@ -714,6 +714,8 @@ def make_handler(
     black_friday_start: Optional[datetime] = None,
     black_friday_end: Optional[datetime] = None,
     black_friday_promotion_code_id: Optional[str] = None,
+    max_pending_jobs_per_workspace: int = repo.DEFAULT_MAX_PENDING_JOBS_PER_WORKSPACE,
+    submit_rate_limit_per_window: int = repo.DEFAULT_SUBMIT_RATE_LIMIT_PER_WINDOW,
 ) -> type:
     """Returns a fresh Handler class closed over this specific server
     instance's config - never module-level globals, so multiple servers
@@ -739,7 +741,13 @@ def make_handler(
     unchanged. Passed straight through to backend.black_friday.
     resolve_promotion_code() on every /billing/checkout call - see that
     module's own docstring on why this is re-evaluated per-request,
-    never cached or trusted from the client."""
+    never cached or trusted from the client.
+
+    max_pending_jobs_per_workspace / submit_rate_limit_per_window (D-108)
+    bound POST /workspaces/<id>/jobs: queued+claimed+running jobs per
+    workspace, and submissions per user per
+    repo.SUBMIT_RATE_LIMIT_WINDOW_SECONDS. Both default to the repository's
+    own defaults; backend/main.py reads them from the environment."""
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "backend-auth/2026.1"
@@ -1250,7 +1258,7 @@ def make_handler(
                     return
                 workspace["membership_role"] = role
                 entitlement = repo.get_entitlement_by_workspace(conn, workspace_id)
-                budget = repo.get_workspace_budget(conn, workspace_id)
+                budget = repo.technical_budget_summary(conn, workspace_id, entitlement)   # D-108: per-service-month safety guard, None for Quick
                 limits = None
                 if entitlement is not None:
                     modes_config = _load_modes_config()
@@ -1427,6 +1435,23 @@ def make_handler(
                     self.close_connection = True
                     self._send_json(403, {"ok": False, "error": "forbidden"})
                     return False
+                # D-108 submit rate limit: per user, before the body (up to
+                # JOB_SUBMIT_MAX_BODY_BYTES) is read or any LOC is counted -
+                # so every request from here on is one attempt whatever its
+                # outcome (402/413, a duplicate idempotency_key...); only a
+                # request refused right here records nothing. See
+                # repository.check_submit_rate_limit(). Abuse protection
+                # only - the LOC allowance is unaffected.
+                retry_after = repo.check_submit_rate_limit(conn, current_user_id, workspace_id, submit_rate_limit_per_window)
+                if retry_after:
+                    self.close_connection = True
+                    self._send_json(
+                        429,
+                        {"ok": False, "error": "submit_rate_limited", "retry_after_seconds": retry_after,
+                         "detail": "too many scan submissions; at most %d per %d seconds" % (submit_rate_limit_per_window, repo.SUBMIT_RATE_LIMIT_WINDOW_SECONDS)},
+                        extra_headers=[("Retry-After", str(retry_after))],
+                    )
+                    return False
                 return True
             except Exception:
                 self.close_connection = True
@@ -1550,6 +1575,9 @@ def make_handler(
                     self._send_json(402, {"ok": False, "error": "loc_quota_exceeded", "effective_loc": effective_loc,
                                           "loc_remaining": usage.get("loc_remaining", 0), "period_end": usage.get("period_end")})
                     return
+                if repo.count_pending_jobs(conn, workspace_id) >= max_pending_jobs_per_workspace:
+                    self._send_json(429, {"ok": False, "error": "too_many_pending_jobs", "max_pending_jobs": max_pending_jobs_per_workspace})
+                    return
                 content_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
                 # A fresh id for the storage OBJECT only - decoupled from
                 # the contract row's own id (create_contract() generates
@@ -1559,7 +1587,8 @@ def make_handler(
                 storage.put_object(storage_ref, source.encode("utf-8"), content_type="text/plain")
                 contract_id = repo.create_contract(conn, workspace_id, storage_ref, content_hash, payload.get("filename") or "contract.sol")
                 try:
-                    job_id = repo.enqueue_job_with_usage(conn, workspace_id, contract_id, current_user_id, mode, idempotency_key, entitlement, effective_loc)
+                    job_id = repo.enqueue_job_with_usage(conn, workspace_id, contract_id, current_user_id, mode, idempotency_key, entitlement, effective_loc,
+                                                         max_pending_jobs=max_pending_jobs_per_workspace)
                 except repo.UsageLimitError as exc:
                     # Nothing was queued or reserved (rolled back). Only a
                     # submission that lost a concurrent race to the last of
@@ -1567,8 +1596,14 @@ def make_handler(
                     # the ordinary case before anything is stored); its
                     # contract row/object are left to retention like any
                     # other unreferenced upload.
-                    status_code = {"loc_per_scan_limit_exceeded": 413, "no_source_code": 422}.get(exc.code, 402)
-                    self._send_json(status_code, {"ok": False, "error": exc.code, "detail": exc.detail, "effective_loc": effective_loc})
+                    status_code = {"loc_per_scan_limit_exceeded": 413, "no_source_code": 422,
+                                   "too_many_pending_jobs": 429, "technical_budget_exhausted": 429}.get(exc.code, 402)
+                    if exc.code == "technical_budget_exhausted":
+                        alerting.emit_safe(alert_sender, alerting.EVENT_TECHNICAL_BUDGET_EXHAUSTED, "warning", {"workspace_id": workspace_id, "plan": entitlement["plan"]})
+                    body = {"ok": False, "error": exc.code, "detail": exc.detail, "effective_loc": effective_loc}
+                    if exc.code == "too_many_pending_jobs":
+                        body["max_pending_jobs"] = max_pending_jobs_per_workspace
+                    self._send_json(status_code, body)
                     return
                 except db.integrity_error_class(conn):
                     # A concurrent identical submission won the idempotency_key race - same job, not an error.
@@ -1854,11 +1889,14 @@ def run_server(
     black_friday_start: Optional[datetime] = None,
     black_friday_end: Optional[datetime] = None,
     black_friday_promotion_code_id: Optional[str] = None,
+    max_pending_jobs_per_workspace: int = repo.DEFAULT_MAX_PENDING_JOBS_PER_WORKSPACE,
+    submit_rate_limit_per_window: int = repo.DEFAULT_SUBMIT_RATE_LIMIT_PER_WINDOW,
 ) -> ThreadingHTTPServer:
     in_flight = _InFlightTracker()
     handler_cls = make_handler(
         connect_fn, email_sender, host_allowlist, secure_cookies, billing, storage, alert_sender, in_flight,
         black_friday_enabled, black_friday_start, black_friday_end, black_friday_promotion_code_id,
+        max_pending_jobs_per_workspace, submit_rate_limit_per_window,
     )
     server = ThreadingHTTPServer((host, port), handler_cls)
     server.in_flight_tracker = in_flight  # see get_in_flight_count() and _InFlightTracker's own docstring.
