@@ -214,6 +214,11 @@ def remove_workspace_member(conn: Any, workspace_id: str, user_id: str) -> bool:
     return cur.rowcount > 0
 
 
+def get_user(conn: Any, user_id: str) -> Optional[Dict[str, Any]]:
+    cur = db.execute(conn, "SELECT id, email, created_at FROM users WHERE id = ?", (user_id,))
+    return db.normalize_row(cur.fetchone())
+
+
 def get_user_by_email(conn: Any, email: str) -> Optional[Dict[str, Any]]:
     """Case-insensitive by construction, never by a LOWER() query - every
     row's email is already stored lowercase (users_email_lowercase CHECK,
@@ -669,6 +674,53 @@ def list_jobs_by_workspace(
             (workspace_id, status, limit, offset),
         )
     return [db.normalize_row(row) for row in cur.fetchall()]
+
+
+def list_job_summaries(
+    conn: Any,
+    workspace_id: str,
+    limit: int = DEFAULT_LIST_LIMIT,
+    offset: int = 0,
+    status: Optional[str] = None,
+    project_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """list_jobs_by_workspace()'s rows (every analysis_jobs column, same
+    filters, same order, same bounds) plus what a history view needs
+    (D-110): the submission's project and kind, its effective LOC as
+    admitted, and its report's id/score/band when one exists. Every join is
+    pinned to workspace_id as well, so nothing from another workspace can
+    ever be attached to a row. Never the contract's storage key."""
+    if not (1 <= limit <= MAX_LIST_LIMIT):
+        raise RepositoryError("limit must be between 1 and %d, got %r" % (MAX_LIST_LIMIT, limit))
+    if offset < 0:
+        raise RepositoryError("offset must be >= 0, got %r" % (offset,))
+    if status is not None and status not in JOB_STATUSES:
+        raise RepositoryError("status must be one of %r, got %r" % (JOB_STATUSES, status))
+    sql = (
+        "SELECT j.*, c.project_id AS project_id, c.source_kind AS source_kind, c.name AS source_name, p.name AS project_name, "
+        "u.effective_loc AS effective_loc, u.usage_model AS usage_model, u.status AS usage_status, "
+        "r.id AS report_id, r.score_status AS score_status, r.score AS score, r.risk_band AS risk_band, r.purged_at AS report_purged_at "
+        "FROM analysis_jobs j "
+        "JOIN contracts c ON c.id = j.contract_id AND c.workspace_id = j.workspace_id "
+        "LEFT JOIN projects p ON p.id = c.project_id AND p.workspace_id = j.workspace_id "
+        "LEFT JOIN job_usage u ON u.job_id = j.id AND u.workspace_id = j.workspace_id "
+        "LEFT JOIN reports r ON r.job_id = j.id AND r.workspace_id = j.workspace_id "
+        "WHERE j.workspace_id = ?"
+    )
+    params: Tuple[Any, ...] = (workspace_id,)
+    if status is not None:
+        sql += " AND j.status = ?"
+        params += (status,)
+    if project_id is not None:
+        sql += " AND c.project_id = ?"
+        params += (project_id,)
+    cur = db.execute(conn, sql + " ORDER BY j.created_at DESC, j.id DESC LIMIT ? OFFSET ?", params + (limit, offset))
+    return [db.normalize_row(row) for row in cur.fetchall()]
+
+
+def get_report_by_job(conn: Any, workspace_id: str, job_id: str) -> Optional[Dict[str, Any]]:
+    cur = db.execute(conn, "SELECT * FROM reports WHERE job_id = ? AND workspace_id = ?", (job_id, workspace_id))
+    return db.normalize_row(cur.fetchone())
 
 
 LEASE_DURATION_SECONDS = 15 * 60  # generous for one analysis job; matches auth.py's own "short-lived by design" philosophy at job scale, not login-token scale.
@@ -1812,6 +1864,15 @@ def usage_summary(conn: Any, workspace_id: str, entitlement: Optional[Dict[str, 
     period_start, period_end = usage_period_for_entitlement(entitlement, now)
     cur = db.execute(conn, "SELECT reserved_loc, consumed_loc FROM usage_periods WHERE workspace_id = ? AND period_start = ?", (workspace_id, period_start))
     row = db.normalize_row(cur.fetchone()) or {"reserved_loc": 0, "consumed_loc": 0}
+    # D-110, informational only (never a limit): scans holding or having
+    # consumed this service month's allowance.
+    cur = db.execute(
+        conn,
+        "SELECT status, COUNT(*) AS n FROM job_usage WHERE workspace_id = ? AND period_start = ? AND status IN ('reserved', 'consumed') GROUP BY status",
+        (workspace_id, period_start),
+    )
+    scans = {r["status"]: int(r["n"]) for r in (db.normalize_row(x) for x in cur.fetchall())}
+    out.update({"scans_in_period": scans.get("reserved", 0) + scans.get("consumed", 0), "scans_completed_in_period": scans.get("consumed", 0)})
     limit = spec["monthly_loc_quota"]
     used = row["reserved_loc"] + row["consumed_loc"]
     out.update({"period_start": period_start, "period_end": period_end, "loc_limit": limit, "loc_reserved": row["reserved_loc"],

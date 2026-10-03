@@ -98,11 +98,12 @@ def purge_expired_contracts(
 
 def _delete_report_companions(storage: object_storage.ObjectStorage, report_storage_ref: str) -> None:
     """Objects stored next to a report with ids derived from it (Layer 2
-    targeted code review, docs/decisiones.md D-105) follow the report's own
-    retention. delete_object() is idempotent for a key that was never written."""
+    targeted code review, docs/decisiones.md D-105; the structured report
+    JSON, D-110) follow the report's own retention. delete_object() is
+    idempotent for a key that was never written."""
     import backend.targeted_review as targeted_review  # stdlib-only module
 
-    for key in targeted_review.companion_keys(report_storage_ref):
+    for key in targeted_review.companion_keys(report_storage_ref) + [object_storage.report_json_key(report_storage_ref)]:
         storage.delete_object(key)
 
 

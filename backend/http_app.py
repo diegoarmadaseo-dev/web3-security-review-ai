@@ -193,6 +193,7 @@ import backend.object_storage as object_storage
 import backend.plans as plans
 import backend.repository as repo
 import backend.submission_input as submission_input
+import backend.targeted_review as targeted_review
 import backend.tenant_scope as tenant_scope
 
 SESSION_COOKIE_NAME = "session"
@@ -214,6 +215,39 @@ _REPORT_ITEM_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/reports/(?P<
 _PROJECTS_COLLECTION_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/projects$")
 _PROJECT_ITEM_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/projects/(?P<project_id>[^/]+)$")
 _JOB_ITEM_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/jobs/(?P<job_id>[^/]+)$")
+_REPORT_DOCUMENT_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/reports/(?P<report_id>[^/]+)/document$")
+_REPORT_DOWNLOAD_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/reports/(?P<report_id>[^/]+)/download$")
+_APP_STATIC_RE = re.compile(r"^/app/static/(?P<name>[A-Za-z0-9._-]+)$")
+
+# D-110 web app: the ONLY files /app/static/ serves (a fixed allowlist, so no
+# request path is ever joined onto the filesystem), and the headers every
+# /app response carries - a strict CSP (no inline script/style, no third
+# party, no framing), no MIME sniffing, no referrer leakage.
+_WEBAPP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webapp")
+_WEBAPP_STATIC = {
+    "app.js": "text/javascript; charset=utf-8",
+    "app-core.js": "text/javascript; charset=utf-8",
+    "app.css": "text/css; charset=utf-8",
+}
+_APP_SECURITY_HEADERS = (
+    ("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+                                "connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"),
+    ("X-Content-Type-Options", "nosniff"),
+    ("X-Frame-Options", "DENY"),
+    ("Referrer-Policy", "same-origin"),
+)
+
+
+def _read_webapp_file(name: str) -> Optional[bytes]:
+    if name != "index.html" and name not in _WEBAPP_STATIC:
+        return None
+    try:
+        with open(os.path.join(_WEBAPP_DIR, name), "rb") as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
 # Every id this backend generates is repository.new_id(), a canonical UUID
 # string. A malformed project/job id is answered 404 up front - never sent
 # to Postgres, where a non-UUID literal would raise instead of matching
@@ -934,6 +968,35 @@ def make_handler(
             if path == "/auth/login":
                 self._send_html(200, _LOGIN_PAGE)
                 return
+            if path == "/auth/me":
+                self._handle_me()
+                return
+            if path == "/billing/plans":
+                self._handle_billing_plans()
+                return
+            if path == "/":
+                # D-110: the signed-in product lives at /app (auth's default
+                # post-login redirect is "/").
+                self.send_response(302)
+                self.send_header("Location", "/app")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if path == "/app" or (path.startswith("/app/") and not path.startswith("/app/static/")):
+                self._handle_app_shell()
+                return
+            match = _APP_STATIC_RE.match(path)
+            if match:
+                self._handle_app_static(match.group("name"))
+                return
+            match = _REPORT_DOCUMENT_RE.match(path)
+            if match:
+                self._handle_report_document(match.group("workspace_id"), match.group("report_id"))
+                return
+            match = _REPORT_DOWNLOAD_RE.match(path)
+            if match:
+                self._handle_report_download(match.group("workspace_id"), match.group("report_id"), parsed)
+                return
             if path == "/workspaces":
                 self._handle_workspace_list()
                 return
@@ -1291,7 +1354,14 @@ def make_handler(
                     if modes_config is not None:
                         limits = (modes_config.get("modes") or {}).get(entitlement["plan"])
                 usage = repo.usage_summary(conn, workspace_id, entitlement)
-                self._send_json(200, {"ok": True, "workspace": workspace, "entitlement": entitlement, "budget": budget, "limits": limits, "usage": usage})
+                # D-110 (display only, every value server-derived): queue
+                # occupancy against the D-108 cap, the analysis modes the
+                # plan may request, and whether checkout is available.
+                admission = {"pending_jobs": repo.count_pending_jobs(conn, workspace_id), "max_pending_jobs": max_pending_jobs_per_workspace,
+                             "allowed_modes": sorted(repo.PLAN_ALLOWED_MODES.get(entitlement["plan"], frozenset())) if entitlement else [],
+                             "billing_configured": billing is not None}
+                self._send_json(200, {"ok": True, "workspace": workspace, "entitlement": entitlement, "budget": budget, "limits": limits, "usage": usage,
+                                      "admission": admission})
             except Exception:
                 self._send_json(500, {"ok": False, "error": "internal error"})
             finally:
@@ -1322,7 +1392,7 @@ def make_handler(
                 except tenant_scope.TenantScopeError:
                     self._send_json(403, {"ok": False, "error": "forbidden"})
                     return
-                jobs = repo.list_jobs_by_workspace(conn, workspace_id, limit=limit, offset=offset, status=status_filter, project_id=project_filter)
+                jobs = repo.list_job_summaries(conn, workspace_id, limit=limit, offset=offset, status=status_filter, project_id=project_filter)
                 self._send_json(200, {"ok": True, "jobs": jobs, "limit": limit, "offset": offset})
             except Exception:
                 self._send_json(500, {"ok": False, "error": "internal error"})
@@ -1549,6 +1619,10 @@ def make_handler(
                     self._send_json(exc.http_status, {"ok": False, "error": exc.code, "detail": exc.detail})
                     return
                 source, source_kind, manifest = built["source"], given[0], built["files"]
+            dry_run = payload.get("dry_run", False)
+            if not isinstance(dry_run, bool):
+                self._send_json(400, {"ok": False, "error": "dry_run must be true or false"})
+                return
             project_id = payload.get("project_id")
             if project_id is not None and (not isinstance(project_id, str) or not _UUID_RE.match(project_id)):
                 self._send_json(404, {"ok": False, "error": "project_not_found"})
@@ -1610,7 +1684,7 @@ def make_handler(
                     self._send_json(403, {"ok": False, "error": "mode not included in the current plan"})
                     return
                 idempotency_key = repo.scoped_idempotency_key(workspace_id, client_idempotency_key) if client_idempotency_key else repo.new_id()
-                existing = repo.get_job_by_idempotency_key(conn, idempotency_key)
+                existing = None if dry_run else repo.get_job_by_idempotency_key(conn, idempotency_key)
                 if existing is not None:
                     self._send_json(200, {"ok": True, "job_id": existing["id"], "status": existing["status"], "duplicate": True})
                     return
@@ -1636,6 +1710,19 @@ def make_handler(
                     return
                 if repo.count_pending_jobs(conn, workspace_id) >= max_pending_jobs_per_workspace:
                     self._send_json(429, {"ok": False, "error": "too_many_pending_jobs", "max_pending_jobs": max_pending_jobs_per_workspace})
+                    return
+                if dry_run:
+                    # D-110 preview: the SAME checks as a real submission up
+                    # to this point (same request, same rate-limit attempt,
+                    # same LOC count, same per-scan/quota/pending
+                    # pre-checks), then stop - nothing stored, no contract,
+                    # no job, no reservation. Non-binding: the real
+                    # submission re-runs every check atomically.
+                    preview = {"ok": True, "dry_run": True, "admissible": True, "effective_loc": effective_loc, "source_kind": source_kind,
+                               "plan": entitlement["plan"], "max_loc_per_scan": spec["max_loc_per_scan"] if spec else None, "usage": usage}
+                    if built is not None:
+                        preview.update({"files": built["files"], "ignored": built["ignored"], "ignored_count": built["ignored_count"]})
+                    self._send_json(200, preview)
                     return
                 content_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
                 # A fresh id for the storage OBJECT only - decoupled from
@@ -1698,6 +1785,188 @@ def make_handler(
             finally:
                 conn.close()
 
+
+
+        # -------------------------------------------------------------
+        # SaaS web app (D-110) - ONE vanilla-JS app served by this same
+        # backend under /app (same origin as the JSON API, so the HttpOnly
+        # session cookie and the Origin-header CSRF check apply unchanged).
+        # The shell carries no data at all: every number on screen comes
+        # from the JSON endpoints below, which stay the only authority
+        # (admission, usage, billing). The public marketing site
+        # (website/) is a separate, static product and is not involved.
+        # -------------------------------------------------------------
+        def _send_app_bytes(self, status: int, body: bytes, content_type: str, cache_control: str) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", cache_control)
+            for key, value in _APP_SECURITY_HEADERS:
+                self.send_header(key, value)
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def _handle_app_shell(self) -> None:
+            conn = connect_fn()
+            try:
+                signed_in = self._current_user_id(conn) is not None
+            finally:
+                conn.close()
+            if not signed_in:
+                self.send_response(302)
+                self.send_header("Location", "/auth/login")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            body = _read_webapp_file("index.html")
+            if body is None:
+                self._send_json(503, {"ok": False, "error": "web app is not available"})
+                return
+            self._send_app_bytes(200, body, "text/html; charset=utf-8", "no-store")
+
+        def _handle_app_static(self, name: str) -> None:
+            entry = _WEBAPP_STATIC.get(name)
+            body = _read_webapp_file(name) if entry else None
+            if body is None:
+                self._send_json(404, {"ok": False, "error": "not found"})
+                return
+            self._send_app_bytes(200, body, entry, "no-cache")
+
+        def _handle_me(self) -> None:
+            conn = connect_fn()
+            try:
+                current_user_id = self._current_user_id(conn)
+                if current_user_id is None:
+                    self._send_json(401, {"ok": False, "error": "authentication required"})
+                    return
+                user = repo.get_user(conn, current_user_id) or {}
+                self._send_json(200, {"ok": True, "user": {"id": user.get("id"), "email": user.get("email")}})
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
+
+        def _handle_billing_plans(self) -> None:
+            """Display data for the plan catalog (D-110): backend/plans.py
+            only - never a Stripe Price ID, never a rule the browser
+            enforces (checkout and admission stay server-side)."""
+            catalog = []
+            for name in plans.PLANS_ORDER:
+                spec = plans.PLANS[name]
+                prices = [{"interval": mode["interval"], "amount_cents": mode["amount_cents"], "currency": mode["currency"], "service_months": mode["service_months"]}
+                          for mode in plans.PRICE_MODES.values() if mode["plan"] == name]
+                catalog.append({"plan": name, "display_name": spec["display_name"], "billing_type": spec["billing_type"], "usage_model": spec["usage_model"],
+                                "max_loc_per_scan": spec["max_loc_per_scan"], "monthly_loc_quota": spec["monthly_loc_quota"],
+                                "scans_per_purchase": spec["scans_per_purchase"], "max_projects": spec["max_projects"], "max_members": spec["max_members"],
+                                "queue_priority": spec["queue_priority"], "priority_support": spec["priority_support"],
+                                "allowed_modes": sorted(plans.PLAN_ALLOWED_MODES[name]), "prices": prices})
+            self._send_json(200, {"ok": True, "plans": catalog})
+
+        def _load_report_for(self, conn: Any, workspace_id: str, report_id: str) -> Optional[Dict[str, Any]]:
+            """The report row (storage_ref still inside) after the session,
+            membership and same-workspace checks, or None after a 401/403/404."""
+            if self._project_scope(conn, workspace_id) is None:
+                return None
+            report = repo.get_report_by_id(conn, report_id) if _UUID_RE.match(report_id) else None
+            if report is None or report["workspace_id"] != workspace_id:
+                self._send_json(404, {"ok": False, "error": "not found"})
+                return None
+            return report
+
+        def _storage_bytes(self, key: str) -> Optional[bytes]:
+            if storage is None:
+                return None
+            try:
+                return storage.get_object(key)
+            except Exception:
+                return None
+
+        def _storage_json(self, key: str) -> Optional[Any]:
+            data = self._storage_bytes(key)
+            if data is None:
+                return None
+            try:
+                return json.loads(data.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                return None
+
+        def _handle_report_document(self, workspace_id: str, report_id: str) -> None:
+            """Everything the report viewer shows, read through this backend
+            (never a storage key or signed URL): the structured report JSON
+            when the worker stored one (D-110), the rendered Markdown, the
+            Layer 2 advisory section when present, and the job/project
+            context. A purged report keeps its metadata, not its content."""
+            conn = connect_fn()
+            try:
+                report = self._load_report_for(conn, workspace_id, report_id)
+                if report is None:
+                    return
+                ref = report.pop("storage_ref", None)
+                purged = report.get("purged_at") is not None
+                job = repo.get_job(conn, report["job_id"]) or {}
+                contract = repo.get_contract(conn, job.get("contract_id")) if job.get("contract_id") else None
+                contract = contract if contract and contract.get("workspace_id") == workspace_id else {}
+                project = repo.get_project(conn, workspace_id, contract["project_id"]) if contract.get("project_id") else None
+                content = {"scored_report": None, "markdown": None, "advisory": None}
+                if ref and not purged:
+                    markdown = self._storage_bytes(ref)
+                    content = {
+                        "scored_report": self._storage_json(object_storage.report_json_key(ref)),
+                        "markdown": markdown.decode("utf-8", "replace") if markdown is not None else None,
+                        "advisory": self._storage_json(ref + targeted_review.OBJECT_SUFFIX),
+                    }
+                self._send_json(200, dict({
+                    "ok": True, "report": report, "purged": purged,
+                    "job": {k: job.get(k) for k in ("id", "status", "mode", "created_at", "started_at", "completed_at")},
+                    "source": {"kind": contract.get("source_kind"), "name": contract.get("name"), "project_id": contract.get("project_id"),
+                               "project_name": project.get("name") if project else None},
+                }, **content))
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
+
+        def _handle_report_download(self, workspace_id: str, report_id: str, parsed: Any) -> None:
+            fmt = (parse_qs(parsed.query).get("format") or [None])[0]
+            if fmt not in ("json", "markdown"):
+                self._send_json(400, {"ok": False, "error": "format must be json or markdown"})
+                return
+            conn = connect_fn()
+            try:
+                report = self._load_report_for(conn, workspace_id, report_id)
+                if report is None:
+                    return
+                ref = report.get("storage_ref")
+                if report.get("purged_at") is not None or not ref:
+                    self._send_json(404, {"ok": False, "error": "report_content_unavailable"})
+                    return
+                if fmt == "json":
+                    body = self._storage_bytes(object_storage.report_json_key(ref))
+                    content_type, ext = "application/json; charset=utf-8", "json"
+                else:
+                    body = self._storage_bytes(ref)
+                    content_type, ext = "text/markdown; charset=utf-8", "md"
+                if body is None:
+                    self._send_json(404, {"ok": False, "error": "report_content_unavailable"})
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Disposition", 'attachment; filename="vericexa-report-%s.%s"' % (report_id, ext))
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
 
         # -------------------------------------------------------------
         # Projects (D-109) - CRUD inside one workspace. Every handler
@@ -1846,7 +2115,9 @@ def make_handler(
                 contract = repo.get_contract(conn, job["contract_id"]) or {}
                 source = {"kind": contract.get("source_kind", "single"), "project_id": contract.get("project_id"), "name": contract.get("name"),
                           "files": repo.list_contract_files(conn, workspace_id, job["contract_id"])}
-                self._send_json(200, {"ok": True, "job": job, "source": source, "usage": repo.get_job_usage(conn, job_id)})
+                report = repo.get_report_by_job(conn, workspace_id, job_id)
+                report_summary = {k: report.get(k) for k in ("id", "score_status", "score", "risk_band", "created_at", "purged_at")} if report else None
+                self._send_json(200, {"ok": True, "job": job, "source": source, "usage": repo.get_job_usage(conn, job_id), "report": report_summary})
             except Exception:
                 self._send_json(500, {"ok": False, "error": "internal error"})
             finally:

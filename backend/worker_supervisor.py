@@ -435,7 +435,21 @@ def claim_and_run_one_job(
             report_score_status="computed" if risk_indicator.get("score") is not None else "not_computed",
             report_score=risk_indicator.get("score"), report_risk_band=risk_indicator.get("band"),
         )
-        if isinstance(result.get("targeted_review"), dict) and isinstance(finalized, dict) and finalized.get("applied"):
+        applied = isinstance(finalized, dict) and finalized.get("applied")
+        if applied and isinstance(result.get("scored_report"), dict):
+            # D-110, best effort AFTER the job is 'succeeded' (same rule as
+            # Layer 2 below): the rendered report already landed, so a
+            # failure here only alerts and the job's state never changes;
+            # the web app then shows the rendered report without the
+            # structured findings view.
+            try:
+                storage.put_object(object_storage.report_json_key(report_key),
+                                   json.dumps(result["scored_report"], ensure_ascii=False, sort_keys=True).encode("utf-8"),
+                                   content_type="application/json")
+            except Exception as exc:
+                alerting.emit_safe(alert_sender, alerting.EVENT_STORAGE_FAILURE, "warning",
+                                   {"job_id": job_id, "phase": "store_report_json", "error_type": type(exc).__name__})
+        if isinstance(result.get("targeted_review"), dict) and applied:
             _persist_targeted_review(conn, storage, workspace_id, job_id, result["targeted_review"], alert_sender)
     else:
         alerting.emit_safe(alert_sender, alerting.EVENT_WORKER_JOB_FAILED, "warning", {"job_id": job_id, "workspace_id": workspace_id, "error": str(result.get("error", ""))[:200]})

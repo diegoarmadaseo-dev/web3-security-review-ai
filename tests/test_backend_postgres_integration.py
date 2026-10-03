@@ -798,6 +798,39 @@ class ProjectsMultiFileIntegrationTests(unittest.TestCase):
         self.assertEqual(repo.list_jobs_by_workspace(self.conn, self.other, project_id=pid), [])
 
 
+class WebAppQueriesIntegrationTests(unittest.TestCase):
+    """D-110 against a REAL Postgres server: the job-summary join (project,
+    usage, report - every join pinned to the workspace), the report-by-job
+    lookup and the per-service-month scan count shown by the web app."""
+
+    def setUp(self):
+        self.conn, _ = _reset_database_and_migrate()
+        self.addCleanup(self.conn.close)
+        self.user_id = repo.create_user(self.conn, "d110-%s@example.com" % repo.new_id())
+        self.ws = repo.create_workspace(self.conn, "WS", self.user_id)
+        self.other = repo.create_workspace(self.conn, "Other", self.user_id)
+        repo.create_entitlement(self.conn, self.ws, "standard", "active", billing_interval="monthly")
+
+    def test_job_summaries_report_lookup_and_scan_count(self):
+        pid = repo.create_project(self.conn, self.ws, "P")
+        contract = repo.create_contract(self.conn, self.ws, "s3://x", "h", "n", project_id=pid, source_kind="files")
+        ent = repo.get_entitlement_by_workspace(self.conn, self.ws)
+        job = repo.enqueue_job_with_usage(self.conn, self.ws, contract, self.user_id, "quick", None, ent, 120)
+        claimed = repo.claim_next_job(self.conn, "w")
+        repo.finalize_job_attempt(self.conn, job, self.ws, claimed["attempt_count"], "w", "claimed", "running")
+        res = repo.finalize_job_attempt(self.conn, job, self.ws, claimed["attempt_count"], "w", "running", "succeeded",
+                                        report_storage_ref="reports/x/y", report_score_status="computed", report_score=40, report_risk_band="HIGH")
+        rows = repo.list_job_summaries(self.conn, self.ws, project_id=pid)
+        self.assertEqual([(r["id"], r["project_name"], r["source_kind"], r["effective_loc"], r["report_id"], r["score"], r["risk_band"]) for r in rows],
+                         [(job, "P", "files", 120, res["report_id"], 40, "HIGH")])
+        self.assertEqual(repo.list_job_summaries(self.conn, self.other), [])
+        self.assertEqual(repo.get_report_by_job(self.conn, self.ws, job)["id"], res["report_id"])
+        self.assertIsNone(repo.get_report_by_job(self.conn, self.other, job))
+        usage = repo.usage_summary(self.conn, self.ws, ent)
+        self.assertEqual((usage["scans_in_period"], usage["scans_completed_in_period"]), (1, 1))
+        self.assertEqual(repo.get_user(self.conn, self.user_id)["id"], self.user_id)
+
+
 class AuthTokenIntegrationTests(unittest.TestCase):
     """Phase 2 identity/access (docs/decisiones.md D-077/D-078 follow-up):
     backend/auth.py against real PostgreSQL - UUID/TIMESTAMPTZ

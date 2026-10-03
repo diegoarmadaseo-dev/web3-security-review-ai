@@ -64,6 +64,16 @@ def workspace_key(workspace_id: str, category: str, object_id: str) -> str:
     return "%s/%s/%s" % (category, workspace_id, object_id)
 
 
+# D-110: the structured (scored) report JSON is stored next to the rendered
+# report, under a key derived from it - so report retention deletes it with
+# the report (backend/retention.py _delete_report_companions()).
+REPORT_JSON_SUFFIX = ".report.json"
+
+
+def report_json_key(report_storage_ref: str) -> str:
+    return report_storage_ref + REPORT_JSON_SUFFIX
+
+
 class ObjectStorage(Protocol):
     def put_object(self, key: str, data: bytes, content_type: str = "application/octet-stream") -> None: ...
     def get_object(self, key: str) -> bytes: ...

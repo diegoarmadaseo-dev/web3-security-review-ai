@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="same-origin">
+<title>Vericexa</title>
+<link rel="stylesheet" href="/app/static/app.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="#/dashboard">Vericexa</a>
+  <label class="ws-picker">Workspace
+    <select id="ws-select" aria-label="Current workspace"></select>
+  </label>
+  <span class="user" id="user-email"></span>
+  <button type="button" class="link-button" id="sign-out">Sign out</button>
+</header>
+<nav class="sidenav" aria-label="Main">
+  <a href="#/dashboard" data-nav="dashboard">Dashboard</a>
+  <a href="#/scan/new" data-nav="scan">New scan</a>
+  <a href="#/scans" data-nav="scans">Scans</a>
+  <a href="#/projects" data-nav="projects">Projects</a>
+  <a href="#/usage" data-nav="usage">Usage</a>
+  <a href="#/billing" data-nav="billing">Billing</a>
+</nav>
+<main id="view" tabindex="-1"><p class="muted">Loading...</p></main>
+<footer class="disclaimer" id="disclaimer"></footer>
+<script src="/app/static/app-core.js"></script>
+<script src="/app/static/app.js"></script>
+</body>
+</html>

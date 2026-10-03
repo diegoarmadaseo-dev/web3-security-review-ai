@@ -266,7 +266,7 @@ def main() -> int:
         sys.stderr.write("worker_entrypoint: unexpected error: %s\n" % type(exc).__name__)
         return 1
 
-    extra: Dict[str, Any] = {}
+    extra: Dict[str, Any] = dict(_bounded_scored_report(result.get("scoredReport")))
     if "targetedCodeReview" in result:
         import backend.targeted_review as targeted_review
         extra["targeted_review"] = targeted_review.bound_output(result["targetedCodeReview"], result.get("targetedCodeReviewRaw"))
@@ -278,6 +278,25 @@ def main() -> int:
         **extra,
     )
     return 0
+
+
+# D-110: the structured (scored) report travels back next to the rendered one
+# so the web app can show findings, evidence and locations and offer a JSON
+# download. Bounded like Layer 2's own output (targeted_review.bound_output()):
+# a report larger than this is omitted (the rendered report still arrives),
+# so it can never push the single result line past the supervisor's
+# WORKER_OUTPUT_SIZE_LIMIT_BYTES (2 MiB by default) and fail a good job.
+SCORED_REPORT_MAX_BYTES = 768 * 1024
+
+
+def _bounded_scored_report(scored: Any) -> Dict[str, Any]:
+    """{"scored_report": <dict>} when it fits SCORED_REPORT_MAX_BYTES, else
+    {"scored_report_omitted": "too_large"}; {} when there is none."""
+    if not isinstance(scored, dict):
+        return {}
+    if len(json.dumps(scored, ensure_ascii=False).encode("utf-8")) > SCORED_REPORT_MAX_BYTES:
+        return {"scored_report_omitted": "too_large"}
+    return {"scored_report": scored}
 
 
 def _targeted_review_enabled(environ: Mapping[str, str]) -> bool:
