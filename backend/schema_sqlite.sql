@@ -153,7 +153,11 @@ CREATE TABLE analysis_jobs (
     -- D-108 (backend/migrations/0010_commercial_guards.sql's mirror): 1 for
     -- a job admitted under a priority plan (Pro), read only by
     -- claim_next_job()'s ordering.
-    priority                INTEGER NOT NULL DEFAULT 0 CHECK (priority IN (0, 1))
+    priority                INTEGER NOT NULL DEFAULT 0 CHECK (priority IN (0, 1)),
+    -- D-113 (backend/migrations/0014_api_keys.sql's mirror): SHA-256 of the
+    -- submission's canonical content, compared when a Private API client
+    -- reuses an idempotency key. NULL for jobs enqueued before it.
+    request_fingerprint     TEXT CHECK (request_fingerprint IS NULL OR length(request_fingerprint) = 64)
 );
 CREATE INDEX idx_analysis_jobs_workspace ON analysis_jobs(workspace_id);
 CREATE INDEX idx_analysis_jobs_claim_queue ON analysis_jobs(status, next_eligible_at, created_at);
@@ -387,3 +391,20 @@ CREATE TABLE trial_grants (
     CHECK ((status = 'available') = (job_id IS NULL))
 );
 CREATE UNIQUE INDEX uq_trial_grants_workspace ON trial_grants(workspace_id);
+
+-- D-113 (backend/migrations/0014_api_keys.sql's mirror) - Private API keys:
+-- only the SHA-256 of the full key is stored; key_prefix is the public
+-- lookup id. See that migration's header.
+CREATE TABLE api_keys (
+    id                  TEXT PRIMARY KEY,
+    workspace_id        TEXT NOT NULL REFERENCES workspaces(id),
+    user_id             TEXT NOT NULL REFERENCES users(id),
+    name                TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 100),
+    key_prefix          TEXT NOT NULL UNIQUE CHECK (length(key_prefix) = 12),
+    key_hash            TEXT NOT NULL UNIQUE CHECK (length(key_hash) = 64),
+    created_at          TEXT NOT NULL,
+    last_used_at        TEXT,
+    revoked_at          TEXT,
+    revoked_by_user_id  TEXT REFERENCES users(id)
+);
+CREATE INDEX idx_api_keys_workspace ON api_keys(workspace_id);

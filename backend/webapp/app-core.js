@@ -81,7 +81,16 @@
     trial_history_expired: "Trial results are kept for 7 days and this one is no longer available.",
     disposable_email_not_allowed: "This email address is not eligible for the free Trial. Please use a personal or work email address.",
     signup_rate_limited: "Too many requests. Please wait a few minutes and try again.",
-    invalid_email: "Enter a valid email address."
+    invalid_email: "Enter a valid email address.",
+    // D-113 Private API keys
+    invalid_key_name: "Enter a key name (at most 100 characters).",
+    key_limit_reached: "This workspace has the maximum number of active API keys. Revoke an unused key first.",
+    key_not_found: "The API key was not found."
+  };
+  // feature_not_available names the feature it refers to (backend/plans.py).
+  var FEATURE_ERRORS = {
+    private_api: "The Private API is available on the Quick, Standard and Pro plans.",
+    report_download: "Report downloads are not included in the free Trial."
   };
   // Outcome word the backend appends after GitHub's authorization redirect.
   var GITHUB_CALLBACK = {
@@ -105,7 +114,7 @@
 
   function describeError(status, body) {
     var code = body && typeof body.error === "string" ? body.error : "";
-    var message = ERRORS[code] || code || STATUS_TEXT[status] || "Request failed (HTTP " + status + ").";
+    var message = (code === "feature_not_available" && body && FEATURE_ERRORS[body.feature]) || ERRORS[code] || code || STATUS_TEXT[status] || "Request failed (HTTP " + status + ").";
     var details = [];
     if (body && typeof body.detail === "string" && body.detail && body.detail !== message) { details.push(body.detail); }
     if (body && typeof body.effective_loc === "number") { details.push("Effective LOC: " + formatNumber(body.effective_loc)); }

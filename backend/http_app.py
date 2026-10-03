@@ -166,6 +166,25 @@ passes False explicitly (a Secure cookie is never sent by a browser over
 plain http://, so this is a real, documented, unavoidable local-testing
 accommodation, never a production default).
 
+PRIVATE API (D-113): /api/v1/* is the authenticated API for Quick, Standard
+and Pro customers - never anonymous, never the Trial. It is NOT a second
+backend: _dispatch_api() authenticates the request with an API key
+(`Authorization: Bearer vcx_...`, backend/api_keys.py; only a SHA-256 hash
+is stored), resolves key -> member -> workspace -> plan, and then calls the
+SAME handler methods the web app uses (projects, job submission, reports),
+through a fixed allowlist of routes (_API_ROUTES) - anything else is 404.
+The workspace always comes from the key, never from the URL, so another
+workspace cannot even be named. Session cookies are ignored on /api/v1 and
+bearer keys are ignored everywhere else, so the Origin-based CSRF defense
+(which /api/v1 does not need: a bearer key is never sent automatically by a
+browser) keeps protecting every cookie-authenticated route. No CORS headers
+are ever sent and OPTIONS is not implemented, so a page on another origin
+can neither attach a key (that needs a preflight) nor read a response.
+Errors on /api/v1 use one envelope - {"error": {"code", "message",
+"request_id", "details"?}} - with the existing error codes; every response
+carries X-Request-Id, and each request writes one structured JSON log line
+(no Authorization header, key, body or source code ever).
+
 Standard library only.
 """
 from __future__ import annotations
@@ -177,6 +196,8 @@ import os
 import re
 import sys
 import threading
+import time
+import uuid
 from datetime import datetime, timezone
 from http import cookies as http_cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -184,6 +205,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, quote, unquote_plus, urlparse
 
 import backend.alerting as alerting
+import backend.api_keys as api_keys
 import backend.auth as auth
 import backend.billing as billing_module
 import backend.black_friday as black_friday
@@ -226,6 +248,88 @@ _GITHUB_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/github$")
 _GITHUB_CONNECT_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/github/connect$")
 _GITHUB_REPOSITORIES_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/github/repositories$")
 _GITHUB_BRANCHES_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/github/repositories/(?P<repository_id>[^/]+)/branches$")
+# D-113: API key management for the web app (session); /api/v1/keys reaches
+# the same handlers with a key.
+_API_KEYS_COLLECTION_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/api-keys$")
+_API_KEY_ITEM_RE = re.compile(r"^/workspaces/(?P<workspace_id>[^/]+)/api-keys/(?P<key_id>[^/]+)$")
+
+# D-113 Private API: the COMPLETE allowlist of /api/v1 routes - (method,
+# path, operation). Each operation is an existing web-app handler (or one of
+# the two read-only API views, usage and billing) called with the key's own
+# workspace; see _dispatch_api(). Nothing else is reachable with a key.
+API_PREFIX = "/api/v1"
+_API_ROUTES = (
+    ("GET", re.compile(r"^/api/v1/keys$"), "keys.list"),
+    ("POST", re.compile(r"^/api/v1/keys$"), "keys.create"),
+    ("DELETE", re.compile(r"^/api/v1/keys/(?P<id>[^/]+)$"), "keys.revoke"),
+    ("GET", re.compile(r"^/api/v1/projects$"), "projects.list"),
+    ("POST", re.compile(r"^/api/v1/projects$"), "projects.create"),
+    ("GET", re.compile(r"^/api/v1/projects/(?P<id>[^/]+)$"), "projects.get"),
+    ("PATCH", re.compile(r"^/api/v1/projects/(?P<id>[^/]+)$"), "projects.update"),
+    ("DELETE", re.compile(r"^/api/v1/projects/(?P<id>[^/]+)$"), "projects.delete"),
+    ("GET", re.compile(r"^/api/v1/scans$"), "scans.list"),
+    ("POST", re.compile(r"^/api/v1/scans$"), "scans.create"),
+    ("GET", re.compile(r"^/api/v1/scans/(?P<id>[^/]+)$"), "scans.get"),
+    ("GET", re.compile(r"^/api/v1/reports/(?P<id>[^/]+)$"), "reports.get"),
+    ("GET", re.compile(r"^/api/v1/reports/(?P<id>[^/]+)/json$"), "reports.json"),
+    ("GET", re.compile(r"^/api/v1/reports/(?P<id>[^/]+)/markdown$"), "reports.markdown"),
+    ("GET", re.compile(r"^/api/v1/usage$"), "usage"),
+    ("GET", re.compile(r"^/api/v1/billing$"), "billing"),
+)
+
+# D-113 error envelope: existing machine codes pass through unchanged; the
+# few older human-sentence errors map to a stable code (else one derived
+# from the status), so a client can always switch on error.code.
+_API_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
+_API_SENTENCE_CODES = {
+    "authentication required": "authentication_required",
+    "not found": "not_found",
+    "internal error": "internal_error",
+    "this workspace has no active subscription": "no_active_subscription",
+    "mode not included in the current plan": "mode_not_allowed",
+    "request body too large": "request_too_large",
+    "a valid Content-Length header is required": "content_length_required",
+    "request body is not valid UTF-8 JSON": "invalid_json",
+    "request body must be a JSON object": "invalid_json",
+    "source is required": "source_required",
+    "source exceeds the maximum submission size": "source_too_large",
+    "job execution is not configured": "service_unavailable",
+}
+_API_STATUS_CODES = {400: "invalid_request", 401: "authentication_required", 402: "payment_required", 403: "forbidden", 404: "not_found",
+                     405: "method_not_allowed", 409: "conflict", 410: "gone", 413: "request_too_large", 422: "unprocessable",
+                     429: "rate_limited", 500: "internal_error", 503: "service_unavailable"}
+# Anything shaped like an API key is masked in every log line, even when a
+# client wrongly puts one in a URL.
+_API_KEY_TEXT_RE = re.compile(r"vcx_[0-9A-Za-z]+_[A-Za-z0-9_-]+")
+
+
+def _api_error_envelope(status: int, body: Dict[str, Any], request_id: str) -> Dict[str, Any]:
+    raw = body.get("error")
+    detail = body.get("detail") if isinstance(body.get("detail"), str) else None
+    if isinstance(raw, str) and _API_CODE_RE.match(raw):
+        code = raw
+        message = detail or raw.replace("_", " ")
+    else:
+        code = _API_SENTENCE_CODES.get(raw) if isinstance(raw, str) else None
+        code = code or _API_STATUS_CODES.get(status, "error")
+        message = detail or (raw if isinstance(raw, str) and raw else code.replace("_", " "))
+    error: Dict[str, Any] = {"code": code, "message": message, "request_id": request_id}
+    details = {k: v for k, v in body.items() if k not in ("ok", "error", "detail")}
+    if details:
+        error["details"] = details
+    return {"error": error}
+
+
+def _request_fingerprint(mode: str, project_id: Optional[str], shape: Optional[str], filename: Any, source: Optional[str],
+                         github_spec: Optional[Dict[str, Any]]) -> str:
+    """D-113: SHA-256 of a submission's canonical content - what "the same
+    request" means for idempotency: mode, project, input shape, display
+    filename and the digest of the source the engine would receive (or the
+    GitHub spec). Never the source itself."""
+    material = {"v": 1, "mode": mode, "project_id": project_id, "shape": shape, "filename": filename if isinstance(filename, str) else None,
+                "source_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest() if github_spec is None and source is not None else None,
+                "github": github_spec}
+    return hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 # D-110 web app: the ONLY files /app/static/ serves (a fixed allowlist, so no
 # request path is ever joined onto the filesystem), and the headers every
@@ -848,6 +952,10 @@ def make_handler(
     class Handler(BaseHTTPRequestHandler):
         server_version = "backend-auth/2026.1"
         timeout = REQUEST_TIMEOUT_SECONDS
+        # D-113: set by _dispatch_api() for one /api/v1 request (the
+        # authenticated key's user/workspace, request id, outcome) and
+        # reset before every request on a keep-alive connection.
+        _api: Optional[Dict[str, Any]] = None
 
         def handle_one_request(self) -> None:
             """Overridden ONLY to bracket the in-flight counter (Phase
@@ -860,6 +968,7 @@ def make_handler(
             _InFlightTracker's own docstring."""
             if in_flight is not None:
                 in_flight.increment()
+            self._api = None
             try:
                 super().handle_one_request()
             finally:
@@ -915,6 +1024,10 @@ def make_handler(
             repeated local runs, never a security issue by itself, but
             real avoidable flakiness worth closing here since this
             handler is the one introducing the unread body)."""
+            if self._api is not None:
+                # D-113: an /api/v1 request is authenticated by its bearer
+                # key, never by an ambient cookie - nothing for CSRF to ride on.
+                return False
             if self._check_same_origin():
                 return False
             self.close_connection = True
@@ -935,11 +1048,24 @@ def make_handler(
                 redacted_path = _redact_query_string(raw_path)
                 if redacted_path != raw_path:
                     message = message.replace(raw_path, redacted_path)
+            message = _API_KEY_TEXT_RE.sub("vcx_[REDACTED]", message)   # D-113
             sys.stderr.write(
                 "%s - - [%s] %s\n" % (self._client_ip(), self.log_date_time_string(), message.translate(self._control_char_table))
             )
 
+        def send_response(self, code: int, message: Optional[str] = None) -> None:
+            """D-113: every /api/v1 response carries its request id."""
+            super().send_response(code, message)
+            if self._api is not None:
+                self._api["status"] = code
+                self.send_header("X-Request-Id", self._api["request_id"])
+
         def _send_json(self, status: int, body: Dict[str, Any], extra_headers: Optional[List[Tuple[str, str]]] = None) -> None:
+            if self._api is not None:
+                if status >= 400:
+                    body = _api_error_envelope(status, body, self._api["request_id"])
+                    self._api["error_code"] = body["error"]["code"]
+                extra_headers = list(extra_headers or []) + [("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff")]
             payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -996,6 +1122,8 @@ def make_handler(
             return content_length, None, None
 
         def _current_user_id(self, conn: Any) -> Optional[str]:
+            if self._api is not None:
+                return self._api["user_id"]   # D-113: the API key's member; cookies are ignored on /api/v1
             session_token = _get_cookie(self.headers, SESSION_COOKIE_NAME)
             if not session_token:
                 return None
@@ -1008,6 +1136,9 @@ def make_handler(
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
             path = parsed.path
+            if path == API_PREFIX or path.startswith("/api/"):
+                self._dispatch_api("GET", parsed)
+                return
             if path == "/health":
                 self._send_json(200, {"ok": True})
                 return
@@ -1069,6 +1200,10 @@ def make_handler(
             match = _GITHUB_BRANCHES_RE.match(path)
             if match:
                 self._handle_github_branches(match.group("workspace_id"), match.group("repository_id"))
+                return
+            match = _API_KEYS_COLLECTION_RE.match(path)
+            if match:
+                self._handle_api_key_list(match.group("workspace_id"))
                 return
             if path == "/workspaces":
                 self._handle_workspace_list()
@@ -1163,7 +1298,11 @@ def make_handler(
         # POST
         # -------------------------------------------------------------
         def do_POST(self) -> None:
-            path = urlparse(self.path).path
+            parsed = urlparse(self.path)
+            path = parsed.path
+            if path == API_PREFIX or path.startswith("/api/"):
+                self._dispatch_api("POST", parsed)
+                return
             if path == "/auth/request-link":
                 self._handle_request_link()
             elif path == "/auth/verify":
@@ -1198,6 +1337,10 @@ def make_handler(
                 match = _GITHUB_CONNECT_RE.match(path)
                 if match:
                     self._handle_github_connect(match.group("workspace_id"))
+                    return
+                match = _API_KEYS_COLLECTION_RE.match(path)
+                if match:
+                    self._handle_api_key_create(match.group("workspace_id"))
                     return
                 self._send_json(404, {"ok": False, "error": "not found"})
 
@@ -1685,6 +1828,23 @@ def make_handler(
             mode = payload.get("mode")
             source = payload.get("source")
             client_idempotency_key = payload.get("idempotency_key")
+            if self._api is not None:
+                # D-113: the Private API accepts the D-109 inputs (source,
+                # files, archive, project_id); GitHub scans stay in the web
+                # app's own integration for now.
+                if payload.get("github") is not None:
+                    self._send_json(400, {"ok": False, "error": "source_not_supported",
+                                          "detail": "GitHub sources are not accepted by the Private API; send source, files or archive"})
+                    return
+                # The standard Idempotency-Key header is an alias of the
+                # body's idempotency_key; both given and different -> 400.
+                header_key = self.headers.get("Idempotency-Key")
+                if header_key is not None:
+                    if client_idempotency_key is not None and client_idempotency_key != header_key:
+                        self._send_json(400, {"ok": False, "error": "idempotency_key_conflict",
+                                              "detail": "the Idempotency-Key header and the body's idempotency_key differ"})
+                        return
+                    client_idempotency_key = header_key
             if mode not in ("quick", "standard", "pro"):
                 self._send_json(400, {"ok": False, "error": "mode must be one of quick/standard/pro"})
                 return
@@ -1786,8 +1946,12 @@ def make_handler(
                     self._send_json(403, {"ok": False, "error": "mode not included in the current plan"})
                     return
                 idempotency_key = repo.scoped_idempotency_key(workspace_id, client_idempotency_key) if client_idempotency_key else repo.new_id()
+                request_fingerprint = _request_fingerprint(mode, project_id, given[0] if given else None, payload.get("filename"),
+                                                           source if github_spec is None else None, github_spec)
                 existing = None if dry_run else repo.get_job_by_idempotency_key(conn, idempotency_key)
                 if existing is not None:
+                    if self._idempotency_conflict(existing, request_fingerprint):
+                        return
                     self._send_json(200, {"ok": True, "job_id": existing["id"], "status": existing["status"], "duplicate": True})
                     return
                 if github_spec is not None:
@@ -1853,7 +2017,7 @@ def make_handler(
                                                    project_id=project_id, source_kind=source_kind, files=manifest, git_source=git_source)
                 try:
                     job_id = repo.enqueue_job_with_usage(conn, workspace_id, contract_id, current_user_id, mode, idempotency_key, entitlement, effective_loc,
-                                                         max_pending_jobs=max_pending_jobs_per_workspace)
+                                                         max_pending_jobs=max_pending_jobs_per_workspace, request_fingerprint=request_fingerprint)
                 except repo.UsageLimitError as exc:
                     # Nothing was queued or reserved (rolled back). Only a
                     # submission that lost a concurrent race to the last of
@@ -1890,6 +2054,8 @@ def make_handler(
                     # the first place.
                     conn.rollback()
                     winner = repo.get_job_by_idempotency_key(conn, idempotency_key)
+                    if self._idempotency_conflict(winner, request_fingerprint):
+                        return
                     self._send_json(200, {"ok": True, "job_id": winner["id"], "status": winner["status"], "duplicate": True})
                     return
                 response = {"ok": True, "job_id": job_id, "status": "queued", "effective_loc": effective_loc, "source_kind": source_kind, "project_id": project_id}
@@ -1904,6 +2070,272 @@ def make_handler(
                 conn.close()
 
 
+
+        def _idempotency_conflict(self, existing: Dict[str, Any], request_fingerprint: str) -> bool:
+            """D-113: True (after a 409) when a Private API request reuses an
+            idempotency key of a job created by a DIFFERENT request. The web
+            app's pre-existing behavior (the first job is returned) is kept;
+            jobs from before migration 0014 carry no fingerprint and match."""
+            stored = existing.get("request_fingerprint")
+            if self._api is None or not stored or stored == request_fingerprint:
+                return False
+            self._send_json(409, {"ok": False, "error": "idempotency_key_reused", "job_id": existing["id"],
+                                  "detail": "this idempotency key was already used for a different request"})
+            return True
+
+        # -------------------------------------------------------------
+        # Private API (D-113) - see the module docstring. _dispatch_api()
+        # authenticates the key, then runs one allowlisted operation: an
+        # existing handler, called with the key's own workspace.
+        # -------------------------------------------------------------
+        def _dispatch_api(self, method: str, parsed: Any) -> None:
+            self._api = {"request_id": uuid.uuid4().hex, "started": time.monotonic(), "user_id": None, "workspace_id": None,
+                         "key_id": None, "status": None, "error_code": None}
+            try:
+                if not self._authenticate_api_request():
+                    self.close_connection = True   # any request body was never read
+                    return
+                path = parsed.path
+                allowed_methods = []
+                for route_method, pattern, operation in _API_ROUTES:
+                    match = pattern.match(path)
+                    if match is None:
+                        continue
+                    if route_method == method:
+                        self._run_api_operation(operation, self._api["workspace_id"], match, parsed)
+                        return
+                    allowed_methods.append(route_method)
+                self.close_connection = True
+                if allowed_methods:
+                    self._send_json(405, {"ok": False, "error": "method_not_allowed"}, extra_headers=[("Allow", ", ".join(sorted(set(allowed_methods))))])
+                else:
+                    self._send_json(404, {"ok": False, "error": "not found"})
+            finally:
+                self._log_api_request(method, parsed.path)
+
+        def _authenticate_api_request(self) -> bool:
+            """API key -> member -> workspace -> plan. True with self._api
+            filled in, or False after a 401/402/403/500. A missing,
+            malformed, unknown or revoked key, or one whose member left the
+            workspace, is the same 401 invalid_api_key (no oracle)."""
+            key, problem = api_keys.parse_authorization(self.headers.get_all("Authorization") or [])
+            if problem == api_keys.AUTH_MISSING:
+                self._send_json(401, {"ok": False, "error": "authentication_required", "detail": "send Authorization: Bearer <API key>"},
+                                extra_headers=[("WWW-Authenticate", 'Bearer realm="vericexa-api"')])
+                return False
+            if problem is not None:
+                self._send_json(401, {"ok": False, "error": "invalid_authorization_header", "detail": "expected exactly one Authorization: Bearer <API key> header"},
+                                extra_headers=[("WWW-Authenticate", 'Bearer realm="vericexa-api", error="invalid_request"')])
+                return False
+            conn = connect_fn()
+            try:
+                row = repo.get_api_key_for_auth(conn, api_keys.parse_prefix(key))
+                valid = row is not None and api_keys.matches(key, row["key_hash"]) and row["revoked_at"] is None
+                if valid:
+                    workspace = repo.get_workspace(conn, row["workspace_id"])
+                    valid = (workspace is not None and not workspace.get("deleted_at")
+                             and tenant_scope.resolve_workspace_role(conn, row["user_id"], row["workspace_id"]) is not None)
+                if not valid:
+                    self._send_json(401, {"ok": False, "error": "invalid_api_key", "detail": "the API key is invalid or has been revoked"},
+                                    extra_headers=[("WWW-Authenticate", 'Bearer realm="vericexa-api", error="invalid_token"')])
+                    return False
+                self._api.update({"user_id": row["user_id"], "workspace_id": row["workspace_id"], "key_id": row["id"]})
+                entitlement = repo.get_entitlement_by_workspace(conn, row["workspace_id"])
+                plan_name = entitlement["plan"] if entitlement else None
+                if not plans.plan_has_feature(plan_name, plans.FEATURE_PRIVATE_API):
+                    self._send_api_feature_not_available(plan_name)
+                    return False
+                if entitlement["status"] not in ("active", "trialing"):
+                    self._send_json(402, {"ok": False, "error": "this workspace has no active subscription"})
+                    return False
+                try:
+                    repo.touch_api_key(conn, row["id"], api_keys.LAST_USED_RESOLUTION_SECONDS)
+                except Exception:
+                    conn.rollback()   # bookkeeping only - never fails the request
+                return True
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+                return False
+            finally:
+                conn.close()
+
+        def _run_api_operation(self, operation: str, workspace_id: str, match: Any, parsed: Any) -> None:
+            item = match.groupdict().get("id")
+            operations = {
+                "keys.list": lambda: self._handle_api_key_list(workspace_id),
+                "keys.create": lambda: self._handle_api_key_create(workspace_id),
+                "keys.revoke": lambda: self._handle_api_key_revoke(workspace_id, item),
+                "projects.list": lambda: self._handle_project_list(workspace_id, parsed),
+                "projects.create": lambda: self._handle_project_create(workspace_id),
+                "projects.get": lambda: self._handle_project_get(workspace_id, item),
+                "projects.update": lambda: self._handle_project_rename(workspace_id, item),
+                "projects.delete": lambda: self._handle_project_delete(workspace_id, item),
+                "scans.list": lambda: self._handle_job_list(workspace_id, parsed),
+                "scans.create": lambda: self._handle_job_submit(workspace_id),
+                "scans.get": lambda: self._handle_job_get(workspace_id, item),
+                "reports.get": lambda: self._handle_report_document(workspace_id, item),
+                "reports.json": lambda: self._handle_report_download(workspace_id, item, parsed, fmt="json"),
+                "reports.markdown": lambda: self._handle_report_download(workspace_id, item, parsed, fmt="markdown"),
+                "usage": lambda: self._handle_api_usage(workspace_id),
+                "billing": lambda: self._handle_api_billing(workspace_id),
+            }
+            operations[operation]()
+
+        def _log_api_request(self, method: str, path: str) -> None:
+            """One structured line per /api/v1 request: identifiers and
+            outcome only - never the Authorization header, the key, a body,
+            source code or any provider token."""
+            ctx = self._api or {}
+            record = {"event": "api_request", "ts": datetime.now(timezone.utc).isoformat(), "request_id": ctx.get("request_id"),
+                      "method": method, "path": _API_KEY_TEXT_RE.sub("vcx_[REDACTED]", path)[:300], "status": ctx.get("status"),
+                      "error_code": ctx.get("error_code"), "workspace_id": ctx.get("workspace_id"), "api_key_id": ctx.get("key_id"),
+                      "duration_ms": int((time.monotonic() - ctx.get("started", time.monotonic())) * 1000)}
+            try:
+                sys.stderr.write(json.dumps(record, ensure_ascii=True) + "\n")
+            except Exception:
+                pass
+
+        def _send_api_feature_not_available(self, plan_name: Optional[str]) -> None:
+            self._send_json(403, {"ok": False, "error": "feature_not_available", "feature": plans.FEATURE_PRIVATE_API, "plan": plan_name,
+                                  "detail": "The Private API is available on the Quick, Standard and Pro plans"})
+
+        def _api_key_scope(self, conn: Any, workspace_id: str) -> Optional[Tuple[str, str]]:
+            """(user id, role) after the session/key and membership checks,
+            or None after a 401/403."""
+            user_id = self._project_scope(conn, workspace_id)
+            if user_id is None:
+                return None
+            return user_id, tenant_scope.resolve_workspace_role(conn, user_id, workspace_id)
+
+        def _handle_api_key_list(self, workspace_id: str) -> None:
+            """Key metadata - never a key or its hash. Owners/admins see
+            every key of the workspace, members their own. Not plan-gated,
+            so keys stay visible (and revocable) after a plan change."""
+            conn = connect_fn()
+            try:
+                scope = self._api_key_scope(conn, workspace_id)
+                if scope is None:
+                    return
+                user_id, role = scope
+                keys = repo.list_api_keys(conn, workspace_id, None if role in ("owner", "admin") else user_id)
+                self._send_json(200, {"ok": True, "keys": keys, "max_active_keys": api_keys.MAX_ACTIVE_KEYS_PER_WORKSPACE})
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
+
+        def _handle_api_key_create(self, workspace_id: str) -> None:
+            """Creates a key acting as the caller in this workspace. The full
+            key is in THIS response only (never stored, listed or logged)."""
+            if self._reject_if_cross_origin():
+                return
+            raw, err_status, err_msg = self._read_body()
+            if err_status:
+                self._send_json(err_status, {"ok": False, "error": err_msg})
+                return
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_json(400, {"ok": False, "error": "request body is not valid UTF-8 JSON"})
+                return
+            name = api_keys.validate_name(payload.get("name") if isinstance(payload, dict) else None)
+            if name is None:
+                self._send_json(400, {"ok": False, "error": "invalid_key_name",
+                                      "detail": "name must be a non-empty string of at most %d characters without control characters" % api_keys.MAX_NAME_LENGTH})
+                return
+            conn = connect_fn()
+            try:
+                scope = self._api_key_scope(conn, workspace_id)
+                if scope is None:
+                    return
+                entitlement = repo.get_entitlement_by_workspace(conn, workspace_id)
+                plan_name = entitlement["plan"] if entitlement else None
+                if not plans.plan_has_feature(plan_name, plans.FEATURE_PRIVATE_API):
+                    self._send_api_feature_not_available(plan_name)
+                    return
+                if entitlement["status"] not in ("active", "trialing"):
+                    self._send_json(402, {"ok": False, "error": "this workspace has no active subscription"})
+                    return
+                key, prefix, key_hash = api_keys.generate()
+                try:
+                    record = repo.create_api_key(conn, workspace_id, scope[0], name, prefix, key_hash, api_keys.MAX_ACTIVE_KEYS_PER_WORKSPACE)
+                except repo.ApiKeyLimitError:
+                    self._send_json(409, {"ok": False, "error": "key_limit_reached", "max_active_keys": api_keys.MAX_ACTIVE_KEYS_PER_WORKSPACE,
+                                          "detail": "revoke an unused key first"})
+                    return
+                self._send_json(200, {"ok": True, "key": record, "secret": key,
+                                      "detail": "Copy this key now: it is shown only once and cannot be recovered."},
+                                extra_headers=[("Cache-Control", "no-store")] if self._api is None else None)
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
+
+        def _handle_api_key_revoke(self, workspace_id: str, key_id: str) -> None:
+            """Revokes a key (owners/admins: any key of the workspace;
+            members: their own). The workspace and its data are untouched.
+            Revoking an already revoked key returns it unchanged."""
+            if self._reject_if_cross_origin():
+                return
+            conn = connect_fn()
+            try:
+                scope = self._api_key_scope(conn, workspace_id)
+                if scope is None:
+                    return
+                user_id, role = scope
+                record = repo.get_api_key(conn, workspace_id, key_id) if _UUID_RE.match(key_id or "") else None
+                if record is None or (role not in ("owner", "admin") and record["user_id"] != user_id):
+                    self._send_json(404, {"ok": False, "error": "key_not_found"})
+                    return
+                if record["revoked_at"] is None:
+                    repo.revoke_api_key(conn, workspace_id, key_id, user_id)
+                self._send_json(200, {"ok": True, "key": repo.get_api_key(conn, workspace_id, key_id)})
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
+
+        def _handle_api_usage(self, workspace_id: str) -> None:
+            """GET /api/v1/usage: the same server-side figures the web app's
+            workspace view shows - commercial usage (credit / service-month
+            LOC / Trial), the D-108 technical budget, queue occupancy and
+            the submit rate limit. Read-only."""
+            conn = connect_fn()
+            try:
+                if self._project_scope(conn, workspace_id) is None:
+                    return
+                entitlement = repo.get_entitlement_by_workspace(conn, workspace_id)
+                self._send_json(200, {
+                    "ok": True, "workspace_id": workspace_id, "plan": entitlement["plan"] if entitlement else None,
+                    "usage": repo.usage_summary(conn, workspace_id, entitlement),
+                    "budget": repo.technical_budget_summary(conn, workspace_id, entitlement),
+                    "admission": {"pending_jobs": repo.count_pending_jobs(conn, workspace_id), "max_pending_jobs": max_pending_jobs_per_workspace,
+                                  "allowed_modes": sorted(repo.PLAN_ALLOWED_MODES.get(entitlement["plan"], frozenset())) if entitlement else [],
+                                  "submit_rate_limit": submit_rate_limit_per_window, "submit_rate_limit_window_seconds": repo.SUBMIT_RATE_LIMIT_WINDOW_SECONDS},
+                })
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
+
+        def _handle_api_billing(self, workspace_id: str) -> None:
+            """GET /api/v1/billing: the workspace's current plan and status.
+            No Stripe identifiers or secrets; plan changes stay in the web
+            app (existing checkout/portal)."""
+            conn = connect_fn()
+            try:
+                if self._project_scope(conn, workspace_id) is None:
+                    return
+                entitlement = repo.get_entitlement_by_workspace(conn, workspace_id) or {}
+                spec = plans.plan_spec(entitlement.get("plan"))
+                public = {k: entitlement.get(k) for k in ("plan", "status", "billing_interval", "current_period_start", "current_period_end")}
+                public["display_name"] = spec["display_name"] if spec else None
+                self._send_json(200, {"ok": True, "workspace_id": workspace_id, "entitlement": public,
+                                      "features": sorted(plans.PLAN_FEATURES.get(entitlement.get("plan") or "", frozenset()))})
+            except Exception:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            finally:
+                conn.close()
 
         # -------------------------------------------------------------
         # Sign-up and free Trial (D-112) - see backend/trial.py. Sign-up
@@ -2484,8 +2916,8 @@ def make_handler(
             finally:
                 conn.close()
 
-        def _handle_report_download(self, workspace_id: str, report_id: str, parsed: Any) -> None:
-            fmt = (parse_qs(parsed.query).get("format") or [None])[0]
+        def _handle_report_download(self, workspace_id: str, report_id: str, parsed: Any, fmt: Optional[str] = None) -> None:
+            fmt = fmt or (parse_qs(parsed.query).get("format") or [None])[0]   # D-113: /api/v1/reports/<id>/json|markdown pass it
             if fmt not in ("json", "markdown"):
                 self._send_json(400, {"ok": False, "error": "format must be json or markdown"})
                 return
@@ -2907,7 +3339,15 @@ def make_handler(
         # DELETE
         # -------------------------------------------------------------
         def do_DELETE(self) -> None:
-            path = urlparse(self.path).path
+            parsed = urlparse(self.path)
+            path = parsed.path
+            if path == API_PREFIX or path.startswith("/api/"):
+                self._dispatch_api("DELETE", parsed)
+                return
+            match = _API_KEY_ITEM_RE.match(path)
+            if match:
+                self._handle_api_key_revoke(match.group("workspace_id"), match.group("key_id"))
+                return
             match = _PROJECT_ITEM_RE.match(path)
             if match:
                 self._handle_project_delete(match.group("workspace_id"), match.group("project_id"))
@@ -2923,7 +3363,11 @@ def make_handler(
             self._handle_member_remove(match.group("workspace_id"), match.group("user_id"))
 
         def do_PATCH(self) -> None:
-            path = urlparse(self.path).path
+            parsed = urlparse(self.path)
+            path = parsed.path
+            if path == API_PREFIX or path.startswith("/api/"):
+                self._dispatch_api("PATCH", parsed)
+                return
             match = _PROJECT_ITEM_RE.match(path)
             if not match:
                 self._send_json(404, {"ok": False, "error": "not found"})

@@ -644,11 +644,14 @@ def _ensure_queue_state(conn: Any, workspace_id: str) -> None:
     )
 
 
-def _insert_job(conn: Any, workspace_id: str, contract_id: str, requested_by_user_id: str, mode: str, idempotency_key: Optional[str], priority: int = 0) -> str:
+def _insert_job(conn: Any, workspace_id: str, contract_id: str, requested_by_user_id: str, mode: str, idempotency_key: Optional[str], priority: int = 0,
+                request_fingerprint: Optional[str] = None) -> str:
     """enqueue_job()'s two statements without the commit, so
     enqueue_job_with_usage() can put the usage reservation in the SAME
     transaction. priority (D-108) is 1 only for a job admitted under a
-    priority plan - see claim_next_job()."""
+    priority plan - see claim_next_job(). request_fingerprint (D-113) is
+    stored with the job, in the same INSERT, for idempotency-key reuse
+    checks."""
     if mode not in ("quick", "standard", "pro"):
         raise RepositoryError("mode must be one of quick/standard/pro, got %r" % mode)
     if priority not in (0, 1):
@@ -658,9 +661,9 @@ def _insert_job(conn: Any, workspace_id: str, contract_id: str, requested_by_use
     _ensure_queue_state(conn, workspace_id)
     db.execute(
         conn,
-        "INSERT INTO analysis_jobs (id, workspace_id, contract_id, requested_by_user_id, mode, idempotency_key, created_at, priority) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (job_id, workspace_id, contract_id, requested_by_user_id, mode, idempotency_key, now, priority),
+        "INSERT INTO analysis_jobs (id, workspace_id, contract_id, requested_by_user_id, mode, idempotency_key, created_at, priority, request_fingerprint) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (job_id, workspace_id, contract_id, requested_by_user_id, mode, idempotency_key, now, priority, request_fingerprint),
     )
     return job_id
 
@@ -1598,6 +1601,7 @@ def enqueue_job_with_usage(
     effective_loc: int,
     now: Optional[datetime] = None,
     max_pending_jobs: int = DEFAULT_MAX_PENDING_JOBS_PER_WORKSPACE,
+    request_fingerprint: Optional[str] = None,
 ) -> str:
     """Admission control for one submission: checks the plan's per-scan
     ceiling, then enqueues the job AND reserves its usage in ONE
@@ -1637,7 +1641,7 @@ def enqueue_job_with_usage(
                 "this workspace already has %d scans queued or running; wait for one to finish" % max_pending_jobs,
             )
         priority = 1 if spec["queue_priority"] == "priority" else 0
-        job_id = _insert_job(conn, workspace_id, contract_id, requested_by_user_id, mode, idempotency_key, priority)
+        job_id = _insert_job(conn, workspace_id, contract_id, requested_by_user_id, mode, idempotency_key, priority, request_fingerprint)
     except UsageLimitError:
         raise
     except Exception:
@@ -2290,6 +2294,112 @@ def revoke_workspace_github_connections(conn: Any, workspace_id: str) -> int:
         "refresh_token_expires_at = NULL, revoked_at = ?, updated_at = ? WHERE workspace_id = ? AND status = 'active'",
         (now, now, workspace_id),
     )
+    conn.commit()
+    return cur.rowcount
+
+
+# ---------------------------------------------------------------------------
+# Private API keys (D-113) - see backend/migrations/0014_api_keys.sql and
+# backend/api_keys.py. Only the SHA-256 of a key is stored; nothing here ever
+# receives or returns the full key except create_api_key()'s caller, which
+# generated it.
+# ---------------------------------------------------------------------------
+
+API_KEY_PUBLIC_FIELDS = ("id", "workspace_id", "user_id", "name", "key_prefix", "created_at", "last_used_at", "revoked_at")
+MAX_API_KEYS_LISTED = 200
+
+
+class ApiKeyLimitError(RepositoryError):
+    """The workspace already has the maximum number of active API keys."""
+
+
+def create_api_key(conn: Any, workspace_id: str, user_id: str, name: str, key_prefix: str, key_hash: str, max_active: int) -> Dict[str, Any]:
+    """Stores a new key (hash only) and returns its public fields. The
+    active-key count and the INSERT run in ONE transaction under the
+    existing per-workspace admission lock, so the ceiling holds under
+    concurrency. Raises ApiKeyLimitError (nothing created)."""
+    conn.commit()   # start from no open transaction, so the lock below is really taken
+    key_id = new_id()
+    now = utcnow_iso()
+    try:
+        _lock_workspace_admission(conn, workspace_id)
+        cur = db.execute(conn, "SELECT COUNT(*) AS n FROM api_keys WHERE workspace_id = ? AND revoked_at IS NULL", (workspace_id,))
+        if int(db.normalize_row(cur.fetchone())["n"]) >= max_active:
+            conn.rollback()
+            raise ApiKeyLimitError("this workspace already has %d active API keys" % max_active)
+        db.execute(
+            conn,
+            "INSERT INTO api_keys (id, workspace_id, user_id, name, key_prefix, key_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (key_id, workspace_id, user_id, name, key_prefix, key_hash, now),
+        )
+        conn.commit()
+    except ApiKeyLimitError:
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    return get_api_key(conn, workspace_id, key_id)
+
+
+def get_api_key(conn: Any, workspace_id: str, key_id: str) -> Optional[Dict[str, Any]]:
+    """Public fields of one key of this workspace (never its hash)."""
+    cur = db.execute(conn, "SELECT %s FROM api_keys WHERE workspace_id = ? AND id = ?" % ", ".join(API_KEY_PUBLIC_FIELDS), (workspace_id, key_id))
+    return db.normalize_row(cur.fetchone())
+
+
+def get_api_key_for_auth(conn: Any, key_prefix: str) -> Optional[Dict[str, Any]]:
+    """The row authentication needs (including key_hash), by the key's
+    public prefix. Only backend/http_app.py's API authentication uses it."""
+    cur = db.execute(
+        conn,
+        "SELECT id, workspace_id, user_id, key_hash, revoked_at, last_used_at FROM api_keys WHERE key_prefix = ?",
+        (key_prefix,),
+    )
+    return db.normalize_row(cur.fetchone())
+
+
+def list_api_keys(conn: Any, workspace_id: str, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Public fields of the workspace's keys (active and revoked), newest
+    first; only user_id's own keys when user_id is given."""
+    sql = "SELECT %s FROM api_keys WHERE workspace_id = ?" % ", ".join(API_KEY_PUBLIC_FIELDS)
+    params: tuple = (workspace_id,)
+    if user_id is not None:
+        sql += " AND user_id = ?"
+        params += (user_id,)
+    sql += " ORDER BY created_at DESC, id LIMIT %d" % MAX_API_KEYS_LISTED
+    cur = db.execute(conn, sql, params)
+    return [db.normalize_row(row) for row in cur.fetchall()]
+
+
+def revoke_api_key(conn: Any, workspace_id: str, key_id: str, revoked_by_user_id: str) -> bool:
+    """Revokes one active key of this workspace; False when there is no
+    such active key. The workspace, its data and other keys are untouched."""
+    now = utcnow_iso()
+    cur = db.execute(
+        conn,
+        "UPDATE api_keys SET revoked_at = ?, revoked_by_user_id = ? WHERE workspace_id = ? AND id = ? AND revoked_at IS NULL",
+        (now, revoked_by_user_id, workspace_id, key_id),
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def touch_api_key(conn: Any, key_id: str, resolution_seconds: int) -> None:
+    """Records last use, at most once per resolution_seconds per key."""
+    now = datetime.now(timezone.utc)
+    threshold = (now - timedelta(seconds=resolution_seconds)).isoformat()
+    db.execute(
+        conn,
+        "UPDATE api_keys SET last_used_at = ? WHERE id = ? AND revoked_at IS NULL AND (last_used_at IS NULL OR last_used_at < ?)",
+        (now.isoformat(), key_id, threshold),
+    )
+    conn.commit()
+
+
+def revoke_workspace_api_keys(conn: Any, workspace_id: str) -> int:
+    """Every active key of the workspace (workspace deletion)."""
+    now = utcnow_iso()
+    cur = db.execute(conn, "UPDATE api_keys SET revoked_at = ? WHERE workspace_id = ? AND revoked_at IS NULL", (now, workspace_id))
     conn.commit()
     return cur.rowcount
 

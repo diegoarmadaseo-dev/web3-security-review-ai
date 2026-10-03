@@ -210,11 +210,14 @@ def delete_workspace_data(
     # D-111: a deleted workspace keeps no usable GitHub credential - every
     # active connection is revoked and its encrypted tokens wiped.
     github_connections_revoked = repo.revoke_workspace_github_connections(conn, workspace_id)
+    # D-113: and no usable Private API key.
+    api_keys_revoked = repo.revoke_workspace_api_keys(conn, workspace_id)
 
     workspace_deleted = repo.mark_workspace_deleted(conn, workspace_id)
 
     return {
         "github_connections_revoked": github_connections_revoked,
+        "api_keys_revoked": api_keys_revoked,
         "dry_run": False,
         "workspace_id": workspace_id,
         "deleted_contracts": deleted_contracts,

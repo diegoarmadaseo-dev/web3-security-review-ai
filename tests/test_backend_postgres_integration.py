@@ -122,7 +122,7 @@ class MigrationIntegrationTests(unittest.TestCase):
         self.conn, self.applied = _reset_database_and_migrate()
         self.addCleanup(self.conn.close)
 
-    def test_fresh_database_applies_all_thirteen_migrations_in_order(self):
+    def test_fresh_database_applies_all_fourteen_migrations_in_order(self):
         # 0002_auth_tokens.sql (Phase 2), 0003_entitlement_status_expand.sql
         # and 0004_entitlement_event_provenance.sql (Phase 3),
         # 0005_job_queue_hardening.sql (Phase 4, D-079),
@@ -132,8 +132,8 @@ class MigrationIntegrationTests(unittest.TestCase):
         # post reap-atomicity-fix and worker-fencing hardening) and
         # 0009_commercial_usage.sql (D-107), 0010_commercial_guards.sql
         # (D-108), 0011_contract_files.sql (D-109) and
-        # 0012_github_connections.sql (D-111) and 0013_trial.sql (D-112)
-        # added alongside
+        # 0012_github_connections.sql (D-111), 0013_trial.sql (D-112) and
+        # 0014_api_keys.sql (D-113) added alongside
         # 0001_initial_schema.sql (Phase 1).
         self.assertEqual(
             self.applied,
@@ -142,6 +142,7 @@ class MigrationIntegrationTests(unittest.TestCase):
                 "0004_entitlement_event_provenance", "0005_job_queue_hardening", "0006_retention_purge",
                 "0007_billing_interval", "0008_queue_fairness", "0009_commercial_usage",
                 "0010_commercial_guards", "0011_contract_files", "0012_github_connections", "0013_trial",
+                "0014_api_keys",
             ],
         )
 
@@ -164,7 +165,7 @@ class MigrationIntegrationTests(unittest.TestCase):
             seen_statuses.add(repo.get_entitlement_by_workspace(self.conn, workspace_id)["status"])
         self.assertEqual(seen_statuses, {"incomplete_expired", "unpaid"})
 
-    def test_all_twenty_five_tables_exist(self):
+    def test_all_twenty_six_tables_exist(self):
         cur = db.execute(
             self.conn,
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
@@ -181,6 +182,7 @@ class MigrationIntegrationTests(unittest.TestCase):
             "contract_files",  # D-109, 0011_contract_files.sql.
             "github_connections", "github_oauth_states", "contract_git_sources",  # D-111, 0012_github_connections.sql.
             "trial_grants",  # D-112, 0013_trial.sql.
+            "api_keys",  # D-113, 0014_api_keys.sql.
         }
         self.assertEqual(tables, expected)
 
@@ -1360,6 +1362,163 @@ class HttpJobSubmitConcurrencyIntegrationTests(unittest.TestCase):
         self.assertNotIn("duplicate", payload_2)
         cur = db.execute(self.conn, "SELECT COUNT(*) AS n FROM analysis_jobs WHERE workspace_id = %s", (workspace_id,))
         self.assertEqual(db.normalize_row(cur.fetchone())["n"], 2)
+
+
+class PrivateApiIntegrationTests(unittest.TestCase):
+    """D-113 against a REAL Postgres server: 0014 (api_keys, the
+    request_fingerprint column and their CHECKs), key storage/lookup/
+    revocation, the active-key ceiling under real concurrency, and through
+    the real HTTP layer: concurrent same-idempotency-key API submissions,
+    reuse with a different payload, the Quick credit reserved once under
+    concurrency, cross-workspace isolation and the Trial refusal."""
+
+    setUp = HttpJobSubmitConcurrencyIntegrationTests.setUp
+    _request = HttpJobSubmitConcurrencyIntegrationTests._request
+    _login = HttpJobSubmitConcurrencyIntegrationTests._login
+
+    def _api(self, method, path, key, body=None, headers=None):
+        import http.client
+        import json as json_module
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
+        hdrs = {"Host": self.host_header, "Authorization": "Bearer " + key}
+        data = None
+        if body is not None:
+            data = json_module.dumps(body).encode("utf-8")
+            hdrs.update({"Content-Type": "application/json", "Content-Length": str(len(data))})
+        hdrs.update(headers or {})
+        conn.request(method, "/api/v1" + path, body=data, headers=hdrs)
+        resp = conn.getresponse()
+        raw = resp.read()
+        conn.close()
+        return resp.status, json_module.loads(raw) if raw[:1] == b"{" else raw
+
+    def _account(self, plan, email):
+        cookie = self._login(email)
+        status, payload = self._request("POST", "/workspaces", {"name": "PG API %s" % plan}, cookie=cookie)
+        self.assertEqual(status, 200, payload)
+        ws = payload["workspace_id"]
+        repo.create_entitlement(self.conn, ws, plan, "active", billing_interval="monthly")
+        if plan == "quick":
+            repo.grant_scan_credit(self.conn, "cs_pg_%s" % email, ws)
+        self.conn.commit()
+        status, created = self._request("POST", "/workspaces/%s/api-keys" % ws, {"name": "pg"}, cookie=cookie)
+        if plan == "trial":
+            self.assertEqual((status, created["error"]), (403, "feature_not_available"))
+            return cookie, ws, None
+        self.assertEqual(status, 200, created)
+        return cookie, ws, created["secret"]
+
+    @staticmethod
+    def _source(name):
+        return "pragma solidity ^0.8.20;\ncontract %s {\n    uint256 public a;\n}\n" % name
+
+    def test_key_storage_lookup_touch_revoke_and_constraints(self):
+        import backend.api_keys as api_keys
+        user = repo.create_user(self.conn, "pg-keys@example.com")
+        ws = repo.create_workspace(self.conn, "K", user)
+        key, prefix, key_hash = api_keys.generate()
+        record = repo.create_api_key(self.conn, ws, user, "ci", prefix, key_hash, 25)
+        self.assertNotIn("key_hash", record)
+        row = repo.get_api_key_for_auth(self.conn, prefix)
+        self.assertTrue(api_keys.matches(key, row["key_hash"]))
+        self.assertIsNone(row["last_used_at"])
+        repo.touch_api_key(self.conn, row["id"], 60)
+        first = repo.get_api_key_for_auth(self.conn, prefix)["last_used_at"]
+        self.assertIsNotNone(first)
+        repo.touch_api_key(self.conn, row["id"], 60)                   # within the resolution: no write
+        self.assertEqual(repo.get_api_key_for_auth(self.conn, prefix)["last_used_at"], first)
+        self.assertEqual([str(k["id"]) for k in repo.list_api_keys(self.conn, ws)], [str(record["id"])])
+        self.assertTrue(repo.revoke_api_key(self.conn, ws, record["id"], user))
+        self.assertFalse(repo.revoke_api_key(self.conn, ws, record["id"], user))
+        self.assertIsNotNone(repo.get_api_key_for_auth(self.conn, prefix)["revoked_at"])
+        for bad in (("ABCDEFABCDEF", "0" * 64), ("abcdefabcdef", "plaintext-secret")):
+            with self.assertRaises(db.integrity_error_class(self.conn)):
+                db.execute(self.conn, "INSERT INTO api_keys (id, workspace_id, user_id, name, key_prefix, key_hash, created_at) VALUES (?, ?, ?, 'x', ?, ?, now())",
+                           (repo.new_id(), ws, user) + bad)
+            self.conn.rollback()
+        self.assertEqual(repo.revoke_workspace_api_keys(self.conn, ws), 0)
+
+    def test_concurrent_key_creation_respects_the_ceiling(self):
+        import backend.api_keys as api_keys
+        user = repo.create_user(self.conn, "pg-ceiling@example.com")
+        ws = repo.create_workspace(self.conn, "C", user)
+        results, barrier = [], threading.Barrier(12)
+
+        def attempt(i):
+            conn = db.connect_postgres(DSN)
+            try:
+                barrier.wait()
+                _, prefix, key_hash = api_keys.generate()
+                repo.create_api_key(conn, ws, user, "k%d" % i, prefix, key_hash, 5)
+                results.append("ok")
+            except repo.ApiKeyLimitError:
+                results.append("limit")
+            except Exception as exc:   # pragma: no cover
+                results.append(repr(exc))
+            finally:
+                conn.close()
+
+        threads = [threading.Thread(target=attempt, args=(i,)) for i in range(12)]
+        [th.start() for th in threads]
+        [th.join(30) for th in threads]
+        self.assertEqual(sorted(results), ["limit"] * 7 + ["ok"] * 5)
+        self.assertEqual(db.execute(self.conn, "SELECT COUNT(*) AS n FROM api_keys WHERE workspace_id = ?", (ws,)).fetchone()["n"], 5)
+
+    def test_concurrent_api_submits_same_idempotency_key(self):
+        _, ws, key = self._account("standard", "pg-api-idem@example.com")
+        payload = {"mode": "standard", "source": self._source("C"), "idempotency_key": "pg-race"}
+        results, barrier = [], threading.Barrier(10)
+
+        def go():
+            barrier.wait(timeout=5)
+            results.append(self._api("POST", "/scans", key, payload))
+
+        threads = [threading.Thread(target=go) for _ in range(10)]
+        [t.start() for t in threads]
+        [t.join(30) for t in threads]
+        self.assertEqual([r[0] for r in results], [200] * 10, results)
+        self.assertEqual(len({r[1]["job_id"] for r in results}), 1)
+        self.assertEqual(sum(1 for r in results if not r[1].get("duplicate")), 1)
+        self.assertEqual(db.execute(self.conn, "SELECT COUNT(*) AS n FROM analysis_jobs WHERE workspace_id = ?", (ws,)).fetchone()["n"], 1)
+        self.assertEqual(db.execute(self.conn, "SELECT COUNT(*) AS n FROM job_usage WHERE workspace_id = ?", (ws,)).fetchone()["n"], 1)
+        status, body = self._api("POST", "/scans", key, dict(payload, source=self._source("Changed")))
+        self.assertEqual((status, body["error"]["code"]), (409, "idempotency_key_reused"))
+        fingerprint = db.execute(self.conn, "SELECT request_fingerprint FROM analysis_jobs WHERE workspace_id = ?", (ws,)).fetchone()["request_fingerprint"]
+        self.assertRegex(fingerprint, r"^[0-9a-f]{64}$")
+
+    def test_quick_credit_is_reserved_once_under_concurrency(self):
+        _, ws, key = self._account("quick", "pg-api-quick@example.com")
+        results, barrier = [], threading.Barrier(6)
+
+        def go(i):
+            barrier.wait(timeout=5)
+            results.append(self._api("POST", "/scans", key, {"mode": "quick", "source": self._source("Q%d" % i)}))
+
+        threads = [threading.Thread(target=go, args=(i,)) for i in range(6)]
+        [t.start() for t in threads]
+        [t.join(30) for t in threads]
+        self.assertEqual(sorted(r[0] for r in results), [200] + [402] * 5, results)
+        self.assertEqual({r[1]["error"]["code"] for r in results if r[0] == 402}, {"no_scan_credit"})
+        self.assertEqual(db.execute(self.conn, "SELECT COUNT(*) AS n FROM job_usage WHERE workspace_id = ?", (ws,)).fetchone()["n"], 1)
+
+    def test_cross_workspace_isolation_and_trial_refusal(self):
+        import backend.api_keys as api_keys
+        _, ws_a, key_a = self._account("pro", "pg-api-a@example.com")
+        _, ws_b, key_b = self._account("pro", "pg-api-b@example.com")
+        status, project = self._api("POST", "/projects", key_b, {"name": "B"})
+        self.assertEqual(status, 200, project)
+        status, job = self._api("POST", "/scans", key_b, {"mode": "pro", "source": self._source("B")})
+        self.assertEqual(status, 200, job)
+        self.assertEqual(self._api("GET", "/projects/%s" % project["project"]["id"], key_a)[0], 404)
+        self.assertEqual(self._api("GET", "/scans/%s" % job["job_id"], key_a)[0], 404)
+        self.assertEqual(self._api("GET", "/scans", key_a)[1]["jobs"], [])
+        self.assertEqual(self._api("GET", "/usage", key_a)[1]["workspace_id"], ws_a)
+        _, ws_t, _ = self._account("trial", "pg-api-trial@example.com")
+        planted, prefix, key_hash = api_keys.generate()
+        user = repo.get_user_by_email(self.conn, "pg-api-trial@example.com")["id"]
+        repo.create_api_key(self.conn, ws_t, user, "planted", prefix, key_hash, 25)
+        status, body = self._api("GET", "/usage", planted)
+        self.assertEqual((status, body["error"]["code"]), (403, "feature_not_available"))
 
 
 class RestoreVerificationIntegrationTests(unittest.TestCase):

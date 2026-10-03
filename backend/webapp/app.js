@@ -165,7 +165,7 @@
     var views = {
       dashboard: dashboardView, projects: function () { return p[1] ? projectView(p[1]) : projectsView(); },
       scan: function () { return newScanView(r.query); }, scans: function () { return p[1] ? jobView(p[1]) : scansView(r.query); },
-      reports: function () { return reportView(p[1]); }, usage: usageView, billing: billingView
+      reports: function () { return reportView(p[1]); }, usage: usageView, billing: billingView, "api-keys": apiKeysView
     };
     (views[p[0]] || dashboardView)();
   }
@@ -560,6 +560,51 @@
         el("p", { className: "small muted", text: u.usage_model === "scan_credit" ? "Quick has no monthly allowance: each purchase includes exactly one scan." : "Unused LOC does not roll over to the next service month. Failed scans are not charged." }));
       sizeBars(view);
     }).catch(function (err) { if (current(token)) { render(el("h1", { text: "Usage" }), errorBox(err)); } });
+  }
+
+  // D-113 Private API keys. The full key is shown once, right after it is
+  // created, and is never fetched again (the backend only stores its hash).
+  function apiKeysView() {
+    var token = state.route, msg = el("div"), created = el("div");
+    Promise.all([loadWs(), api("GET", wsPath("/api-keys"))]).then(function (r) {
+      if (!current(token)) { return; }
+      var adm = r[0].admission || {}, keys = r[1].keys || [];
+      var allowed = (adm.features || []).indexOf("private_api") >= 0;
+      var input = el("input", { type: "text", maxlength: "100", required: true, "aria-label": "Key name", placeholder: "e.g. CI pipeline" });
+      function showSecret(d) {
+        clear(created);
+        created.appendChild(el("div", { className: "alert ok", role: "status" },
+          el("p", null, el("strong", { text: "Copy this key now: it is shown only once and cannot be recovered." })),
+          el("pre", null, el("code", { text: d.secret })),
+          el("p", { className: "small", text: "Send it as: Authorization: Bearer <key>" })));
+      }
+      var form = allowed ? el("form", { className: "inline", onsubmit: function (ev) {
+        ev.preventDefault();
+        api("POST", wsPath("/api-keys"), { name: input.value }).then(function (d) {
+          input.value = "";
+          showSecret(d);
+          return api("GET", wsPath("/api-keys")).then(function (l) { clear(table); append(table, keysTable(l.keys || [])); });
+        }).catch(function (err) { clear(msg); msg.appendChild(errorBox(err)); });
+      } }, input, el("button", { type: "submit", text: "Create key" })) : el("p", null, "The Private API is available on the Quick, Standard and Pro plans. ", el("a", { href: "#/billing", text: "See plans" }));
+      function keysTable(list) {
+        if (!list.length) { return el("p", { className: "muted", text: "No API keys yet." }); }
+        return el("table", null, el("thead", null, el("tr", null, ["Name", "Key", "Created", "Last used", "Status", ""].map(function (h) { return el("th", { text: h }); }))),
+          el("tbody", null, list.map(function (k) {
+            return el("tr", null, el("td", { text: k.name }), el("td", null, el("code", { text: "vcx_" + k.key_prefix + "_..." })),
+              el("td", { text: C.formatDate(k.created_at) }), el("td", { text: k.last_used_at ? C.formatDate(k.last_used_at) : "Never" }),
+              el("td", { text: k.revoked_at ? "Revoked " + C.formatDate(k.revoked_at) : "Active" }),
+              el("td", null, k.revoked_at ? null : el("button", { type: "button", className: "danger", text: "Revoke", onclick: function (ev) {
+                ev.target.disabled = true;
+                api("DELETE", wsPath("/api-keys/" + encodeURIComponent(k.id))).then(function () { clear(created); route(); })
+                  .catch(function (err) { ev.target.disabled = false; clear(msg); msg.appendChild(errorBox(err)); });
+              } })));
+          })));
+      }
+      var table = el("div", null, keysTable(keys));
+      render(el("h1", { text: "API keys" }),
+        el("p", { className: "muted", text: "Keys authenticate the Private API (" + window.location.origin + "/api/v1/) for this workspace only. A key acts as the member who created it; revoke a key to stop it immediately." }),
+        msg, created, form, table);
+    }).catch(function (err) { if (current(token)) { render(el("h1", { text: "API keys" }), errorBox(err)); } });
   }
 
   function billingView() {
