@@ -47,8 +47,8 @@ what the code actually reads.
 
 | Variable | Purpose | Required? | Secret? |
 |---|---|---|---|
-| `STRIPE_SECRET_KEY` | Stripe API secret key. | Yes | **Yes** |
-| `STRIPE_WEBHOOK_SECRET` | Verifies `Stripe-Signature` on `/billing/webhook`. | Yes | **Yes** |
+| `STRIPE_SECRET_KEY` | Stripe API secret key. D-115: also used by `/billing/webhook` to re-read each subscription and a Quick session's line items - a restricted key needs write on Checkout Sessions and Customer Portal sessions and read on Subscriptions and Checkout Session line items. | Yes | **Yes** |
+| `STRIPE_WEBHOOK_SECRET` | Verifies `Stripe-Signature` on `/billing/webhook`. The endpoint must send exactly: `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `customer.subscription.created`, `customer.subscription.updated`, `customer.subscription.deleted`, `invoice.paid`, `invoice.payment_failed` (D-115; Sandbox runbook: `docs/stripe-sandbox-e2e.md`). | Yes | **Yes** |
 | `STRIPE_PRICE_STANDARD_MONTHLY` / `_ANNUAL`, `STRIPE_PRICE_PRO_MONTHLY` / `_ANNUAL` | Stripe Price IDs of the 4 subscription price modes of the Launch catalog (`backend/plans.py`, D-107: Standard $199.99/month or $1,999.90/year, Pro $289.99/month or $2,899.90/year; annual = 12 service months, usage still metered per service month). Validated at startup (`price_...` shape, no ID reused). | Yes (all 4) | No |
 | `STRIPE_PRICE_QUICK_ONETIME` | Stripe Price ID of Quick ($29.99, one-time payment - Checkout `mode=payment`, never a subscription - exactly 1 scan of up to 3,000 effective LOC). Same validation as the other four. The retired D-086 variables `STRIPE_PRICE_QUICK_MONTHLY` / `_ANNUAL` are a startup error if set. | Yes | No |
 

@@ -41,7 +41,7 @@ import backend.retention as retention  # noqa: E402
 import backend.targeted_review as targeted_review  # noqa: E402
 import backend.trial as trial  # noqa: E402
 import backend.worker_supervisor as ws_mod  # noqa: E402
-from tests.test_backend_billing import _make_billing  # noqa: E402
+from tests.test_backend_billing import PRICE_ALLOWLIST, _make_billing  # noqa: E402
 from tests.test_backend_commercial import _sol  # noqa: E402
 from tests.test_backend_commercial_guards import _GuardsHttpCase  # noqa: E402
 from tests.test_backend_http_app import HOST, _CapturingEmailSender, _capture_stderr  # noqa: E402
@@ -624,15 +624,21 @@ class TrialBillingTests(_TrialHttpCase):
         self.assertEqual(status, 200, body)                                       # an unused Trial is not an unused Quick scan
         status, _, body = self.jpost("/billing/checkout", cookie, {"workspace_id": ws, "plan": "standard", "interval": "monthly"})
         self.assertEqual(status, 200, body)
-        # Quick paid on the Trial workspace -> Quick entitlement + 1 credit.
-        http_app._apply_quick_payment(conn, {"id": "cs_test_conv", "client_reference_id": ws, "customer": "cus_conv", "metadata": {"plan": "quick", "workspace_id": ws}}, None)
+        # Quick paid on the Trial workspace -> Quick entitlement + 1 credit
+        # (D-115: what was paid is verified against Stripe's line items).
+        stripe_billing = _make_billing()
+        stripe_billing._client.checkout.sessions.line_items.store["cs_test_conv"] = [(PRICE_ALLOWLIST["vericexa_quick_onetime"], 1)]
+        http_app._apply_quick_payment(conn, {"id": "cs_test_conv", "client_reference_id": ws, "customer": "cus_conv", "metadata": {"plan": "quick", "workspace_id": ws}},
+                                      None, stripe_billing)
         self.assertEqual(repo.get_entitlement_by_workspace(conn, ws)["plan"], "quick")
         status, _, body = self.submit(cookie, ws, {"source": _sol(2000)})
         self.assertEqual(status, 200, body)                                       # Quick's 3,000 LOC now apply
         self.assertEqual(repo.get_job_usage(conn, body["job_id"])["usage_model"], "scan_credit")
         self.assertEqual(self.jget("/trial", cookie)[2]["trial"]["state"], "used")   # the email's Trial is gone for good
         # A subscription event converts it again (Standard).
-        http_app._upsert_entitlement(conn, ws, "standard", "active", "cus_conv", "sub_conv", None, None, interval="monthly")
+        stripe_billing._client.subscriptions.store["sub_conv"] = {"id": "sub_conv", "customer": "cus_conv", "status": "active", "metadata": {"workspace_id": ws},
+                                                                  "items": {"data": [{"price": {"id": PRICE_ALLOWLIST["vericexa_standard_monthly"]}}]}}
+        http_app._sync_subscription(conn, stripe_billing, "sub_conv", ws)   # D-115: Stripe's current state of the subscription
         self.assertEqual(repo.get_entitlement_by_workspace(conn, ws)["plan"], "standard")
         self.assertEqual(self.jpost("/workspaces/%s/projects" % ws, cookie, {"name": "P1"})[0], 200)
         self.assertEqual(self.jpost("/workspaces/%s/projects" % ws, cookie, {"name": "P2"})[0], 200)   # unlimited again

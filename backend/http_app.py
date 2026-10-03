@@ -90,7 +90,12 @@ documents webhook delivery as at-least-once and NOT guaranteed in order,
 so without this an old, out-of-order event could both wrongly revoke an
 active subscriber's access and, worse, wrongly RESTORE access after a
 real cancellation (both confirmed reproducible before this fix - see
-that same audit).
+that same audit). D-115 keeps that rule for Quick payments and replaces
+it for SUBSCRIPTIONS, which it could not order when Stripe sends several
+events in the same second (a paid subscription could stay "incomplete"):
+every subscription-related event now triggers a re-read of the
+subscription from Stripe, applied under a per-workspace lock - the newest
+state always wins, whatever the delivery order (_sync_subscription()).
 
 SCANNER/PREFETCH SAFETY: GET /auth/verify is read-only (backend.auth.
 peek_token, never consumes) and renders a confirmation page requiring an
@@ -752,188 +757,123 @@ _SUBSCRIPTION_EVENT_TYPES = ("customer.subscription.created", "customer.subscrip
 _SUBSCRIPTION_PLANS = tuple(name for name, spec in plans.PLANS.items() if spec["billing_type"] == plans.BILLING_SUBSCRIPTION)
 
 
-def _upsert_entitlement(
-    conn: Any,
-    workspace_id: Optional[str],
-    plan: Optional[str],
-    status: str,
-    stripe_customer_id: Optional[str],
-    stripe_subscription_id: Optional[str],
-    current_period_end: Optional[str],
-    event_created_at: Optional[str],
-    interval: Optional[str] = None,
-    current_period_start: Optional[str] = None,
-) -> None:
-    """Shared by every branch of _apply_webhook_event() below that carries
-    an authoritative subscription status. Checks existence FIRST (rather
-    than branching on update_entitlement_status()'s return value, as a
-    pre-Phase-3-hardening version of this function did) because that
-    return value is now ambiguous between "no row exists yet" (must
-    create) and "a row exists but this event is stale/tied and was
-    correctly ignored" (must do nothing) - see that function's own
-    docstring on the ordering rule. Creating one on whichever event
-    happens to arrive FIRST for a given workspace also establishes this
-    row's OWN ordering baseline (event_created_at is stamped on create
-    too, not left NULL) - see module docstring on billing's "never
-    assume webhook delivery order". A plan-less event with no existing
-    row to update (should never happen for a session/subscription this
-    backend itself created, since billing.StripeBilling.
-    create_checkout_session() always stamps workspace_id/plan into
-    metadata) is silently skipped rather than guessed at.
-
-    interval (D-086) is validated here - not just plan - before ever
-    reaching repository.py: an unrecognized/missing value is passed
-    through as None (repository.py's own CHECK constraint would reject
-    anything else at the CREATE path anyway; validating here keeps a
-    malformed metadata value from ever reaching that far).
-
-    D-107: a subscription event now also UPDATES plan (resolved from the
-    subscription's own Price ID by the caller), the subscription/customer
-    ids and current_period_start (service-month anchor) on an existing
-    row, so a portal upgrade/downgrade or monthly<->annual switch is
-    reflected; only subscription plans are accepted here."""
-    if not workspace_id:
-        return
-    if interval not in ("monthly", "annual"):
-        interval = None
-    if plan not in _SUBSCRIPTION_PLANS:
-        plan = None
-    if repo.get_entitlement_by_workspace(conn, workspace_id) is None:
-        if plan is not None:
-            repo.create_entitlement(conn, workspace_id, plan, status, stripe_customer_id, stripe_subscription_id, current_period_end, event_created_at,
-                                    billing_interval=interval, current_period_start=current_period_start)
-        return
-    repo.update_entitlement_status(conn, workspace_id, status, current_period_end, event_created_at, billing_interval=interval, plan=plan,
-                                   current_period_start=current_period_start, stripe_customer_id=stripe_customer_id,
-                                   stripe_subscription_id=stripe_subscription_id)
-
-
-def _apply_quick_payment(conn: Any, obj: Dict[str, Any], event_created_at: Optional[str]) -> None:
+def _apply_quick_payment(conn: Any, obj: Dict[str, Any], event_created_at: Optional[str],
+                         billing: Optional["billing_module.StripeBilling"] = None) -> None:
     """A PAID Quick Checkout Session (D-107): grants exactly one scan credit
     (keyed by the session id - a redelivered event never grants twice) and
     makes the workspace's entitlement quick/active. Never touches a
     workspace whose current entitlement is a live subscription (checkout
-    refuses to sell Quick to one; this is defense in depth)."""
+    refuses to sell Quick to one; this is defense in depth).
+
+    D-115: the session's metadata is only a pointer - what was PAID is
+    verified with Stripe: its line items must be exactly one unit of the
+    configured Quick Price (anything else, e.g. another product's session
+    in the same Stripe account, grants nothing), and client_reference_id
+    and metadata.workspace_id must agree."""
     metadata = obj.get("metadata") or {}
     workspace_id = obj.get("client_reference_id") or metadata.get("workspace_id")
     session_id = obj.get("id")
     if not workspace_id or not isinstance(session_id, str) or not session_id or metadata.get("plan") != plans.PLAN_QUICK:
         return
-    existing = repo.get_entitlement_by_workspace(conn, workspace_id)
-    if existing is not None and existing["plan"] in _SUBSCRIPTION_PLANS and existing["status"] in ("active", "trialing", "past_due"):
+    if metadata.get("workspace_id") and obj.get("client_reference_id") and metadata["workspace_id"] != obj["client_reference_id"]:
         return
-    repo.grant_scan_credit(conn, session_id, workspace_id)
-    if existing is None:
-        repo.create_entitlement(conn, workspace_id, plans.PLAN_QUICK, "active", stripe_customer_id=obj.get("customer"), stripe_event_created_at=event_created_at)
-    else:
-        repo.update_entitlement_status(conn, workspace_id, "active", stripe_event_created_at=event_created_at, plan=plans.PLAN_QUICK,
-                                       stripe_customer_id=obj.get("customer"))
+    if billing is None or billing.checkout_session_price_ids(session_id) != [(billing.resolve_price_id(plans.PLAN_QUICK, plans.INTERVAL_ONE_TIME), 1)]:
+        return
+    customer = obj.get("customer")
+    repo.apply_quick_purchase(conn, workspace_id, session_id, customer.get("id") if isinstance(customer, dict) else customer, event_created_at)
+
+
+def _sync_subscription(conn: Any, billing: Optional["billing_module.StripeBilling"], subscription_id: Optional[str],
+                       workspace_hint: Optional[str]) -> None:
+    """D-115: applies a subscription's CURRENT state, re-read from Stripe,
+    to its workspace's entitlement - the event that triggered this is only
+    a pointer (see backend/billing.py's module docstring on authoritative
+    state). Under the per-workspace billing lock, so concurrent deliveries
+    are applied in read order. The workspace comes from the server-stamped
+    subscription metadata and must match the hint the event carried; the
+    plan and interval come ONLY from the subscription's own Price ID - a
+    Price outside the configured catalog (retired, foreign, missing) never
+    grants anything. Stripe API errors propagate: the webhook answers 500,
+    the event stays retryable and Stripe redelivers it."""
+    if billing is None or not isinstance(subscription_id, str) or not subscription_id:
+        return
+    workspace_id = workspace_hint
+    if not workspace_id:
+        workspace_id = (billing.retrieve_subscription(subscription_id).get("metadata") or {}).get("workspace_id")
+        if not workspace_id:
+            return
+    repo.lock_workspace_billing(conn, workspace_id)
+    try:
+        subscription = billing.retrieve_subscription(subscription_id)
+        metadata = subscription.get("metadata") or {}
+        status = subscription.get("status")
+        resolved = billing.plan_for_price_id(billing_module.subscription_price_id(subscription))
+        if (metadata.get("workspace_id") != workspace_id or subscription.get("id") not in (None, subscription_id) or not isinstance(status, str)
+                or resolved is None or resolved["plan"] not in _SUBSCRIPTION_PLANS):
+            conn.rollback()   # releases the lock; nothing to apply
+            return
+        customer = subscription.get("customer")
+        repo.apply_subscription_state(
+            conn, workspace_id, resolved["plan"], resolved["interval"], status,
+            customer.get("id") if isinstance(customer, dict) else customer, subscription_id,
+            billing_module.subscription_period_start(subscription), billing_module.subscription_period_end(subscription),
+        )
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def _apply_webhook_event(conn: Any, event_type: str, obj: Dict[str, Any], event_created_at: Optional[str],
                          billing: Optional["billing_module.StripeBilling"] = None) -> None:
-    """Dispatches one of the 5 handled Stripe event types
-    (backend/billing.py's module docstring lists them) to an
-    entitlements update. event_created_at is the ENCLOSING Stripe
-    Event's own `created` timestamp (already converted to an ISO string
-    by the caller, _handle_billing_webhook) - the ordering signal every
-    branch below threads through to repository.py's update_entitlement_
-    status()/create_entitlement(), per docs/decisiones.md D-077's Phase 3
-    webhook-hardening follow-up: Stripe explicitly documents webhook
-    delivery as at-least-once and NOT guaranteed in order, so a stale
-    event must never regress (or, after a cancellation, incorrectly
-    restore) a newer entitlement state - see update_entitlement_status()'s
-    own docstring for the exact deterministic rule, including its tie-
-    break. Any OTHER event type Stripe might deliver (there are dozens)
-    is a deliberate silent no-op here, never an error -
-    _handle_billing_webhook() still records via record_webhook_event()/
-    mark_webhook_event_processed() that it was received, so nothing is
-    lost, but this backend only ACTS on the 5 types this phase is scoped
-    to."""
+    """Dispatches the handled Stripe event types to an entitlement change.
+
+    - Quick (checkout.session.completed / async_payment_succeeded in
+      payment mode, paid): one scan credit keyed by the session id, after
+      verifying the paid line item (_apply_quick_payment); its entitlement
+      update keeps the Phase 3 ordering rule on event_created_at (the
+      ENCLOSING event's `created`, see update_entitlement_status()).
+    - Subscriptions (D-115): checkout.session.completed in subscription
+      mode, customer.subscription.created/updated/deleted, invoice.paid and
+      invoice.payment_failed are TRIGGERS for _sync_subscription(), which
+      applies the subscription's current state re-read from Stripe under
+      the per-workspace lock. Stripe delivers at least once and in any
+      order, and routinely emits several of these within the same second
+      (a `created`-based order could leave a paid subscription stuck at
+      "incomplete"); re-reading makes the order irrelevant and replays
+      harmless.
+
+    Any other event type is a deliberate no-op (still recorded by
+    _handle_billing_webhook()). An exception propagates so the caller
+    answers 500 and the event stays retryable."""
     if event_type in ("checkout.session.completed", "checkout.session.async_payment_succeeded") and obj.get("mode") == "payment":
         # D-107 Quick: one-time payment. Only a PAID session grants the
         # scan; an asynchronous payment method completes later with
         # checkout.session.async_payment_succeeded (handled here too).
         if obj.get("payment_status") == "paid":
-            _apply_quick_payment(conn, obj, event_created_at)
+            _apply_quick_payment(conn, obj, event_created_at, billing)
         return
     if event_type == "checkout.session.async_payment_succeeded":
         return
     if event_type == "checkout.session.completed":
-        # Deliberately NOT _upsert_entitlement(): this event's own object
-        # carries no real subscription status (a Checkout Session's
-        # status is about the CHECKOUT, not the subscription it created),
-        # so this handler only ever CREATES a row that does not exist yet
-        # - using 'incomplete' as an honest placeholder pending the
-        # authoritative status a customer.subscription.* event carries -
-        # and never touches status OR event_created_at on a row that
-        # already exists, at any timestamp: an existing row, by
-        # definition, was already established by a MORE authoritative
-        # event (a subscription event carries a real status; this one
-        # never does), so this event is never "newer" in the sense that
-        # matters here, regardless of what its own `created` says.
-        # Without this asymmetry, a customer.subscription.updated event
-        # that happens to arrive FIRST (setting a real status like
-        # 'active') would be silently regressed back to 'incomplete' by
-        # this event arriving second - exactly the delivery-order
-        # assumption this phase was explicitly scoped to never make.
+        # Subscription checkout: the session points at the subscription it
+        # created; its real state (usually already active) is applied now,
+        # whichever of the subscription/invoice events arrives first.
         metadata = obj.get("metadata") or {}
         workspace_id = obj.get("client_reference_id")
-        plan = metadata.get("plan")
-        interval = metadata.get("interval")
-        if interval not in ("monthly", "annual"):
-            interval = None
-        if workspace_id and plan in _SUBSCRIPTION_PLANS and repo.get_entitlement_by_workspace(conn, workspace_id) is None:
-            repo.create_entitlement(
-                conn,
-                workspace_id,
-                plan,
-                status="incomplete",
-                stripe_customer_id=obj.get("customer"),
-                stripe_subscription_id=obj.get("subscription"),
-                stripe_event_created_at=event_created_at,
-                billing_interval=interval,
-            )
-    elif event_type in _SUBSCRIPTION_EVENT_TYPES:
-        # A canceled subscription's own status is already 'canceled' on
-        # the object customer.subscription.deleted carries - confirmed
-        # Stripe behavior, so both event types share this one branch.
-        metadata = obj.get("metadata") or {}
-        status = obj.get("status")
-        if not isinstance(status, str):
+        if metadata.get("workspace_id") and workspace_id and metadata["workspace_id"] != workspace_id:
             return
-        # D-107: the subscription's own Price ID decides plan/interval.
-        # A Price ID outside the configured catalog (a retired D-086
-        # price, a foreign price) is ignored entirely - never mapped to a
-        # plan. Only an object carrying no price at all falls back to the
-        # server-stamped metadata.
-        plan, interval = metadata.get("plan"), metadata.get("interval")
-        price_id = billing_module.subscription_price_id(obj)
-        if price_id is not None:
-            resolved = billing.plan_for_price_id(price_id) if billing is not None else None
-            if resolved is None or resolved["plan"] not in _SUBSCRIPTION_PLANS:
-                return
-            plan, interval = resolved["plan"], resolved["interval"]
-        _upsert_entitlement(
-            conn,
-            workspace_id=metadata.get("workspace_id"),
-            plan=plan,
-            status=status,
-            stripe_customer_id=obj.get("customer"),
-            stripe_subscription_id=obj.get("id"),
-            current_period_end=billing_module.subscription_period_end(obj),
-            event_created_at=event_created_at,
-            interval=interval,
-            current_period_start=billing_module.subscription_period_start(obj),
-        )
-    elif event_type == "invoice.paid":
-        workspace_id = billing_module.invoice_workspace_id(obj)
-        if workspace_id:
-            repo.update_entitlement_status(conn, workspace_id, "active", stripe_event_created_at=event_created_at)
-    elif event_type == "invoice.payment_failed":
-        workspace_id = billing_module.invoice_workspace_id(obj)
-        if workspace_id:
-            repo.update_entitlement_status(conn, workspace_id, "past_due", stripe_event_created_at=event_created_at)
+        subscription = obj.get("subscription")
+        _sync_subscription(conn, billing, subscription.get("id") if isinstance(subscription, dict) else subscription,
+                           workspace_id or metadata.get("workspace_id"))
+    elif event_type in _SUBSCRIPTION_EVENT_TYPES:
+        # created / updated (activation, renewal = new current_period_start,
+        # plan or interval change, cancel_at_period_end) / deleted (canceled).
+        _sync_subscription(conn, billing, obj.get("id"), (obj.get("metadata") or {}).get("workspace_id"))
+    elif event_type in ("invoice.paid", "invoice.payment_failed"):
+        # Renewal paid / payment failed: the subscription's own status
+        # (active / past_due ...) is what Stripe decided; only the
+        # invoice's OWN subscription is re-read, never "the workspace's".
+        _sync_subscription(conn, billing, billing_module.invoice_subscription_id(obj), billing_module.invoice_workspace_id(obj))
 
 
 def make_handler(
@@ -3243,7 +3183,9 @@ def make_handler(
                     self._send_json(403, {"ok": False, "error": "forbidden"})
                     return
                 existing = repo.get_entitlement_by_workspace(conn, workspace_id)
-                if existing is not None and existing["plan"] in _SUBSCRIPTION_PLANS and existing["status"] in ("active", "trialing"):
+                # D-115: a past_due/unpaid subscription still exists in Stripe - fix the
+                # payment in the portal instead of buying a second subscription.
+                if existing is not None and existing["plan"] in _SUBSCRIPTION_PLANS and existing["status"] in ("active", "trialing", "past_due", "unpaid"):
                     self._send_json(409, {"ok": False, "error": "this workspace already has an active subscription"})
                     return
                 if plan == plans.PLAN_QUICK and existing is not None and existing["plan"] == plans.PLAN_QUICK and (repo.usage_summary(conn, workspace_id, existing) or {}).get("scans_available", 0) > 0:

@@ -616,7 +616,7 @@
     Promise.all([loadWs(), catalog()]).then(function (r) {
       if (!current(token)) { return; }
       var ws = r[0], ent = ws.entitlement, usage = ws.usage, adm = ws.admission || {};
-      var subscription = ent && ["standard", "pro"].indexOf(ent.plan) >= 0 && ["active", "trialing", "past_due"].indexOf(ent.status) >= 0;
+      var subscription = ent && ["standard", "pro"].indexOf(ent.plan) >= 0 && ["active", "trialing", "past_due", "unpaid"].indexOf(ent.status) >= 0;   // D-115: matches the backend's checkout refusal
       function go(promise) {
         promise.then(function (d) {
           var url = C.safeExternalUrl(d.checkout_url || d.portal_url);

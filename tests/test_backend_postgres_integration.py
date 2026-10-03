@@ -1080,6 +1080,8 @@ class WebhookHardeningIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.conn, _ = _reset_database_and_migrate()
         self.addCleanup(self.conn.close)
+        import tests.test_backend_billing as billing_tests
+        self.billing = billing_tests._make_billing()   # D-115: subscription events re-read Stripe's state (the fake's store)
 
     def _process_once(self, event_id, event_type, obj):
         """Mirrors backend/http_app.py's _handle_billing_webhook() logic
@@ -1090,7 +1092,8 @@ class WebhookHardeningIntegrationTests(unittest.TestCase):
         if not should_process:
             return "skipped-duplicate"
         try:
-            http_app._apply_webhook_event(self.conn, event_type, obj, None)
+            self.billing._client.subscriptions.store[obj["id"]] = obj
+            http_app._apply_webhook_event(self.conn, event_type, obj, None, self.billing)
             repo.mark_webhook_event_processed(self.conn, event_id)
             return "succeeded"
         except Exception as exc:
@@ -1105,7 +1108,7 @@ class WebhookHardeningIntegrationTests(unittest.TestCase):
         return {
             "id": "sub_pg_1", "customer": "cus_pg_1", "status": "active",
             "metadata": {"workspace_id": "00000000-0000-0000-0000-000000000000", "plan": "standard"},
-            "items": {"data": []},
+            "items": {"data": [{"price": {"id": "price_standard_monthly_test"}}]},
         }
 
     def test_processing_failure_leaves_event_retryable_and_a_later_retry_succeeds(self):
@@ -1138,8 +1141,9 @@ class WebhookHardeningIntegrationTests(unittest.TestCase):
         # fresh attempt on a properly-rolled-back connection does not.
         should_process = repo.record_webhook_event(self.conn, "evt_pg_retry_3", "customer.subscription.updated")
         self.assertTrue(should_process)
+        self.billing._client.subscriptions.store["sub_pg_1"] = self._doomed_event()
         with self.assertRaises(Exception):
-            http_app._apply_webhook_event(self.conn, "customer.subscription.updated", self._doomed_event(), None)
+            http_app._apply_webhook_event(self.conn, "customer.subscription.updated", self._doomed_event(), None, self.billing)
         with self.assertRaises(psycopg.errors.InFailedSqlTransaction):
             repo.mark_webhook_event_processed(self.conn, "evt_pg_retry_3", error="without rollback, this itself fails")
         self.conn.rollback()  # the actual fix backend/http_app.py applies before this same call.
@@ -1556,6 +1560,92 @@ class GitHubActionsIntegrationTests(unittest.TestCase):
             with self.assertRaises(db.integrity_error_class(self.conn)):
                 db.execute(self.conn, "UPDATE contract_ci_sources SET %s = ? WHERE contract_id = ?" % column, (value, contract))
             self.conn.rollback()
+
+
+class StripeBillingIntegrationTests(unittest.TestCase):
+    """D-115 against a REAL Postgres server: the per-workspace billing lock
+    (a row lock here, not SQLite's database lock) serializes concurrent
+    subscription syncs, a Quick session grants one credit under concurrent
+    deliveries, and the guards keep an old subscription from touching the
+    current one."""
+
+    def setUp(self):
+        self.conn, _ = _reset_database_and_migrate()
+        self.addCleanup(self.conn.close)
+        import tests.test_backend_billing as billing_tests
+        self.billing_tests = billing_tests
+        self.billing = billing_tests._make_billing()
+        self.owner = repo.create_user(self.conn, "pg-stripe-%s@example.com" % repo.new_id())
+        self.ws = repo.create_workspace(self.conn, "PG Stripe WS", self.owner)
+
+    def _sub(self, status, sub_id="sub_pg", plan="pro", interval="monthly", start=1_900_000_000):
+        return {"id": sub_id, "customer": "cus_pg", "status": status, "metadata": {"workspace_id": self.ws},
+                "items": {"data": [{"price": {"id": self.billing_tests.PRICE_ALLOWLIST["vericexa_%s_%s" % (plan, interval)]},
+                                    "current_period_start": start, "current_period_end": start + 30 * 86400}]}}
+
+    def _deliver(self, event_id, event_type, obj):
+        conn = db.connect_postgres(DSN)
+        try:
+            if not repo.record_webhook_event(conn, event_id, event_type):
+                return "duplicate"
+            try:
+                http_app._apply_webhook_event(conn, event_type, obj, None, self.billing)
+                repo.mark_webhook_event_processed(conn, event_id)
+                return "ok"
+            except Exception as exc:
+                conn.rollback()
+                repo.mark_webhook_event_processed(conn, event_id, error=str(exc))
+                return "failed: %r" % exc
+        finally:
+            conn.close()
+
+    def test_concurrent_same_second_subscription_events_end_active(self):
+        self.billing._client.subscriptions.store["sub_pg"] = self._sub("active")      # Stripe's state when the burst is delivered
+        events = [("evt_pg_c%d" % i, "customer.subscription.created", self._sub("incomplete")) for i in range(4)]
+        events += [("evt_pg_u%d" % i, "customer.subscription.updated", self._sub("active")) for i in range(4)]
+        events += [("evt_pg_i%d" % i, "invoice.paid", {"parent": {"subscription_details": {"subscription": "sub_pg", "metadata": {"workspace_id": self.ws}}}})
+                   for i in range(4)]
+        events += [events[0]] * 3                                                      # the same event.id redelivered concurrently
+        results, barrier = [], threading.Barrier(len(events))
+
+        def go(event):
+            barrier.wait(timeout=10)
+            results.append(self._deliver(*event))
+
+        threads = [threading.Thread(target=go, args=(e,)) for e in events]
+        [t.start() for t in threads]
+        [t.join(60) for t in threads]
+        self.assertFalse([r for r in results if r.startswith("failed")], results)
+        self.assertEqual(results.count("ok"), 12)
+        ent = repo.get_entitlement_by_workspace(self.conn, self.ws)
+        self.assertEqual((ent["plan"], ent["status"], ent["billing_interval"], ent["stripe_subscription_id"]), ("pro", "active", "monthly", "sub_pg"))
+        self.assertEqual(db.execute(self.conn, "SELECT COUNT(*) AS n FROM entitlements").fetchone()["n"], 1)
+
+    def test_quick_session_grants_one_credit_under_concurrency(self):
+        session = {"id": "cs_pg_quick", "mode": "payment", "payment_status": "paid", "client_reference_id": self.ws, "customer": "cus_q",
+                   "metadata": {"workspace_id": self.ws, "plan": "quick", "interval": "one_time"}}
+        self.billing._client.checkout.sessions.line_items.store["cs_pg_quick"] = [(self.billing_tests.PRICE_ALLOWLIST["vericexa_quick_onetime"], 1)]
+        events = [("evt_pg_q%d" % i, "checkout.session.completed" if i % 2 else "checkout.session.async_payment_succeeded", session) for i in range(8)]
+        results, barrier = [], threading.Barrier(len(events))
+
+        def go(event):
+            barrier.wait(timeout=10)
+            results.append(self._deliver(*event))
+
+        threads = [threading.Thread(target=go, args=(e,)) for e in events]
+        [t.start() for t in threads]
+        [t.join(60) for t in threads]
+        self.assertFalse([r for r in results if r.startswith("failed")], results)
+        self.assertEqual(db.execute(self.conn, "SELECT COUNT(*) AS n FROM scan_credits WHERE workspace_id = ?", (self.ws,)).fetchone()["n"], 1)
+        self.assertEqual(repo.get_entitlement_by_workspace(self.conn, self.ws)["plan"], "quick")
+
+    def test_old_subscription_never_touches_the_current_one(self):
+        self.billing._client.subscriptions.store["sub_new"] = self._sub("active", sub_id="sub_new", plan="standard", interval="annual")
+        self.assertEqual(self._deliver("evt_pg_new", "customer.subscription.created", self._sub("active", sub_id="sub_new", plan="standard", interval="annual")), "ok")
+        self.billing._client.subscriptions.store["sub_old"] = self._sub("canceled", sub_id="sub_old")
+        self.assertEqual(self._deliver("evt_pg_old", "customer.subscription.deleted", self._sub("canceled", sub_id="sub_old")), "ok")
+        ent = repo.get_entitlement_by_workspace(self.conn, self.ws)
+        self.assertEqual((ent["plan"], ent["billing_interval"], ent["status"], ent["stripe_subscription_id"]), ("standard", "annual", "active", "sub_new"))
 
 
 class RestoreVerificationIntegrationTests(unittest.TestCase):

@@ -73,6 +73,19 @@ SDK (stripe==12.5.1) rather than assumed:
     authoritative path for entitlement status either way, so a skipped
     invoice event never leaves entitlements stale on its own.
 
+AUTHORITATIVE STATE (D-115): webhook events are only a TRIGGER for
+subscription state. Stripe sends several events for one change within the
+same second (customer.subscription.created/updated, invoice.paid,
+checkout.session.completed), delivers them at least once and in any order,
+and an event's own `created` has one-second resolution - so ordering by it
+cannot tell a same-second "incomplete" from the "active" that follows it.
+backend/http_app.py therefore re-reads the subscription with
+retrieve_subscription() and applies THAT (its current status, Price and
+period), serialized per workspace. A Quick payment is likewise verified
+against what was actually paid: checkout_session_price_ids() lists the
+Checkout Session's line items, and only exactly one unit of the configured
+Quick Price grants a scan.
+
 Stripe SDK is imported lazily/optionally, same pattern as backend/db.py's
 psycopg import - an environment that never configures billing (e.g. the
 existing test suite, or a deployment that hasn't enabled billing yet)
@@ -190,6 +203,20 @@ def subscription_price_id(subscription: Dict[str, Any]) -> Optional[str]:
     return price if isinstance(price, str) and price else None
 
 
+def invoice_subscription_id(invoice: Dict[str, Any]) -> Optional[str]:
+    """The subscription an invoice belongs to: the top-level `subscription`
+    (older API versions; an id or an expanded object) or
+    parent.subscription_details.subscription (newer ones). None for an
+    invoice that is not a subscription invoice."""
+    value = invoice.get("subscription")
+    if not value:
+        parent = invoice.get("parent") or {}
+        value = (parent.get("subscription_details") or invoice.get("subscription_details") or {}).get("subscription")
+    if isinstance(value, dict):
+        value = value.get("id")
+    return value if isinstance(value, str) and value else None
+
+
 def invoice_workspace_id(invoice: Dict[str, Any]) -> Optional[str]:
     """Public for the same reason as subscription_period_end() above. See
     module docstring on invoice metadata inheritance uncertainty across
@@ -297,6 +324,27 @@ class StripeBilling:
         if black_friday_promotion_code_id and mode["checkout_mode"] == "subscription":
             params["discounts"] = [{"promotion_code": black_friday_promotion_code_id}]
         return self._client.checkout.sessions.create(params)
+
+    def retrieve_subscription(self, subscription_id: str) -> Dict[str, Any]:
+        """The subscription's CURRENT state from Stripe (D-115) - see the
+        module docstring on authoritative state. Stripe API errors
+        propagate unchanged, so the webhook answers 500 and Stripe retries."""
+        return self._client.subscriptions.retrieve(subscription_id)
+
+    def checkout_session_price_ids(self, session_id: str) -> Optional[list]:
+        """[(price_id, quantity), ...] of a Checkout Session's line items
+        (D-115: what was actually paid), or None when Stripe reports more
+        items than one page - never the case for this catalog's one-item
+        sessions, and treated as "not a Quick purchase" by the caller."""
+        listing = self._client.checkout.sessions.line_items.list(session_id, {"limit": 10})
+        if listing.get("has_more"):
+            return None
+        items = []
+        for item in listing.get("data") or []:
+            price = item.get("price")
+            price_id = price.get("id") if isinstance(price, dict) else price
+            items.append((price_id, item.get("quantity")))
+        return items
 
     def create_portal_session(self, customer_id: str, return_url: str) -> Dict[str, Any]:
         return self._client.billing_portal.sessions.create({"customer": customer_id, "return_url": return_url})

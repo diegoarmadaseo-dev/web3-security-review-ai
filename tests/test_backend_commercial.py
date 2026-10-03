@@ -506,14 +506,26 @@ class WebhookEntitlementTests(_LedgerCase):
     def setUp(self):
         super().setUp()
         self.billing = billing.StripeBilling("sk_test_fake", "whsec_fake", dict(SANDBOX_PRICE_IDS))
+        self.billing._client = billing_tests._FakeStripeClient()   # no network: Stripe's state is the fake's store (D-115)
+        self.stripe = self.billing._client
         self.ws = repo.create_workspace(self.conn, "Hook WS", self.user)
 
-    def apply(self, event_type, obj, created=1_800_000_000):
+    def apply(self, event_type, obj, created=1_800_000_000, stripe_state=True):
+        """stripe_state: a subscription event's payload is also Stripe's
+        current state (D-115 re-reads it) unless the test says otherwise."""
+        if stripe_state and event_type.startswith("customer.subscription."):
+            self.stripe.subscriptions.store[obj["id"]] = obj
         http_app._apply_webhook_event(self.conn, event_type, obj, billing.stripe_timestamp_to_iso(created), self.billing)
 
-    def quick_session(self, session_id="cs_q1", payment_status="paid"):
+    def quick_session(self, session_id="cs_q1", payment_status="paid", paid=None):
+        """paid: the session's line items as Stripe reports them (default:
+        one unit of the Quick sandbox price)."""
+        self.stripe.checkout.sessions.line_items.store[session_id] = paid if paid is not None else [(SANDBOX_PRICE_IDS["vericexa_quick_onetime"], 1)]
         return {"id": session_id, "mode": "payment", "payment_status": payment_status, "client_reference_id": self.ws, "customer": "cus_q",
                 "metadata": {"workspace_id": self.ws, "plan": "quick", "interval": "one_time"}}
+
+    def invoice(self, subscription_id="sub_1"):
+        return {"customer": "cus_s", "parent": {"subscription_details": {"subscription": subscription_id, "metadata": {"workspace_id": self.ws}}}}
 
     def subscription(self, price_id, status="active", start=1_800_000_000, plan_meta="standard"):
         return {"id": "sub_1", "customer": "cus_s", "status": status, "metadata": {"workspace_id": self.ws, "plan": plan_meta, "interval": "monthly"},
@@ -536,9 +548,11 @@ class WebhookEntitlementTests(_LedgerCase):
         self.apply("customer.subscription.updated", self.subscription(SANDBOX_PRICE_IDS["vericexa_pro_monthly"], plan_meta="standard"), created=1_800_000_100)
         ent = repo.get_entitlement_by_workspace(self.conn, self.ws)
         self.assertEqual((ent["plan"], ent["billing_interval"]), ("pro", "monthly"))          # portal upgrade: price wins over stale metadata
-        self.apply("invoice.payment_failed", {"metadata": {"workspace_id": self.ws}}, created=1_800_000_200)
+        self.stripe.subscriptions.store["sub_1"] = self.subscription(SANDBOX_PRICE_IDS["vericexa_pro_monthly"], status="past_due")   # renewal failed
+        self.apply("invoice.payment_failed", self.invoice(), created=1_800_000_200)
         self.assertEqual(repo.get_entitlement_by_workspace(self.conn, self.ws)["status"], "past_due")
-        self.apply("invoice.paid", {"metadata": {"workspace_id": self.ws}}, created=1_800_000_300)
+        self.stripe.subscriptions.store["sub_1"] = self.subscription(SANDBOX_PRICE_IDS["vericexa_pro_monthly"], status="active")     # retried, paid
+        self.apply("invoice.paid", self.invoice(), created=1_800_000_300)
         self.assertEqual(repo.get_entitlement_by_workspace(self.conn, self.ws)["status"], "active")
         self.apply("customer.subscription.deleted", self.subscription(SANDBOX_PRICE_IDS["vericexa_pro_monthly"], status="canceled"), created=1_800_000_400)
         self.assertEqual(repo.get_entitlement_by_workspace(self.conn, self.ws)["status"], "canceled")
@@ -548,6 +562,26 @@ class WebhookEntitlementTests(_LedgerCase):
         self.assertIsNone(repo.get_entitlement_by_workspace(self.conn, self.ws))
         self.apply("customer.subscription.created", self.subscription(SANDBOX_PRICE_IDS["vericexa_quick_onetime"], plan_meta="quick"))   # the Quick price is not a subscription
         self.assertIsNone(repo.get_entitlement_by_workspace(self.conn, self.ws))
+
+    def test_quick_credit_requires_the_quick_price_actually_paid(self):
+        for i, paid in enumerate(([(SANDBOX_PRICE_IDS["vericexa_standard_monthly"], 1)], [(SANDBOX_PRICE_IDS["vericexa_quick_onetime"], 2)],
+                                  [(SANDBOX_PRICE_IDS["vericexa_quick_onetime"], 1), ("price_other", 1)], [], [("price_foreign_product", 1)])):
+            self.apply("checkout.session.completed", self.quick_session("cs_bad_%d" % i, paid=paid))
+        self.assertIsNone(repo.get_entitlement_by_workspace(self.conn, self.ws))
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM scan_credits").fetchone()[0], 0)
+        mismatched = self.quick_session("cs_mismatch")
+        mismatched["metadata"]["workspace_id"] = repo.create_workspace(self.conn, "Other WS", self.user)
+        self.apply("checkout.session.completed", mismatched)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM scan_credits").fetchone()[0], 0)
+
+    def test_late_cancellation_of_an_old_subscription_never_overrides_a_quick_purchase(self):
+        self.apply("customer.subscription.created", self.subscription(SANDBOX_PRICE_IDS["vericexa_standard_monthly"]))
+        self.apply("customer.subscription.deleted", self.subscription(SANDBOX_PRICE_IDS["vericexa_standard_monthly"], status="canceled"))
+        self.apply("checkout.session.completed", self.quick_session())
+        self.apply("customer.subscription.deleted", self.subscription(SANDBOX_PRICE_IDS["vericexa_standard_monthly"], status="canceled"))   # redelivered later
+        ent = repo.get_entitlement_by_workspace(self.conn, self.ws)
+        self.assertEqual((ent["plan"], ent["status"]), ("quick", "active"))
+        self.assertEqual(repo.usage_summary(self.conn, self.ws, ent)["scans_available"], 1)
 
     def test_quick_payment_never_overrides_a_live_subscription(self):
         self.apply("customer.subscription.created", self.subscription(SANDBOX_PRICE_IDS["vericexa_standard_monthly"]))
@@ -663,6 +697,7 @@ class QuickCheckoutAndPortalHttpTests(billing_tests._BillingHttpTestCase):
 
     def test_signed_quick_webhook_grants_exactly_one_credit(self):
         ws = self._create_workspace("Quick Hook WS")
+        self.billing._client.checkout.sessions.line_items.store["cs_test_quick_hook"] = [(billing_tests.PRICE_ALLOWLIST["vericexa_quick_onetime"], 1)]
         session = {"id": "cs_test_quick_hook", "mode": "payment", "payment_status": "paid", "client_reference_id": ws, "customer": "cus_qh",
                    "metadata": {"workspace_id": ws, "plan": "quick", "interval": "one_time"}}
         first = billing_tests._event("checkout.session.completed", "evt_quick_1", session, created=1_800_000_000)
